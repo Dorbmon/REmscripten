@@ -1508,24 +1508,17 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
     case F_GETLK: {
       // If these constants differ then we'd need a case for both.
       static_assert(F_GETLK == F_GETLK64);
-      flock* data;
-      va_list v1;
-      va_start(v1, cmd);
-      data = va_arg(v1, flock*);
-      va_end(v1);
-      // We're always unlocked for now, until we implement byte-range locks.
-      data->l_type = F_UNLCK;
-      return 0;
+      // Do not report an unlocked state until byte-range locks exist. Callers
+      // such as SQLite would otherwise interpret this as a real lock service.
+      return -ENOTSUP;
     }
     case F_SETLK:
     case F_SETLKW: {
       static_assert(F_SETLK == F_SETLK64);
       static_assert(F_SETLKW == F_SETLKW64);
-      // Pretend that the locking is successful. These are process-level locks,
-      // and Emscripten programs are a single process. If we supported linking a
-      // filesystem between programs, we'd need to do more here.
-      // See https://github.com/emscripten-core/emscripten/issues/23697
-      return 0;
+      // Record locking has no WasmFS implementation. In particular, returning
+      // success here would corrupt SQLite's concurrency assumptions.
+      return -ENOTSUP;
     }
     default: {
       // TODO: support any remaining cmds

@@ -13288,6 +13288,10 @@ Module.postRun = () => {{
     create_file('js_backend_files/file.dat', 'data')
     self.do_run_in_out_file_test('wasmfs/wasmfs_before_preload.c', cflags=['--preload-file', 'js_backend_files/file.dat'])
 
+  def test_wasmfs_fcntl_locks(self):
+    self.set_setting('WASMFS')
+    self.do_runf('wasmfs/wasmfs_fcntl_locks.c', 'success')
+
   def test_hello_world_above_2gb(self):
     self.do_run_in_out_file_test('hello_world.c', cflags=['-sGLOBAL_BASE=2GB', '-sINITIAL_MEMORY=3GB'])
 
