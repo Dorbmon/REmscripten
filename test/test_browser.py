@@ -5600,6 +5600,22 @@ Module["preRun"] = () => {
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')
   @no_wasm64()
+  def test_wasmfs_opfs_open_truncate(self):
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    # A writable O_TRUNC must not return a descriptor if the access-handle
+    # truncate fails. The injected build then remounts the same backend before
+    # proving that the failed open released its browser-side access handle.
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_open_truncate.c',
+      cflags=common_args)
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_open_truncate.c',
+      cflags=common_args + ['-DWASMFS_OPFS_OPEN_TRUNCATE_INJECTED',
+                            '-sWASMFS_OPFS_TEST_QUOTA_TRUNCATE=1'])
+
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
   def test_wasmfs_opfs_writable_truncate(self):
     common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
     # The first build covers a healthy pathname truncate. The second injects

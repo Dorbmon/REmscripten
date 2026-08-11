@@ -679,8 +679,18 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
       }
       return -EACCES;
     }
-    // Try to truncate the file, continuing silently if we cannot.
-    (void)child->cast<DataFile>()->locked().setSize(0);
+    int truncateErr = child->cast<DataFile>()->locked().setSize(0);
+    // Preserve the historical O_RDONLY | O_TRUNC behavior. In particular,
+    // OPFS may use a non-truncatable Blob for a read-only open.
+    if (truncateErr && accessMode != O_RDONLY) {
+      // The state has not entered the file table. Release its physical open
+      // before reporting the truncation failure, and prefer a cleanup failure
+      // because it may leave a browser-side handle live.
+      if (int closeErr = abandonOpenFile(std::move(openFile))) {
+        return closeErr;
+      }
+      return truncateErr;
+    }
   }
 
   return installOpenFile(std::move(openFile));
