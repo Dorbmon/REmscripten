@@ -3,12 +3,12 @@
 // University of Illinois/NCSA Open Source License.  Both these licenses can be
 // found in the LICENSE file.
 
-#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <emscripten/wasmfs.h>
 #include <emscripten/syscalls.h>
@@ -29,31 +29,58 @@ int _wasmfs_read_file(const char* path, uint8_t** out_buf, off_t* out_size) {
   static_assert(sizeof(off_t) == 8, "File offset type must be 64-bit");
 
   struct stat file;
-  int err = 0;
-  err = stat(path, &file);
-  if (err < 0) {
+  if (stat(path, &file) < 0) {
     return errno;
   }
 
   off_t size = file.st_size;
+  if (size < 0 || static_cast<uintmax_t>(size) > SIZE_MAX) {
+    return EFBIG;
+  }
+  size_t readSize = static_cast<size_t>(size);
 
   static thread_local uint8_t* buffer = nullptr;
-  buffer = (uint8_t*)realloc(buffer, size);
+  auto newBuffer = static_cast<uint8_t*>(realloc(buffer, readSize));
+  if (readSize && !newBuffer) {
+    return ENOMEM;
+  }
+  buffer = newBuffer;
 
   int fd = open(path, O_RDONLY);
   if (fd < 0) {
     return errno;
   }
-  ssize_t numRead = read(fd, buffer, size);
-  if (numRead < 0) {
-    return errno;
+
+  int readErr = 0;
+  const size_t maxReadSize = static_cast<size_t>(SSIZE_MAX);
+  size_t totalRead = 0;
+  while (totalRead < readSize) {
+    size_t chunkSize = readSize - totalRead;
+    if (chunkSize > maxReadSize) {
+      chunkSize = maxReadSize;
+    }
+
+    ssize_t numRead = read(fd, buffer + totalRead, chunkSize);
+    if (numRead < 0) {
+      readErr = errno ? errno : EIO;
+      break;
+    }
+    if (numRead == 0 || static_cast<size_t>(numRead) > chunkSize) {
+      // Do not expose stale data after a concurrent shrink or a backend that
+      // violates the read contract.
+      readErr = EIO;
+      break;
+    }
+    totalRead += static_cast<size_t>(numRead);
   }
-  // TODO: Generalize this so that it is thread-proof.
-  // Must guarantee that the file size has not changed by the time it is read.
-  assert(numRead == size);
-  err = close(fd);
-  if (err < 0) {
-    return errno;
+
+  // Do not leak the descriptor when read fails. A close failure is dominant:
+  // it can leave backend state alive even after the earlier read error.
+  if (close(fd) < 0) {
+    return errno ? errno : EIO;
+  }
+  if (readErr) {
+    return readErr;
   }
 
   *out_size = size;

@@ -134,15 +134,19 @@ addToLibrary({
         throw new Error(`Invalid encoding type "${opts.encoding}"`);
       }
 
-      var buf, length;
+      var buf, length, result;
       // Copy the file into a JS buffer on the heap.
       withStackSave(() => {
         var bufPtr = stackAlloc({{{ POINTER_SIZE }}});
-        var sizePtr = stackAlloc({{{ POINTER_SIZE }}});
-        FS.handleError(-__wasmfs_read_file(stringToUTF8OnStack(path), bufPtr, sizePtr));
-        buf = {{{ makeGetValue('bufPtr', '0', '*') }}};
-        length = {{{ makeGetValue('sizePtr', '0', 'i53') }}};
+        // _wasmfs_read_file stores a 64-bit off_t in this slot.
+        var sizePtr = stackAlloc({{{ getNativeTypeSize('i64') }}});
+        result = __wasmfs_read_file(stringToUTF8OnStack(path), bufPtr, sizePtr);
+        if (result === 0) {
+          buf = {{{ makeGetValue('bufPtr', '0', '*') }}};
+          length = {{{ makeGetValue('sizePtr', '0', 'i53') }}};
+        }
       });
+      FS.handleError(-result);
 
       // Default return type is binary.
       // The buffer contents exist 8 bytes after the returned pointer.

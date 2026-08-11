@@ -13322,6 +13322,17 @@ Module.postRun = () => {{
     'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',
                           '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
   })
+  def test_wasmfs_read_file_cleanup(self, args):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test(
+        'wasmfs/wasmfs_read_file_cleanup.c',
+        cflags=['-sFORCE_FILESYSTEM'] + args)
+
+  @parameterized({
+    '': ([],),
+    'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',
+                          '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
   def test_wasmfs_mknodat(self, args):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test(
