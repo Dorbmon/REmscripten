@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static void expectRejectedOpen(const char* path, int flag, int expectedErrno) {
@@ -16,7 +17,7 @@ static void expectRejectedOpen(const char* path, int flag, int expectedErrno) {
   assert(open(path, O_CREAT | O_EXCL | O_RDWR | flag, 0600) == -1);
   assert(errno == expectedErrno);
 
-  // Rejecting an unsupported flag must not leave an O_CREAT side effect.
+  // A rejected O_CREAT request must not leave a side effect.
   errno = 0;
   assert(access(path, F_OK) == -1);
   assert(errno == ENOENT);
@@ -45,6 +46,11 @@ int main(void) {
   int dirfd = open(".", O_RDONLY | O_DIRECTORY);
   assert(dirfd >= 0);
   assert(close(dirfd) == 0);
+
+  assert(mkdir("read-only-parent", 0555) == 0);
+  expectRejectedOpen("read-only-parent/new", 0, EACCES);
+  assert(chmod("read-only-parent", 0755) == 0);
+  assert(rmdir("read-only-parent") == 0);
 
   expectAllowedOpen("cloexec-nonblock-open", O_CLOEXEC | O_NONBLOCK);
   expectAllowedOpen("noctty-open", O_NOCTTY);

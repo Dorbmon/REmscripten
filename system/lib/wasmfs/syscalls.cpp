@@ -701,6 +701,12 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
         return -ENOENT;
       }
 
+      // Creating a child modifies the parent directory, so it requires write
+      // permission on that directory.
+      if (!(lockedParent.getMode() & WASMFS_PERM_WRITE)) {
+        return -EACCES;
+      }
+
       // Mask out everything except the permissions bits.
       mode &= S_IALLUGO;
 
@@ -709,7 +715,6 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
         backend = parent->getBackend();
       }
 
-      // TODO: Check write permissions on the parent directory.
       std::shared_ptr<File> created;
       if (backend == parent->getBackend()) {
         created = lockedParent.insertDataFile(std::string(childName), mode);
