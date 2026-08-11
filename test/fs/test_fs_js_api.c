@@ -306,6 +306,23 @@ EM_JS(void, test_wasmfs_cwd_errors, (int path_max, int eio), {
   assert(FS.cwd() === '/');
 });
 
+EM_JS(void, test_wasmfs_close_malformed_stream, (int ebadf), {
+  function expectEBADF(stream) {
+    var ex;
+    try {
+      FS.close(stream);
+    } catch (err) {
+      ex = err;
+    }
+    assert(ex && ex.name === 'ErrnoError' && ex.errno === ebadf,
+           `expected EBADF, got ${ex && ex.errno}`);
+  }
+
+  // Both values used to be coerced to fd 0 by the i32 Wasm boundary.
+  expectEBADF({});
+  expectEBADF({fd: 0x100000000});
+});
+
 EM_JS(void, test_wasmfs_register_device_errors,
       (int eio, int einval, int eperm), {
   function expectErrno(operation, expected) {
@@ -695,6 +712,9 @@ int main() {
   test_fs_close();
   test_fs_readlink();
 #if defined(WASMFS) && !defined(NODEFS) && !defined(NODERAWFS)
+  test_wasmfs_close_malformed_stream(EBADF);
+  char byte;
+  assert(read(STDIN_FILENO, &byte, 0) == 0);
   test_wasmfs_readlink_bounds(PATH_MAX);
   test_wasmfs_readdir_errors(ENOENT, ENOTDIR);
   test_wasmfs_cwd_errors(PATH_MAX, EIO);

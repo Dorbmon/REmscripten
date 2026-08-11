@@ -210,7 +210,15 @@ addToLibrary({
       return { fd : fd };
     }),
     create: (path, mode) => FS_create(path, mode),
-    close: (stream) => FS.handleError(-__wasmfs_close(stream.fd)),
+    close(stream) {
+      var fd = stream?.fd;
+      // The Wasm bridge takes an i32, so reject values that JavaScript would
+      // coerce into a different descriptor.
+      if (!Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff) {
+        throw new FS.ErrnoError({{{ cDefs.EBADF }}});
+      }
+      return FS.handleError(-__wasmfs_close(fd));
+    },
     unlink: (path) => FS_unlink(path),
     chdir: (path) => FS.handleError(
       withStackSave(() => __wasmfs_chdir(stringToUTF8OnStack(path)))
