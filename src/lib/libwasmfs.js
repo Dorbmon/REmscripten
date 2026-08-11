@@ -315,18 +315,30 @@ addToLibrary({
       }
     },
     stat(path) {
-      return withStackSave(() => {
+      var result;
+      var stats;
+      withStackSave(() => {
         var statBuf = stackAlloc({{{ C_STRUCTS.stat.__size__ }}});
-        FS.handleError(__wasmfs_stat(stringToUTF8OnStack(path), statBuf));
-        return FS.statBufToObject(statBuf);
+        result = __wasmfs_stat(stringToUTF8OnStack(path), statBuf);
+        if (result === 0) {
+          stats = FS.statBufToObject(statBuf);
+        }
       });
+      FS.handleError(result);
+      return stats;
     },
     lstat(path) {
-      return withStackSave(() => {
+      var result;
+      var stats;
+      withStackSave(() => {
         var statBuf = stackAlloc({{{ C_STRUCTS.stat.__size__ }}});
-        FS.handleError(__wasmfs_lstat(stringToUTF8OnStack(path), statBuf));
-        return FS.statBufToObject(statBuf);
+        result = __wasmfs_lstat(stringToUTF8OnStack(path), statBuf);
+        if (result === 0) {
+          stats = FS.statBufToObject(statBuf);
+        }
       });
+      FS.handleError(result);
+      return stats;
     },
     chmod(path, mode) {
       return FS.handleError(withStackSave(() => {

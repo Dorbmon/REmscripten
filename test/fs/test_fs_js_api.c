@@ -139,6 +139,25 @@ EM_JS(void, test_fs_error_propagation, (), {
   expectENOENT(() => FS.symlink('target', 'missing-js-api-parent/link'));
 });
 
+#if WASMFS
+EM_JS(void, test_wasmfs_stat_error_stack, (int enoent), {
+  function expectENOENT(operation) {
+    var stack = stackSave();
+    var ex;
+    try {
+      operation();
+    } catch (err) {
+      ex = err;
+    }
+    assert(ex && ex.name === 'ErrnoError' && ex.errno === enoent);
+    assert(stackSave() === stack);
+  }
+
+  expectENOENT(() => FS.stat('missing-js-api-stat'));
+  expectENOENT(() => FS.lstat('missing-js-api-lstat'));
+});
+#endif
+
 // createPath should succeed when called on existing paths ( https://github.com/emscripten-core/emscripten/issues/23602 )
 EM_JS(void, test_fs_createPath, (), {
   FS.createPath('/', 'home', true, true);
@@ -739,6 +758,9 @@ int main() {
 #endif
   test_fs_open();
   test_fs_error_propagation();
+#if WASMFS
+  test_wasmfs_stat_error_stack(ENOENT);
+#endif
 #if defined(NODERAWFS) && !WASMFS
   test_fs_readFile(EBADF, 0);
 #else
