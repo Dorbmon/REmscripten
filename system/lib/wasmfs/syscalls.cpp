@@ -45,6 +45,36 @@
 // In Linux, the maximum length for a filename is 255 bytes.
 #define WASMFS_NAME_MAX 255
 
+namespace {
+
+// Parent pointers are weak and each directory has its own lock. Traverse the
+// CWD tree with at most one directory lock held at a time so an unmount check
+// cannot invert the normal WasmFS file-locking discipline.
+bool cwdIsAtOrBelow(wasmfs::WasmFS::CWDTransition& cwdTransition,
+                    const std::shared_ptr<wasmfs::Directory>& directory) {
+  auto current = cwdTransition.getCWD();
+  while (current) {
+    if (current == directory) {
+      return true;
+    }
+
+    std::shared_ptr<wasmfs::Directory> parent;
+    {
+      auto lockedCurrent = current->locked();
+      parent = lockedCurrent.getParent();
+    }
+
+    // The root is its own parent. An unlinked directory has no parent.
+    if (!parent || parent == current) {
+      return false;
+    }
+    current = std::move(parent);
+  }
+  return false;
+}
+
+} // anonymous namespace
+
 extern "C" {
 
 using namespace wasmfs;
@@ -768,29 +798,37 @@ __wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
   return __WASI_ERRNO_SUCCESS;
 }
 
-static int doChdir(std::shared_ptr<File>& file) {
+static int doChdir(WasmFS::CWDTransition& cwdTransition,
+                   std::shared_ptr<File>& file) {
   auto dir = file->dynCast<Directory>();
   if (!dir) {
     return -ENOTDIR;
   }
-  wasmFS.setCWD(dir);
+  cwdTransition.setCWD(dir);
   return 0;
 }
 
 int __syscall_chdir(intptr_t path) {
+  auto cwdTransition = wasmFS.beginCWDTransition();
   auto parsed = path::parseFile((char*)path);
   if (auto err = parsed.getError()) {
     return err;
   }
-  return doChdir(parsed.getFile());
+  return doChdir(cwdTransition, parsed.getFile());
 }
 
 int __syscall_fchdir(int fd) {
+  auto cwdTransition = wasmFS.beginCWDTransition();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
   }
-  return doChdir(openFile->locked().getFile());
+  std::shared_ptr<File> file;
+  {
+    auto lockedOpenFile = openFile->locked();
+    file = lockedOpenFile.getFile();
+  }
+  return doChdir(cwdTransition, file);
 }
 
 int __syscall_getcwd(intptr_t buf, size_t size) {
@@ -898,6 +936,11 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
     if (flags != AT_REMOVEDIR) {
       return -EISDIR;
     }
+    // Generic rmdir must not detach a mountpoint. wasmfs_unmount() is the
+    // supported direct detach operation and serializes it with CWD transitions.
+    if (parent->getBackend() != dir->getBackend()) {
+      return -EBUSY;
+    }
     // A directory can only be removed if it has no entries.
     if (dir->locked().getNumEntries() > 0) {
       return -ENOTEMPTY;
@@ -925,34 +968,53 @@ int __syscall_rmdir(intptr_t path) {
 // wasmfs_unmount is similar to __syscall_unlinkat, but assumes AT_REMOVEDIR is
 // true and will only unlink mountpoints (Empty and nonempty).
 int wasmfs_unmount(const char* path) {
+  auto cwdTransition = wasmFS.beginCWDTransition();
   auto parsed = path::parseParent(path, AT_FDCWD);
   if (auto err = parsed.getError()) {
     return err;
   }
   auto& [parent, childNameView] = parsed.getParentChild();
   std::string childName(childNameView);
-  auto lockedParent = parent->locked();
-  auto file = lockedParent.getChild(childName);
-  if (!file) {
-    return -ENOENT;
-  }
-  // Disallow removing the root directory, even if it is empty.
-  if (file == wasmFS.getRootDirectory()) {
-    return -EBUSY;
-  }
 
-  if (!file->dynCast<Directory>()) {
-    // A normal file or symlink.
-    return -ENOTDIR;
-  }
+  // Do not hold the mount's parent lock while walking CWD ancestry. Apart from
+  // avoiding nested directory locks, revalidate the mountpoint before unlinking
+  // in case another thread changes it while the CWD check is in progress.
+  while (true) {
+    std::shared_ptr<Directory> mount;
+    {
+      auto lockedParent = parent->locked();
+      auto file = lockedParent.getChild(childName);
+      if (!file) {
+        return -ENOENT;
+      }
+      // Disallow removing the root directory, even if it is empty.
+      if (file == wasmFS.getRootDirectory()) {
+        return -EBUSY;
+      }
 
-  if (parent->getBackend() == file->getBackend()) {
-    // The child is not a valid mountpoint.
-    return -EINVAL;
-  }
+      mount = file->dynCast<Directory>();
+      if (!mount) {
+        // A normal file or symlink.
+        return -ENOTDIR;
+      }
 
-  // Input is valid, perform the unlink.
-  return lockedParent.removeChild(childName);
+      if (parent->getBackend() == mount->getBackend()) {
+        // The child is not a valid mountpoint.
+        return -EINVAL;
+      }
+    }
+
+    if (cwdIsAtOrBelow(cwdTransition, mount)) {
+      return -EBUSY;
+    }
+
+    auto lockedParent = parent->locked();
+    if (lockedParent.getChild(childName) != mount) {
+      continue;
+    }
+    // Input is valid, perform the unlink.
+    return lockedParent.removeChild(childName);
+  }
 }
 
 int __syscall_getdents64(int fd, intptr_t dirp, size_t count) {
@@ -1027,6 +1089,10 @@ int __syscall_renameat(int olddirfd,
                        intptr_t oldpath,
                        int newdirfd,
                        intptr_t newpath) {
+  // Hold this before renameMutex and path parsing. A rename can move the CWD
+  // into a mount that another thread is checking for unmount.
+  auto cwdTransition = wasmFS.beginCWDTransition();
+
   // Rename is the only syscall that needs to (or is allowed to) acquire locks
   // on two directories at once. It requires locks on both the old and new
   // parent directories to ensure that the moved file can be atomically removed

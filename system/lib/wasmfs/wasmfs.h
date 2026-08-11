@@ -26,6 +26,12 @@ class WasmFS {
   std::shared_ptr<Directory> rootDirectory;
   std::shared_ptr<Directory> cwd;
   std::mutex mutex;
+  std::mutex cwdTransitionMutex;
+
+  void setCWD(std::shared_ptr<Directory> directory) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    cwd = directory;
+  };
 
   // Private method to initialize root directory once.
   // Initializes default directories including dev/stdin, dev/stdout,
@@ -36,6 +42,34 @@ class WasmFS {
   void preloadFiles();
 
 public:
+  // Serializes CWD installation with mount detachment. Acquire this before
+  // renameMutex, `mutex`, FileTable, and any File or Directory lock.
+  class CWDTransition {
+    friend class WasmFS;
+
+    WasmFS& wasmfs;
+    std::unique_lock<std::mutex> lock;
+
+    explicit CWDTransition(WasmFS& wasmfs)
+      : wasmfs(wasmfs), lock(wasmfs.cwdTransitionMutex) {}
+
+  public:
+    CWDTransition(const CWDTransition&) = delete;
+    CWDTransition& operator=(const CWDTransition&) = delete;
+    CWDTransition(CWDTransition&&) = default;
+    CWDTransition& operator=(CWDTransition&&) = delete;
+
+    std::shared_ptr<Directory> getCWD() {
+      assert(lock.owns_lock());
+      return wasmfs.getCWD();
+    }
+
+    void setCWD(std::shared_ptr<Directory> directory) {
+      assert(lock.owns_lock());
+      wasmfs.setCWD(std::move(directory));
+    }
+  };
+
   WasmFS();
   ~WasmFS();
 
@@ -48,10 +82,7 @@ public:
     return cwd;
   };
 
-  void setCWD(std::shared_ptr<Directory> directory) {
-    const std::lock_guard<std::mutex> lock(mutex);
-    cwd = directory;
-  };
+  CWDTransition beginCWDTransition() { return CWDTransition(*this); }
 
   backend_t addBackend(std::unique_ptr<Backend> backend) {
     const std::lock_guard<std::mutex> lock(mutex);

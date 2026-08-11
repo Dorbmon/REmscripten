@@ -13259,6 +13259,10 @@ Module.postRun = () => {{
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test('wasmfs/wasmfs_pipe2_full.c')
 
+  def test_wasmfs_unmount_cwd_busy(self):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test('wasmfs/wasmfs_unmount_cwd_busy.c')
+
   @also_with_wasmfs
   def test_unistd_seek(self):
     self.do_run_in_out_file_test('wasmfs/wasmfs_seek.c')
