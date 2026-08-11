@@ -28,12 +28,27 @@ EM_JS(void, test_fs_open, (), {
   assert(appendStream && appendStream.fd >= 0);
 
   var ex;
+#if WASMFS
+  var stack = stackSave();
+  try {
+    FS.open('testfile', 'invalid-mode');
+  } catch(err) {
+    ex = err;
+  }
+  assert(ex && ex.message === 'Unknown file open mode: invalid-mode');
+  assert(stackSave() === stack);
+  ex = null;
+  stack = stackSave();
+#endif
   try {
     FS.open('filenothere', 'r');
   } catch(err) {
     ex = err;
   }
   assert(ex.name === "ErrnoError" && ex.errno === 44 /* ENOENT */);
+#if WASMFS
+  assert(stackSave() === stack);
+#endif
 
   var createFileNotHere = FS.open('filenothere', 'w+');
 

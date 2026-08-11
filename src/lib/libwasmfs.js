@@ -203,12 +203,15 @@ addToLibrary({
     rmdir: (path) => FS.handleError(
       withStackSave(() => __wasmfs_rmdir(stringToUTF8OnStack(path)))
     ),
-    open: (path, flags, mode = 0o666) => withStackSave(() => {
+    open(path, flags, mode = 0o666) {
       flags = FS_modeStringToFlags(flags);
-      var buffer = stringToUTF8OnStack(path);
-      var fd = FS.handleError(__wasmfs_open(buffer, flags, mode));
-      return { fd : fd };
-    }),
+      var fd;
+      withStackSave(() => {
+        var buffer = stringToUTF8OnStack(path);
+        fd = __wasmfs_open(buffer, flags, mode);
+      });
+      return { fd : FS.handleError(fd) };
+    },
     create: (path, mode) => FS_create(path, mode),
     close(stream) {
       var fd = stream?.fd;
