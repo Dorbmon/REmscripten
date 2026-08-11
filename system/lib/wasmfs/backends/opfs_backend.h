@@ -8,7 +8,8 @@ using namespace wasmfs;
 
 extern "C" {
 
-// Ensure that the root OPFS directory is initialized with ID 0.
+// Ensure that the root OPFS directory is initialized in permanent handle ID 1.
+// HandleAllocator reserves ID 0.
 void _wasmfs_opfs_init_root_directory(em_proxying_ctx* ctx);
 
 // Acquire and release the opt-in storage-bucket-scoped OPFS profile lease.

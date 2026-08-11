@@ -181,7 +181,8 @@ addToLibrary({
   _wasmfs_opfs_init_root_directory__deps: ['$wasmfsOPFSDirectoryHandles', '$wasmfsOPFSProxyFinish'],
   _wasmfs_opfs_init_root_directory__async: 'auto',
   _wasmfs_opfs_init_root_directory: async (ctx) => {
-    // allocated.length starts off as 1 since 0 is a reserved handle
+    // HandleAllocator reserves 0, so this first push puts the root in
+    // permanent slot 1. It remains live for this backend's ProxyWorker.
     if (wasmfsOPFSDirectoryHandles.allocated.length == 1) {
       // Closure compiler errors on this as it does not recognize the OPFS
       // API yet, it seems. Unfortunately an existing annotation for this is in

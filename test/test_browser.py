@@ -5344,6 +5344,14 @@ Module["preRun"] = () => {
     self.btest_exit(test, cflags=args + ['-DWASMFS_RESUME'])
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_root_remount(self):
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_root_remount.c',
+      cflags=['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js'])
+
+  @no_firefox('no OPFS support yet')
   @no_safari('no Web Locks support yet')
   @no_wasm64()
   def test_wasmfs_opfs_profile_lease(self):

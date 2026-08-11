@@ -24,6 +24,9 @@ using ProxyWorker = emscripten::ProxyWorker;
 using ProxyingQueue = emscripten::ProxyingQueue;
 
 constexpr size_t kMaxProfileLeaseNameLength = 128;
+// HandleAllocator reserves ID 0. The OPFS root is initialized in slot 1 and
+// remains there for the lifetime of its backend's ProxyWorker.
+constexpr int kOPFSRootDirectoryID = 1;
 
 bool IsValidProfileLeaseName(const char* name) {
   if (!name) {
@@ -293,8 +296,9 @@ public:
     : Directory(mode, backend), proxy(proxy), dirID(dirID) {}
 
   ~OPFSDirectory() override {
-    // Never free the root directory ID.
-    if (dirID != 0) {
+    // The root handle is shared by all mounts of this backend, so only child
+    // directory handles are owned by their C++ wrappers. Slot 0 is reserved.
+    if (dirID != 0 && dirID != kOPFSRootDirectoryID) {
       proxy([&]() { _wasmfs_opfs_free_directory(dirID); });
     }
   }
@@ -436,7 +440,8 @@ public:
 
   std::shared_ptr<Directory> createDirectory(mode_t mode) override {
     proxy([](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); });
-    return std::make_shared<OPFSDirectory>(mode, this, 1, proxy);
+    return std::make_shared<OPFSDirectory>(
+      mode, this, kOPFSRootDirectoryID, proxy);
   }
 
   std::shared_ptr<Symlink> createSymlink(std::string target) override {
