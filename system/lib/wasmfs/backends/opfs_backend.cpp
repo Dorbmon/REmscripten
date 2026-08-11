@@ -73,7 +73,7 @@ public:
 
 class OpenState {
 public:
-  enum Kind { None, Access, Blob };
+  enum Kind { None, Access, Blob, FailedAccessClose };
 
 private:
   Kind kind = None;
@@ -84,6 +84,11 @@ public:
   Kind getKind() { return kind; }
 
   int open(Worker& proxy, int fileID, oflags_t flags) {
+    if (kind == FailedAccessClose) {
+      // A failed AccessHandle close has an ambiguous browser-side result. Do
+      // not reuse it or attempt another close implicitly.
+      return -EIO;
+    }
     if (kind == None) {
       assert(openCount == 0);
       switch (flags) {
@@ -142,9 +147,18 @@ public:
           break;
         case None:
           WASMFS_UNREACHABLE("Open file should have kind");
+        case FailedAccessClose:
+          WASMFS_UNREACHABLE("Failed close state should not be open");
       }
-      kind = None;
-      id = -1;
+      if (kind == Access && err) {
+        // JS deliberately retains this AccessHandle's slot after a rejected
+        // close. Keep its ID here as a poison marker so this wrapper cannot
+        // reopen or operate on a possibly live or already-closed handle.
+        kind = FailedAccessClose;
+      } else {
+        kind = None;
+        id = -1;
+      }
     }
     return err;
   }
@@ -174,7 +188,11 @@ public:
     : DataFile(mode, backend), proxy(proxy), fileID(fileID) {}
 
   ~OPFSFile() override {
-    assert(state.getKind() == OpenState::None);
+    // A rejected AccessHandle close remains intentionally quarantined in the
+    // ProxyWorker until its context is torn down. The file wrapper itself can
+    // still be destroyed without pretending the close succeeded.
+    assert(state.getKind() == OpenState::None ||
+           state.getKind() == OpenState::FailedAccessClose);
     proxy([&]() { _wasmfs_opfs_free_file(fileID); });
   }
 
@@ -195,6 +213,8 @@ private:
       case OpenState::Blob:
         proxy([&]() { size = _wasmfs_opfs_get_size_blob(state.getBlobID()); });
         break;
+      case OpenState::FailedAccessClose:
+        return -EIO;
       default:
         WASMFS_UNREACHABLE("Unexpected open state");
     }
@@ -224,6 +244,8 @@ private:
         });
         break;
       }
+      case OpenState::FailedAccessClose:
+        return -EIO;
       default:
         WASMFS_UNREACHABLE("Unexpected open state");
     }
@@ -250,6 +272,8 @@ private:
             ctx.ctx, state.getBlobID(), buf, len, offset, &nread);
         });
         break;
+      case OpenState::FailedAccessClose:
+        return -EIO;
       case OpenState::None:
       default:
         WASMFS_UNREACHABLE("Unexpected open state");
@@ -258,6 +282,9 @@ private:
   }
 
   ssize_t write(const uint8_t* buf, size_t len, off_t offset) override {
+    if (state.getKind() == OpenState::FailedAccessClose) {
+      return -EIO;
+    }
     assert(state.getKind() == OpenState::Access);
     // TODO: use an i64 here.
     int32_t nwritten;
@@ -280,6 +307,8 @@ private:
       case OpenState::None:
       default:
         break;
+      case OpenState::FailedAccessClose:
+        return -EIO;
     }
     return err;
   }

@@ -5815,6 +5815,188 @@ Module["preRun"] = () => {
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')
   @no_wasm64()
+  def test_wasmfs_opfs_close_failure(self):
+    test = test_file('wasmfs/wasmfs_opfs_close_failure.c')
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD',
+                   '-sEXIT_RUNTIME', '-lopfs.js']
+    create_file('close-failure-holder-pre.js', r'''
+      // This runs on the browser main runtime after native atexit handlers.
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-close-failure',
+          },
+          window.location.origin);
+      };
+    ''')
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_CLOSE_FAILURE_HOLDER',
+                     '-sWASMFS_OPFS_TEST_CLOSE_FAILURE=1', '--pre-js',
+                     'close-failure-holder-pre.js',
+                     '-o', 'close-failure-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-o', 'close-failure-contender.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kModuleTimeoutMs = 15000;
+        const kTraceType = 'wasmfs-opfs-test-close-failure';
+        const pendingModules = new Map();
+        const pendingHolderExits = new Map();
+        const pendingWitnesses = new Map();
+        const witnessWaiters = new Map();
+        const witnessChannel = new BroadcastChannel(kTraceType);
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for holder shutdown'));
+            }, kModuleTimeoutMs);
+            pendingHolderExits.set(
+              frame.contentWindow, {resolve, reject, timeout});
+          });
+        }
+
+        function waitForWitness(phase) {
+          if (pendingWitnesses.has(phase)) {
+            const witness = pendingWitnesses.get(phase);
+            pendingWitnesses.delete(phase);
+            return Promise.resolve(witness);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              witnessWaiters.delete(phase);
+              reject(new Error('timed out waiting for ' + phase +
+                               ' close-failure witness'));
+            }, kModuleTimeoutMs);
+            witnessWaiters.set(phase, {resolve, timeout});
+          });
+        }
+
+        witnessChannel.onmessage = (event) => {
+          const witness = event.data;
+          if (witness?.type != kTraceType ||
+              (witness.phase != 'close-rejected' &&
+               witness.phase != 'next-access')) {
+            return;
+          }
+          const waiter = witnessWaiters.get(witness.phase);
+          if (waiter) {
+            witnessWaiters.delete(witness.phase);
+            clearTimeout(waiter.timeout);
+            waiter.resolve(witness);
+          } else {
+            pendingWitnesses.set(witness.phase, witness);
+          }
+        };
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != 'wasmfs-opfs-close-failure') {
+            return;
+          }
+          if (event.data.event == 'holder-exit') {
+            const pending = pendingHolderExits.get(event.source);
+            if (!pending) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pending.timeout);
+            if (event.data.status != 0) {
+              pending.reject(new Error(
+                'holder did not exit cleanly: status=' + event.data.status));
+            } else {
+              pending.resolve();
+            }
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        (async () => {
+          const holder = await startModule('close-failure-holder.html');
+          if (holder.message.role != kHolder || holder.message.error != 0) {
+            throw new Error('holder failed: role=' + holder.message.role +
+                            ', errno=' + holder.message.error);
+          }
+
+          const rejectedClose = await waitForWitness('close-rejected');
+          const nextAccess = await waitForWitness('next-access');
+          if (!Number.isInteger(rejectedClose.accessID) ||
+              !Number.isInteger(nextAccess.accessID) ||
+              rejectedClose.accessID <= 0 || nextAccess.accessID <= 0) {
+            throw new Error('invalid access-handle trace IDs');
+          }
+          if (rejectedClose.accessID == nextAccess.accessID) {
+            throw new Error('failed access-handle slot was reused: ' +
+                            rejectedClose.accessID);
+          }
+
+          // The injected failure was before browser close(), so the contender
+          // can report success only if it correctly observed writer exclusion.
+          const contender = await startModule('close-failure-contender.html');
+          if (contender.message.role != kContender ||
+              contender.message.error != 0) {
+            throw new Error('contender did not observe target writer exclusion: '
+                            + 'role=' + contender.message.role + ', errno=' +
+                            contender.message.error);
+          }
+
+          // The holder closed its unrelated descriptor before reporting. Its
+          // onExit witness proves poison-state teardown did not hide an abort.
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_opfs_close_failure_holder_shutdown();
+          await holderExit;
+          contender.frame.remove();
+          holder.frame.remove();
+          witnessChannel.close();
+          reportResultToServer('0');
+        })().catch((error) => {
+          witnessChannel.close();
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=60)
+
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
   def test_wasmfs_opfs_fd_table_full_close(self):
     test = test_file('wasmfs/wasmfs_opfs_fd_table_full_close.c')
     common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD',

@@ -1835,6 +1835,12 @@ var WASMFS = false;
 // [link]
 var WASMFS_OPFS_TEST_MOVE_INTERRUPT = 0;
 
+// Test-only selector that makes the first OPFS SyncAccessHandle close fail.
+// This controls code emitted at link time only; it intentionally provides no
+// runtime configuration or recovery API.
+// [link]
+var WASMFS_OPFS_TEST_CLOSE_FAILURE = 0;
+
 // If set to 1, embeds all subresources in the emitted file as base64 string
 // literals. Embedded subresources may include (but aren't limited to) wasm,
 // asm.js, and static memory initialization code.

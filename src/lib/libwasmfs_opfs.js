@@ -8,6 +8,10 @@
 #error "WASMFS_OPFS_TEST_MOVE_INTERRUPT must be 0, 1, or 2"
 #endif
 
+#if WASMFS_OPFS_TEST_CLOSE_FAILURE != 0 && WASMFS_OPFS_TEST_CLOSE_FAILURE != 1
+#error "WASMFS_OPFS_TEST_CLOSE_FAILURE must be 0 or 1"
+#endif
+
 addToLibrary({
   $wasmfsOPFSDirectoryHandles__deps: ['$HandleAllocator'],
   $wasmfsOPFSDirectoryHandles: "new HandleAllocator()",
@@ -35,6 +39,29 @@ addToLibrary({
       type: 'wasmfs-opfs-test-move-interrupt',
     });
     await new Promise(() => {});
+  },
+#endif
+
+#if WASMFS_OPFS_TEST_CLOSE_FAILURE
+  // This state and its witness channel live only in the OPFS ProxyWorker for
+  // the focused close-failure test. The first injected failure happens before
+  // the browser's close() call, so its native access handle remains live.
+  $wasmfsOPFSTestCloseFailureState: {
+    channel: undefined,
+    injected: false,
+    tracedNextAccess: false,
+  },
+  $wasmfsOPFSTestCloseFailureTrace__deps: ['$wasmfsOPFSTestCloseFailureState'],
+  $wasmfsOPFSTestCloseFailureTrace: (phase, accessID) => {
+    if (!wasmfsOPFSTestCloseFailureState.channel) {
+      wasmfsOPFSTestCloseFailureState.channel = new BroadcastChannel(
+        'wasmfs-opfs-test-close-failure');
+    }
+    wasmfsOPFSTestCloseFailureState.channel.postMessage({
+      accessID,
+      phase,
+      type: 'wasmfs-opfs-test-close-failure',
+    });
   },
 #endif
 
@@ -365,6 +392,10 @@ addToLibrary({
 
   _wasmfs_opfs_open_access__deps: ['$wasmfsOPFSFileHandles',
                                    '$wasmfsOPFSAccessHandles', '$wasmfsOPFSProxyFinish',
+#if WASMFS_OPFS_TEST_CLOSE_FAILURE
+                                   '$wasmfsOPFSTestCloseFailureState',
+                                   '$wasmfsOPFSTestCloseFailureTrace',
+#endif
 #if !PTHREADS
                                    '$wasmfsOPFSCreateAsyncAccessHandle'
 #endif
@@ -391,6 +422,13 @@ addToLibrary({
       accessHandle = await wasmfsOPFSCreateAsyncAccessHandle(fileHandle);
 #endif
       accessID = wasmfsOPFSAccessHandles.allocate(accessHandle);
+#if WASMFS_OPFS_TEST_CLOSE_FAILURE
+      if (wasmfsOPFSTestCloseFailureState.injected &&
+          !wasmfsOPFSTestCloseFailureState.tracedNextAccess) {
+        wasmfsOPFSTestCloseFailureState.tracedNextAccess = true;
+        wasmfsOPFSTestCloseFailureTrace('next-access', accessID);
+      }
+#endif
     } catch (e) {
       // TODO: Presumably only one of these will appear in the final API?
       if (e.name === "InvalidStateError" ||
@@ -430,17 +468,36 @@ addToLibrary({
     wasmfsOPFSProxyFinish(ctx);
   },
 
-  _wasmfs_opfs_close_access__deps: ['$wasmfsOPFSAccessHandles', '$wasmfsOPFSProxyFinish'],
+  _wasmfs_opfs_close_access__deps: ['$wasmfsOPFSAccessHandles', '$wasmfsOPFSProxyFinish',
+#if WASMFS_OPFS_TEST_CLOSE_FAILURE
+                                     '$wasmfsOPFSTestCloseFailureState',
+                                     '$wasmfsOPFSTestCloseFailureTrace',
+#endif
+                                    ],
   _wasmfs_opfs_close_access__async: 'auto',
   _wasmfs_opfs_close_access: async (ctx, accessID, errPtr) => {
     let accessHandle = wasmfsOPFSAccessHandles.get(accessID);
+    let closed = false;
     try {
+#if WASMFS_OPFS_TEST_CLOSE_FAILURE
+      if (!wasmfsOPFSTestCloseFailureState.injected) {
+        wasmfsOPFSTestCloseFailureState.injected = true;
+        wasmfsOPFSTestCloseFailureTrace('close-rejected', accessID);
+        throw new Error('injected OPFS access close failure');
+      }
+#endif
       await accessHandle.close();
+      closed = true;
     } catch {
       let err = -{{{ cDefs.EIO }}};
       {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
     }
-    wasmfsOPFSAccessHandles.free(accessID);
+    // A rejected close leaves the browser resource's state ambiguous. Keep the
+    // slot strongly referenced and unavailable for reuse until the backend's
+    // worker context is torn down.
+    if (closed) {
+      wasmfsOPFSAccessHandles.free(accessID);
+    }
     wasmfsOPFSProxyFinish(ctx);
   },
 
