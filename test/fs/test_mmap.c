@@ -53,6 +53,11 @@ void test_mmap_write() {
   assert(write(fd, "", 1) != -1);
 
   char *map = (char*)mmap(0, textsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+#if WASMFS
+  assert(map == MAP_FAILED);
+  assert(errno == ENOTSUP);
+  close(fd);
+#else
   assert(map != MAP_FAILED);
 
   for (size_t i = 0; i < textsize; i++) {
@@ -62,6 +67,7 @@ void test_mmap_write() {
   assert(msync(map, textsize, MS_SYNC) != -1);
   assert(munmap(map, textsize) != -1);
   close(fd);
+#endif
 
   {
     FILE* fd = fopen("out.txt", "r");
@@ -170,6 +176,11 @@ void test_mmap_shared_with_offset() {
   assert(errno == EINVAL);
 
   map = (char*)mmap(0, textsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+#if WASMFS
+  assert(map == MAP_FAILED);
+  assert(errno == ENOTSUP);
+  close(fd);
+#else
   assert(map != MAP_FAILED);
 
   for (size_t i = 0; i < textsize; i++) {
@@ -179,6 +190,7 @@ void test_mmap_shared_with_offset() {
   assert(msync(map, textsize, MS_SYNC) != -1);
   assert(munmap(map, textsize) != -1);
   close(fd);
+#endif
 
   {
     FILE* fd = fopen("sharedoffset.txt", "r");

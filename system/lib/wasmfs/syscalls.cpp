@@ -1776,6 +1776,14 @@ int _mmap_js(size_t length,
     return -ENODEV;
   }
 
+  // WasmFS currently maps a copy and writes it back through an fd on sync.
+  // It cannot provide MAP_SHARED writable mapping lifetime, coherence, or
+  // writeback error semantics, so fail instead of accepting unsafe writes.
+  if (!(flags & MAP_ANONYMOUS) && mapType == MAP_SHARED &&
+      (prot & PROT_WRITE)) {
+    return -ENOTSUP;
+  }
+
   // TODO: On MAP_SHARED, install the mapping on the DataFile object itself so
   // that reads and writes can be redirected to the mapped region and so that
   // the mapping can correctly outlive the file being closed. This will require

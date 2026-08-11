@@ -1,0 +1,5 @@
+in.txt content=mmap ftw!
+out.txt content=
+outreadonly.txt content=readonly mmap
+private.txt content=
+sharedoffset.txt content= 131072

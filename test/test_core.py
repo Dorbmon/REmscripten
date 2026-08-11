@@ -5949,7 +5949,8 @@ got: 10
   def test_fs_mmap(self):
     if self.get_setting('WASMFS'):
       self.set_setting('FORCE_FILESYSTEM')
-    self.do_run_in_out_file_test('fs/test_mmap.c')
+    suffix = '.wasmfs' if self.get_setting('WASMFS') else ''
+    self.do_run_in_out_file_test('fs/test_mmap.c', out_suffix=suffix)
 
   @no_wasmfs('wasmfs will (?) need a non-JS mechanism to ignore permissions during startup')
   @also_with_minimal_runtime
