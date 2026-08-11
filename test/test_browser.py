@@ -5630,6 +5630,169 @@ Module["preRun"] = () => {
                             '-sWASMFS_OPFS_TEST_QUOTA_WRITABLE_TRUNCATE=1'])
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_write_file(self):
+    test = test_file('wasmfs/wasmfs_opfs_write_file.c')
+    common_args = ['-sWASMFS', '-sFORCE_FILESYSTEM', '-pthread',
+                   '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME', '-lopfs.js']
+    create_file('write-file-holder-pre.js', r'''
+      // The C holder calls FS.writeFile from its runtime pthread. This hook
+      // only confirms that its later orderly teardown did not abort.
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-write-file',
+          },
+          window.location.origin);
+      };
+    ''')
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_WRITE_FILE_HOLDER', '--pre-js',
+                     'write-file-holder-pre.js', '-o',
+                     'write-file-normal-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-o', 'write-file-normal-contender.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_WRITE_FILE_HOLDER',
+                     '-DWASMFS_OPFS_WRITE_FILE_QUOTA',
+                     '-sWASMFS_OPFS_TEST_QUOTA_WRITE=1', '--pre-js',
+                     'write-file-holder-pre.js', '-o',
+                     'write-file-quota-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_WRITE_FILE_HOLDER',
+                     '-DWASMFS_OPFS_WRITE_FILE_CLOSE_FAILURE',
+                     '-sWASMFS_OPFS_TEST_QUOTA_WRITE=1',
+                     '-sWASMFS_OPFS_TEST_CLOSE_FAILURE=1', '--pre-js',
+                     'write-file-holder-pre.js', '-o',
+                     'write-file-close-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_WRITE_FILE_CLOSE_FAILURE', '-o',
+                     'write-file-close-contender.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kModuleTimeoutMs = 15000;
+        const pendingModules = new Map();
+        const pendingHolderExits = new Map();
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for holder shutdown'));
+            }, kModuleTimeoutMs);
+            pendingHolderExits.set(
+              frame.contentWindow, {resolve, reject, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != 'wasmfs-opfs-write-file') {
+            return;
+          }
+          if (event.data.event == 'holder-exit') {
+            const pending = pendingHolderExits.get(event.source);
+            if (!pending) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pending.timeout);
+            if (event.data.status != 0) {
+              pending.reject(new Error(
+                'holder did not exit cleanly: status=' + event.data.status));
+            } else {
+              pending.resolve();
+            }
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function runScenario(name, holderPath, contenderPath) {
+          const holder = await startModule(holderPath);
+          if (holder.message.role != kHolder || holder.message.error != 0) {
+            throw new Error(name + ' holder failed: role=' +
+                            holder.message.role + ', errno=' +
+                            holder.message.error);
+          }
+
+          // This is a distinct Wasm module and OPFS backend. It can acquire a
+          // writer only if the holder's runtime-pthread FS.writeFile operation
+          // closed its SyncAccessHandle (except in the close-failure scenario,
+          // where the C contender explicitly expects EACCES).
+          const contender = await startModule(contenderPath);
+          if (contender.message.role != kContender ||
+              contender.message.error != 0) {
+            throw new Error(name + ' contender failed: role=' +
+                            contender.message.role + ', errno=' +
+                            contender.message.error);
+          }
+
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_opfs_write_file_holder_shutdown();
+          await holderExit;
+          contender.frame.remove();
+          holder.frame.remove();
+        }
+
+        (async () => {
+          await runScenario('normal', 'write-file-normal-holder.html',
+                            'write-file-normal-contender.html');
+          await runScenario('quota failure', 'write-file-quota-holder.html',
+                            'write-file-normal-contender.html');
+          await runScenario('close failure', 'write-file-close-holder.html',
+                            'write-file-close-contender.html');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=90)
+
+  @no_firefox('no OPFS support yet')
   @no_safari('no Web Locks support yet')
   @no_wasm64()
   def test_wasmfs_opfs_profile_lease(self):

@@ -221,7 +221,7 @@ addToLibrary({
       _free(dataBuffer);
       return FS.handleError(bytesRead);
     },
-    writeFile: (path, data) => FS_writeFile(path, data),
+    writeFile: (path, data, opts) => FS_writeFile(path, data, opts),
     mmap: (stream, length, offset, prot, flags) => {
       var buf = FS.handleError(__wasmfs_mmap(length, prot, flags, stream.fd, {{{ splitI64('offset') }}}));
       return { ptr: buf, allocated: true };
@@ -509,22 +509,67 @@ addToLibrary({
     return FS_mknod(path, mode, 0);
   },
 
-  $FS_writeFile__deps: ['$FS_fileDataToTypedArray', '_wasmfs_write_file', '$stackSave', '$stackRestore', 'malloc', 'free'],
+#if FORCE_FILESYSTEM || INCLUDE_FULL_LIBRARY
+  $FS_writeFile__deps: ['$FS_fileDataToTypedArray'],
+  $FS_writeFile: (path, data, opts) => {
+    // Match the legacy JS FS contract: write the whole input through the normal
+    // descriptor path, default to "w", and return undefined. The close attempt
+    // must happen after every write outcome; a close error wins because it can
+    // leave an OPFS SyncAccessHandle live.
+    if (opts === undefined) {
+      opts = {};
+    }
+    opts.flags = opts.flags || {{{ cDefs.O_TRUNC }}} | {{{ cDefs.O_CREAT }}} |
+                              {{{ cDefs.O_WRONLY }}};
+    var stream = FS.open(path, opts.flags, opts.mode);
+    var error;
+    try {
+      data = FS_fileDataToTypedArray(data);
+      var written = FS.write(
+        stream, data, 0, data.byteLength, undefined, opts.canOwn);
+      if (written != data.byteLength) {
+        error = new FS.ErrnoError({{{ cDefs.EIO }}});
+      }
+    } catch (e) {
+      error = e;
+    } finally {
+      try {
+        FS.close(stream);
+      } catch (e) {
+        error = e;
+      }
+    }
+    if (error) {
+      throw error;
+    }
+  },
+#else
+  // Keep the minimal preloading path available when the public JS FS object
+  // does not include open/write/close. The exported helper has the same
+  // default flags and reports negative errno values to FS.handleError.
+  $FS_writeFile__deps: ['$FS_fileDataToTypedArray', '_wasmfs_write_file',
+                        '$stackSave', '$stackRestore', 'malloc', 'free'],
   $FS_writeFile: (path, data) => {
     var sp = stackSave();
-    var pathBuffer = stringToUTF8OnStack(path);
-    data = FS_fileDataToTypedArray(data);
-    var len = data.length;
-    var dataBuffer = _malloc(len);
+    var dataBuffer = 0;
+    var ret;
+    try {
+      var pathBuffer = stringToUTF8OnStack(path);
+      data = FS_fileDataToTypedArray(data);
+      var len = data.length;
+      dataBuffer = _malloc(len || 1);
 #if ASSERTIONS
-    assert(dataBuffer);
+      assert(dataBuffer);
 #endif
-    HEAPU8.set(data, dataBuffer);
-    var ret = __wasmfs_write_file(pathBuffer, dataBuffer, len);
-    _free(dataBuffer);
-    stackRestore(sp);
-    return ret;
+      HEAPU8.set(data, dataBuffer);
+      ret = __wasmfs_write_file(pathBuffer, dataBuffer, len);
+    } finally {
+      _free(dataBuffer);
+      stackRestore(sp);
+    }
+    FS.handleError(ret);
   },
+#endif
 
   $FS_mkdir__deps: ['_wasmfs_mkdir'],
   $FS_mkdir: (path, mode = 0o777) => FS.handleError(withStackSave(() => {

@@ -3,14 +3,15 @@
 // University of Illinois/NCSA Open Source License.  Both these licenses can be
 // found in the LICENSE file.
 
+#include <assert.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <emscripten/wasmfs.h>
 #include <emscripten/syscalls.h>
-
-#include "backend.h"
-#include "file.h"
-#include "paths.h"
 
 // Some APIs return data using a thread-local allocation that is never freed.
 // This is simpler and more efficient as it avoids the JS caller needing to free
@@ -18,8 +19,6 @@
 // call back into wasm), but on the other hand it does mean more memory may be
 // used. This seems a reasonable tradeoff as heavy workloads should ideally
 // avoid the JS API anyhow.
-
-using namespace wasmfs;
 
 extern "C" {
 
@@ -62,56 +61,55 @@ int _wasmfs_read_file(const char* path, uint8_t** out_buf, off_t* out_size) {
   return 0;
 }
 
-// Writes to a file, possibly creating it, and returns the number of bytes
-// written successfully. If the file already exists, appends to it.
+// Write the complete buffer using the legacy FS.writeFile default flags.
+//
+// This function remains exported for JS users of the low-level WasmFS API.
+// Route it through normal descriptors rather than opening a DataFile directly:
+// that gives it the same path, symlink, permission, truncate, and access-handle
+// lifetime behavior as the public FS.open/write/close sequence. Preserve this
+// low-level export's byte-count success result, and return a negative errno on
+// failure.
 int _wasmfs_write_file(const char* pathname, const uint8_t* data, size_t data_size) {
-  auto parsedParent = path::parseParent(pathname);
-  if (parsedParent.getError()) {
-    return 0;
+  if (!data && data_size) {
+    return -EINVAL;
   }
-  auto& [parent, childNameView] = parsedParent.getParentChild();
-  std::string childName(childNameView);
+  if (data_size > INT_MAX) {
+    return -EFBIG;
+  }
 
-  std::shared_ptr<File> child;
-  {
-    auto lockedParent = parent->locked();
-    child = lockedParent.getChild(childName);
-    if (!child) {
-      // Lookup failed; try creating the file.
-      child = lockedParent.insertDataFile(childName, 0777);
-      if (!child) {
-        // File creation failed; nothing else to do.
-        return 0;
-      }
+  int fd = open(pathname, O_TRUNC | O_CREAT | O_WRONLY, 0666);
+  if (fd < 0) {
+    return -(errno ? errno : EIO);
+  }
+
+  int writeErr = 0;
+  size_t written = 0;
+  while (written < data_size) {
+    ssize_t result = write(fd, data + written, data_size - written);
+    if (result < 0) {
+      writeErr = -(errno ? errno : EIO);
+      break;
     }
+    if (result == 0) {
+      // A successful zero-byte write before the whole buffer is consumed
+      // cannot make progress. Do not report a completed FS.writeFile call.
+      writeErr = -EIO;
+      break;
+    }
+    if (static_cast<size_t>(result) > data_size - written) {
+      writeErr = -EIO;
+      break;
+    }
+    written += result;
   }
 
-  auto dataFile = child->dynCast<DataFile>();
-  if (!dataFile) {
-    // There is something here but it isn't a data file.
-    return 0;
+  // A close failure can leave an OPFS SyncAccessHandle live. It therefore
+  // takes precedence over an earlier write failure after the required cleanup
+  // attempt has completed.
+  if (close(fd) < 0) {
+    return -(errno ? errno : EIO);
   }
-
-  auto lockedFile = dataFile->locked();
-  int err = lockedFile.open(O_WRONLY);
-  if (err < 0) {
-    emscripten_err("Fatal error in FS.writeFile");
-    abort();
-  }
-
-  auto offset = lockedFile.getSize();
-  auto result = lockedFile.write(data, data_size, offset);
-  if (result != __WASI_ERRNO_SUCCESS) {
-    return 0;
-  }
-
-  err = lockedFile.close();
-  if (err < 0) {
-    emscripten_err("Fatal error in FS.writeFile");
-    abort();
-  }
-
-  return data_size;
+  return writeErr ? writeErr : static_cast<int>(written);
 }
 
 int _wasmfs_mkdir(const char* path, int mode) {
