@@ -399,6 +399,11 @@ addToLibrary({
       }
 #endif
       var backendPointer = type.createBackend(opts);
+      // A null backend would make WasmFS silently fall back to the parent
+      // backend, creating a normal directory instead of mounting the type.
+      if (!backendPointer) {
+        throw new FS.ErrnoError({{{ cDefs.EINVAL }}});
+      }
       return FS.handleError(withStackSave(() => __wasmfs_mount(stringToUTF8OnStack(mountpoint), backendPointer)));
     },
     unmount: (mountpoint) => (

@@ -48,6 +48,16 @@ int main() {
     }
     assert(ex.name === 'ErrnoError' && ex.errno === 55); // ENOTEMPTY
     ex = null;
+
+    // A failed backend factory must not silently use the parent backend.
+    try {
+      FS.mount({ createBackend() {} }, {}, '/invalid-backend');
+    } catch (e) {
+      ex = e;
+    }
+    assert(ex.name === 'ErrnoError' && ex.errno === 28); // EINVAL
+    assert(FS.findObject('/invalid-backend') === null);
+    ex = null;
 #endif
 
     // mount to an existing mountpoint
