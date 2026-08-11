@@ -13255,6 +13255,12 @@ Module.postRun = () => {{
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test('wasmfs/wasmfs_fdatasync.c')
 
+  def test_wasmfs_sync_open_unsupported(self):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test(
+        'wasmfs/wasmfs_sync_open_unsupported.c',
+        cflags=['-sASSERTIONS=0'])
+
   def test_wasmfs_mmap_shared_write_unsupported(self):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test(
