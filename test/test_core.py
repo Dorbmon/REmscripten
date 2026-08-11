@@ -6011,6 +6011,11 @@ Module.onRuntimeInitialized = () => {
   def test_fs_llseek(self):
     self.do_runf('fs/test_llseek.c', 'success', cflags=['-sFORCE_FILESYSTEM'])
 
+  @also_without_bigint
+  def test_wasmfs_llseek(self):
+    self.setup_wasmfs_test()
+    self.do_runf('fs/test_llseek.c', 'success', cflags=['-sFORCE_FILESYSTEM'])
+
   @also_with_noderawfs
   def test_fs_readv(self):
     self.do_runf('fs/test_readv.c', 'success', cflags=['-sFORCE_FILESYSTEM'])

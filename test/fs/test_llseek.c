@@ -23,9 +23,11 @@ int main()
     }
     assert(ex instanceof FS.ErrnoError && ex.errno === 28 /* EINVAL */);
 
-    if (FS.llseek(stream, 0, 1 /* SEEK_CUR */) === 11) {
-      console.log("success");
-    }
+    assert(FS.llseek(stream, 0, 1 /* SEEK_CUR */) === 11);
+    assert(FS.llseek(stream, 0x80000000, 0 /* SEEK_SET */) === 0x80000000);
+    assert(FS.llseek(stream, 0x100000007, 1 /* SEEK_CUR */) === 0x180000007);
+
+    console.log("success");
     FS.close(stream);
   );
 
