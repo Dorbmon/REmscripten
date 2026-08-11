@@ -1841,6 +1841,12 @@ var WASMFS_OPFS_TEST_MOVE_INTERRUPT = 0;
 // [link]
 var WASMFS_OPFS_TEST_CLOSE_FAILURE = 0;
 
+// Test-only selector that traces OPFS FileSystemFileHandle allocation and
+// release in the dedicated ProxyWorker. This controls code emitted at link
+// time only; it does not describe browser-wide handle capacity.
+// [link]
+var WASMFS_OPFS_TEST_FILE_HANDLE_CACHE = 0;
+
 // If set to 1, embeds all subresources in the emitted file as base64 string
 // literals. Embedded subresources may include (but aren't limited to) wasm,
 // asm.js, and static memory initialization code.

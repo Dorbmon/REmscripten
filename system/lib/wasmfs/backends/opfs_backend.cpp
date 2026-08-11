@@ -5,9 +5,11 @@
 
 #include <emscripten/threading.h>
 #include <errno.h>
+#include <mutex>
 #include <stdlib.h>
 
 #include <string>
+#include <utility>
 
 #include "backend.h"
 #include "file.h"
@@ -179,13 +181,64 @@ public:
 };
 
 class OPFSFile : public DataFile {
-public:
+  // The JS FileSystemFileHandle is intentionally not retained while this file
+  // is idle. Unlike the handle, this C++ object remains in the dcache so that
+  // WasmFS file identity (including the pointer-derived inode number) stays
+  // stable across a close and later reopen.
   Worker& proxy;
-  int fileID;
+  int fileID = -1;
+  int parentID;
+  std::string name;
   OpenState state;
 
-  OPFSFile(mode_t mode, backend_t backend, int fileID, Worker& proxy)
-    : DataFile(mode, backend), proxy(proxy), fileID(fileID) {}
+  // The File mutex protects the open state, JS file-handle ID, and locator.
+  // Keep the locator locally rather than deriving it from Directory::getName:
+  // normal file operations already hold this mutex and must not acquire the
+  // parent directory lock.
+  int ensureFileID() {
+    assert(fileID >= 0 || state.getKind() == OpenState::None);
+    if (fileID >= 0) {
+      return 0;
+    }
+    // removeChild clears the weak parent before dropping the dcache entry. Do
+    // not reacquire a handle for an unlinked file whose directory ID may later
+    // be reused in the JS allocator.
+    auto currentParent = parent.lock();
+    if (!currentParent) {
+      return -ENOENT;
+    }
+
+    int newFileID = -1;
+    proxy([&](auto ctx) {
+      _wasmfs_opfs_acquire_file(
+        ctx.ctx, parentID, name.c_str(), &newFileID);
+    });
+    if (newFileID < 0) {
+      return newFileID;
+    }
+    fileID = newFileID;
+    return 0;
+  }
+
+  void releaseFileIDIfIdle() {
+    // FailedAccessClose is the intentional narrow exception: its ambiguous
+    // SyncAccessHandle keeps the associated FileSystemFileHandle pinned until
+    // wrapper teardown. Every healthy idle wrapper releases its JS reference.
+    if (state.getKind() != OpenState::None || fileID < 0) {
+      return;
+    }
+    proxy([&]() { _wasmfs_opfs_free_file(fileID); });
+    fileID = -1;
+  }
+
+public:
+  OPFSFile(mode_t mode,
+           backend_t backend,
+           int parentID,
+           std::string name,
+           Worker& proxy)
+    : DataFile(mode, backend), proxy(proxy), parentID(parentID),
+      name(std::move(name)) {}
 
   ~OPFSFile() override {
     // A rejected AccessHandle close remains intentionally quarantined in the
@@ -193,18 +246,52 @@ public:
     // still be destroyed without pretending the close succeeded.
     assert(state.getKind() == OpenState::None ||
            state.getKind() == OpenState::FailedAccessClose);
-    proxy([&]() { _wasmfs_opfs_free_file(fileID); });
+    if (fileID >= 0) {
+      proxy([&]() { _wasmfs_opfs_free_file(fileID); });
+    }
+  }
+
+  int moveTo(int newParentID, const std::string& newName) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (state.getKind() == OpenState::FailedAccessClose) {
+      return -EIO;
+    }
+    if (int err = ensureFileID()) {
+      return err;
+    }
+
+    int err = 0;
+    proxy([&](auto ctx) {
+      _wasmfs_opfs_move_file(
+        ctx.ctx, fileID, newParentID, newName.c_str(), &err);
+    });
+    if (err == 0) {
+      // Do not update this before the browser move succeeds: a later lazy
+      // reacquisition must still name the old file after a failed move.
+      parentID = newParentID;
+      name = newName;
+    }
+    // A successful or failed move that began from an idle wrapper is a
+    // one-shot file-handle operation. Keep a handle only when the file is
+    // still open or deliberately poisoned by a failed access close.
+    releaseFileIDIfIdle();
+    return err;
   }
 
 private:
   off_t getSize() override {
     off_t size;
     switch (state.getKind()) {
-      case OpenState::None:
+      case OpenState::None: {
+        if (int err = ensureFileID()) {
+          return err;
+        }
         proxy([&](auto ctx) {
           _wasmfs_opfs_get_size_file(ctx.ctx, fileID, &size);
         });
+        releaseFileIDIfIdle();
         break;
+      }
       case OpenState::Access:
         proxy([&](auto ctx) {
           _wasmfs_opfs_get_size_access(ctx.ctx, state.getAccessID(), &size);
@@ -239,9 +326,13 @@ private:
         // file and do something better here?
         return -EIO;
       case OpenState::None: {
+        if (int err = ensureFileID()) {
+          return err;
+        }
         proxy([&](auto ctx) {
           _wasmfs_opfs_set_size_file(ctx.ctx, fileID, size, &err);
         });
+        releaseFileIDIfIdle();
         break;
       }
       case OpenState::FailedAccessClose:
@@ -252,9 +343,27 @@ private:
     return err;
   }
 
-  int open(oflags_t flags) override { return state.open(proxy, fileID, flags); }
+  int open(oflags_t flags) override {
+    if (state.getKind() == OpenState::FailedAccessClose) {
+      return -EIO;
+    }
+    if (int err = ensureFileID()) {
+      return err;
+    }
+    int err = state.open(proxy, fileID, flags);
+    // Failed opens do not leave an open state to own an idle file handle.
+    releaseFileIDIfIdle();
+    return err;
+  }
 
-  int close() override { return state.close(proxy); }
+  int close() override {
+    int err = state.close(proxy);
+    // Keep a rejected close's FileSystemFileHandle only alongside its
+    // quarantined SyncAccessHandle. A successful final close has no need for
+    // an idle strong JS file-handle reference.
+    releaseFileIDIfIdle();
+    return err;
+  }
 
   ssize_t read(uint8_t* buf, size_t len, off_t offset) override {
     // TODO: use an i64 here.
@@ -344,7 +453,8 @@ private:
       return NULL;
     }
     if (childType == 1) {
-      return std::make_shared<OPFSFile>(0777, getBackend(), childID, proxy);
+      return std::make_shared<OPFSFile>(
+        0777, getBackend(), dirID, name, proxy);
     } else if (childType == 2) {
       return std::make_shared<OPFSDirectory>(
         0777, getBackend(), childID, proxy);
@@ -363,7 +473,8 @@ private:
       // TODO: Propagate specific errors.
       return nullptr;
     }
-    return std::make_shared<OPFSFile>(mode, getBackend(), childID, proxy);
+    return std::make_shared<OPFSFile>(
+      mode, getBackend(), dirID, name, proxy);
   }
 
   std::shared_ptr<Directory> insertDirectory(const std::string& name,
@@ -387,20 +498,15 @@ private:
   }
 
   int insertMove(const std::string& name, std::shared_ptr<File> file) override {
-    int err = 0;
     if (file->is<DataFile>()) {
       auto opfsFile = std::static_pointer_cast<OPFSFile>(file);
-      proxy([&](auto ctx) {
-        _wasmfs_opfs_move_file(
-          ctx.ctx, opfsFile->fileID, dirID, name.c_str(), &err);
-      });
+      return opfsFile->moveTo(dirID, name);
     } else {
       // TODO: Support moving directories once OPFS supports that.
       // EBUSY can be returned when the directory is "in use by the system,"
       // which can mean whatever we want.
-      err = -EBUSY;
+      return -EBUSY;
     }
-    return err;
   }
 
   int removeChild(const std::string& name) override {

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -20,6 +21,7 @@ enum TestRole {
 };
 
 static const char kTargetPath[] = "/opfs/wasmfs-opfs-close-failure-target";
+static const char kMovedPath[] = "/opfs/wasmfs-opfs-close-failure-moved";
 static const char kOtherPath[] = "/opfs/wasmfs-opfs-close-failure-other";
 
 #ifdef WASMFS_OPFS_CLOSE_FAILURE_HOLDER
@@ -118,6 +120,16 @@ static int ExerciseFailedClose(void) {
     return ErrorOrEIO();
   }
 
+  // Rename must reject the same poisoned wrapper rather than operating with
+  // its deliberately pinned FileSystemFileHandle.
+  errno = 0;
+  if (rename(kTargetPath, kMovedPath) == 0) {
+    return EIO;
+  }
+  if (errno != EIO) {
+    return ErrorOrEIO();
+  }
+
   // This unrelated file forces a subsequent access allocation. The browser
   // harness compares its trace ID with the retained target ID.
   int other = open(kOtherPath, O_CREAT | O_EXCL | O_RDWR, 0600);
@@ -135,6 +147,7 @@ int main(void) {
   if (error == 0) {
     // The test may be rerun against the same OPFS origin.
     (void)unlink(kTargetPath);
+    (void)unlink(kMovedPath);
     (void)unlink(kOtherPath);
     error = ExerciseFailedClose();
   }

@@ -22,20 +22,31 @@ void _wasmfs_opfs_acquire_profile_lease(em_proxying_ctx* ctx,
 void _wasmfs_opfs_release_profile_lease(em_proxying_ctx* ctx, int* err);
 
 // Look up the child under `parent` with `name`. Write 1 to `child_type` if it's
-// a regular file or 2 if it's a directory. Write the child's file or directory
-// ID to `child_id`, or -1 if the child does not exist, or -2 if the child
-// exists but cannot be opened.
+// a regular file or 2 if it's a directory. For a regular file, write zero to
+// `child_id`: its OPFSFile wrapper acquires a FileSystemFileHandle lazily. For
+// a directory, write its directory ID. Write a negative error to `child_id` if
+// the child does not exist or cannot be opened.
 void _wasmfs_opfs_get_child(em_proxying_ctx* ctx,
                             int parent,
                             const char* name,
                             int* child_type,
                             int* child_id);
 
-// Create a file under `parent` with `name` and store its ID in `child_id`.
+// Create a file under `parent` with `name` and write zero to `child_id`. Its
+// OPFSFile wrapper acquires a FileSystemFileHandle lazily.
 void _wasmfs_opfs_insert_file(em_proxying_ctx* ctx,
                               int parent,
                               const char* name,
                               int* child_id);
+
+// Acquire a FileSystemFileHandle for an existing regular file. This is used
+// when an OPFSFile retains its WasmFS identity but has released its idle JS
+// file-handle reference. Write the handle ID or a negative errno to
+// `file_id`.
+void _wasmfs_opfs_acquire_file(em_proxying_ctx* ctx,
+                               int parent,
+                               const char* name,
+                               int* file_id);
 
 // Create a directory under `parent` with `name` and store its ID in `child_id`.
 void _wasmfs_opfs_insert_directory(em_proxying_ctx* ctx,

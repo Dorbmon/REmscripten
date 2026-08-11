@@ -12,6 +12,10 @@
 #error "WASMFS_OPFS_TEST_CLOSE_FAILURE must be 0 or 1"
 #endif
 
+#if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE != 0 && WASMFS_OPFS_TEST_FILE_HANDLE_CACHE != 1
+#error "WASMFS_OPFS_TEST_FILE_HANDLE_CACHE must be 0 or 1"
+#endif
+
 addToLibrary({
   $wasmfsOPFSDirectoryHandles__deps: ['$HandleAllocator'],
   $wasmfsOPFSDirectoryHandles: "new HandleAllocator()",
@@ -61,6 +65,29 @@ addToLibrary({
       accessID,
       phase,
       type: 'wasmfs-opfs-test-close-failure',
+    });
+  },
+#endif
+
+#if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE
+  // This test-only trace observes strong FileSystemFileHandle references in
+  // the OPFS ProxyWorker. It deliberately says nothing about directory,
+  // Blob, SyncAccessHandle, browser-wide, or persistence capacity.
+  $wasmfsOPFSTestFileHandleCacheTraceState: {
+    channel: undefined,
+  },
+  $wasmfsOPFSTestFileHandleCacheTrace__deps: [
+    '$wasmfsOPFSTestFileHandleCacheTraceState',
+  ],
+  $wasmfsOPFSTestFileHandleCacheTrace: (phase, fileID) => {
+    if (!wasmfsOPFSTestFileHandleCacheTraceState.channel) {
+      wasmfsOPFSTestFileHandleCacheTraceState.channel = new BroadcastChannel(
+        'wasmfs-opfs-test-file-handle-cache');
+    }
+    wasmfsOPFSTestFileHandleCacheTraceState.channel.postMessage({
+      fileID,
+      phase,
+      type: 'wasmfs-opfs-test-file-handle-cache',
     });
   },
 #endif
@@ -222,16 +249,14 @@ addToLibrary({
     wasmfsOPFSProxyFinish(ctx);
   },
 
-  // Return the file ID for the file with `name` under `parent`, creating it if
-  // it doesn't exist and `create` or otherwise return a negative error code
-  // corresponding to the error.
-  $wasmfsOPFSGetOrCreateFile__deps: ['$wasmfsOPFSDirectoryHandles',
-                                     '$wasmfsOPFSFileHandles'],
+  // Look up the file with `name` under `parent`, creating it if requested.
+  // The C++ OPFSFile wrapper acquires a FileSystemFileHandle only when an
+  // operation needs it, so a metadata-only lookup does not retain one.
+  $wasmfsOPFSGetOrCreateFile__deps: ['$wasmfsOPFSDirectoryHandles'],
   $wasmfsOPFSGetOrCreateFile: async (parent, name, create) => {
     let parentHandle = wasmfsOPFSDirectoryHandles.get(parent);
-    let fileHandle;
     try {
-      fileHandle = await parentHandle.getFileHandle(name, {create: create});
+      await parentHandle.getFileHandle(name, {create: create});
     } catch (e) {
       if (e.name === "NotFoundError") {
         return -{{{ cDefs.EEXIST }}};
@@ -244,7 +269,7 @@ addToLibrary({
 #endif
       return -{{{ cDefs.EIO }}};
     }
-    return wasmfsOPFSFileHandles.allocate(fileHandle);
+    return 0;
   },
 
   // Return the file ID for the directory with `name` under `parent`, creating
@@ -327,6 +352,41 @@ addToLibrary({
     wasmfsOPFSProxyFinish(ctx);
   },
 
+  _wasmfs_opfs_acquire_file__deps: [
+    '$wasmfsOPFSDirectoryHandles',
+    '$wasmfsOPFSFileHandles',
+#if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE
+    '$wasmfsOPFSTestFileHandleCacheTrace',
+#endif
+    '$wasmfsOPFSProxyFinish',
+  ],
+  _wasmfs_opfs_acquire_file__async: 'auto',
+  _wasmfs_opfs_acquire_file: async (ctx, parent, namePtr, fileIDPtr) => {
+    let fileID;
+    try {
+      let name = UTF8ToString(namePtr);
+      let parentHandle = wasmfsOPFSDirectoryHandles.get(parent);
+      let fileHandle = await parentHandle.getFileHandle(name);
+      fileID = wasmfsOPFSFileHandles.allocate(fileHandle);
+#if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE
+      wasmfsOPFSTestFileHandleCacheTrace('acquire', fileID);
+#endif
+    } catch (e) {
+      if (e.name === 'NotFoundError') {
+        fileID = -{{{ cDefs.ENOENT }}};
+      } else if (e.name === 'TypeMismatchError') {
+        fileID = -{{{ cDefs.EISDIR }}};
+      } else {
+#if ASSERTIONS
+        err('unexpected error:', e, e.stack);
+#endif
+        fileID = -{{{ cDefs.EIO }}};
+      }
+    }
+    {{{ makeSetValue('fileIDPtr', 0, 'fileID', 'i32') }}};
+    wasmfsOPFSProxyFinish(ctx);
+  },
+
   _wasmfs_opfs_insert_directory__deps: ['$wasmfsOPFSGetOrCreateDir', '$wasmfsOPFSProxyFinish'],
   _wasmfs_opfs_insert_directory__async: 'auto',
   _wasmfs_opfs_insert_directory: async (ctx, parent, namePtr, childIDPtr) => {
@@ -380,9 +440,16 @@ addToLibrary({
     wasmfsOPFSProxyFinish(ctx);
   },
 
-  _wasmfs_opfs_free_file__deps: ['$wasmfsOPFSFileHandles'],
+  _wasmfs_opfs_free_file__deps: ['$wasmfsOPFSFileHandles',
+#if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE
+                                  '$wasmfsOPFSTestFileHandleCacheTrace',
+#endif
+                                 ],
   _wasmfs_opfs_free_file: (fileID) => {
     wasmfsOPFSFileHandles.free(fileID);
+#if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE
+    wasmfsOPFSTestFileHandleCacheTrace('release', fileID);
+#endif
   },
 
   _wasmfs_opfs_free_directory__deps: ['$wasmfsOPFSDirectoryHandles'],

@@ -5352,6 +5352,211 @@ Module["preRun"] = () => {
       cflags=['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js'])
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_file_handle_cache(self):
+    test = test_file('wasmfs/wasmfs_opfs_file_handle_cache.c')
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD',
+                   '-sEXIT_RUNTIME', '-lopfs.js']
+    create_file('file-handle-cache-pre.js', r'''
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'exit',
+            status,
+            type: 'wasmfs-opfs-file-handle-cache',
+          },
+          window.location.origin);
+      };
+    ''')
+    self.compile_btest(
+      test,
+      common_args + ['-sWASMFS_OPFS_TEST_FILE_HANDLE_CACHE=1', '--pre-js',
+                     'file-handle-cache-pre.js', '-o',
+                     'file-handle-cache.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kPrepared = 0;
+        const kIdle = 1;
+        const kFinished = 2;
+        const kModuleTimeoutMs = 15000;
+        const kTraceType = 'wasmfs-opfs-test-file-handle-cache';
+        const kResultType = 'wasmfs-opfs-file-handle-cache';
+        const phases = new Map();
+        const phaseWaiters = new Map();
+        const traceWaiters = new Set();
+        const exitWaiters = new Map();
+        const liveFileHandles = new Set();
+        let acquires = 0;
+        let releases = 0;
+        let frame;
+        const traceChannel = new BroadcastChannel(kTraceType);
+
+        function waitForPhase(phase) {
+          if (phases.has(phase)) {
+            return Promise.resolve(phases.get(phase));
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              phaseWaiters.delete(phase);
+              reject(new Error('timed out waiting for phase ' + phase));
+            }, kModuleTimeoutMs);
+            phaseWaiters.set(phase, {resolve, timeout});
+          });
+        }
+
+        function waitForTrace(expected) {
+          return new Promise((resolve, reject) => {
+            const check = () => {
+              if (acquires > expected || releases > expected) {
+                traceWaiters.delete(check);
+                clearTimeout(timeout);
+                reject(new Error('unexpected file-handle trace count: ' +
+                                 'acquires=' + acquires + ', releases=' +
+                                 releases + ', expected=' + expected));
+                return;
+              }
+              if (acquires == expected && releases == expected &&
+                  liveFileHandles.size == 0) {
+                traceWaiters.delete(check);
+                clearTimeout(timeout);
+                resolve();
+              }
+            };
+            const timeout = setTimeout(() => {
+              traceWaiters.delete(check);
+              reject(new Error('timed out waiting for ' + expected +
+                               ' balanced file-handle trace events; got ' +
+                               acquires + ' acquires, ' + releases +
+                               ' releases, and ' + liveFileHandles.size +
+                               ' live handles'));
+            }, kModuleTimeoutMs);
+            traceWaiters.add(check);
+            check();
+          });
+        }
+
+        function waitForExit(target) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              exitWaiters.delete(target);
+              reject(new Error('timed out waiting for clean module exit'));
+            }, kModuleTimeoutMs);
+            exitWaiters.set(target, {resolve, timeout});
+          });
+        }
+
+        traceChannel.onmessage = (event) => {
+          const trace = event.data;
+          if (trace?.type != kTraceType || !Number.isInteger(trace.fileID) ||
+              trace.fileID <= 0) {
+            return;
+          }
+          if (trace.phase == 'acquire') {
+            liveFileHandles.add(trace.fileID);
+            ++acquires;
+          } else if (trace.phase == 'release') {
+            liveFileHandles.delete(trace.fileID);
+            ++releases;
+          } else {
+            return;
+          }
+          for (const waiter of [...traceWaiters]) {
+            waiter();
+          }
+        };
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kResultType) {
+            return;
+          }
+          if (event.data.event == 'exit') {
+            const waiter = exitWaiters.get(event.source);
+            if (!waiter) {
+              return;
+            }
+            exitWaiters.delete(event.source);
+            clearTimeout(waiter.timeout);
+            if (event.data.status != 0) {
+              waiter.reject(new Error('module did not exit cleanly: status=' +
+                                      event.data.status));
+            } else {
+              waiter.resolve();
+            }
+            return;
+          }
+          if (!Number.isInteger(event.data.phase) ||
+              !Number.isInteger(event.data.error)) {
+            return;
+          }
+          const phase = event.data.phase;
+          const result = {error: event.data.error};
+          phases.set(phase, result);
+          const waiter = phaseWaiters.get(phase);
+          if (waiter) {
+            phaseWaiters.delete(phase);
+            clearTimeout(waiter.timeout);
+            waiter.resolve(result);
+          }
+        });
+
+        (async () => {
+          frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          frame.src = 'file-handle-cache.html';
+
+          let result = await waitForPhase(kPrepared);
+          if (result.error != 0) {
+            throw new Error('test setup failed: errno=' + result.error);
+          }
+
+          frame.contentWindow.Module._wasmfs_opfs_file_handle_cache_start();
+          result = await waitForPhase(kIdle);
+          if (result.error != 0) {
+            throw new Error('initial close failed: errno=' + result.error);
+          }
+          // The initial writable open/close must leave no strong idle
+          // FileSystemFileHandle reference in the ProxyWorker.
+          await waitForTrace(1);
+
+          frame.contentWindow.Module
+            ._wasmfs_opfs_file_handle_cache_continue();
+          result = await waitForPhase(kFinished);
+          if (result.error != 0) {
+            throw new Error('lazy reacquire test failed: errno=' + result.error);
+          }
+          // One initial open plus stat, truncate, rename, reopen, final stat,
+          // and the separate metadata probe each acquire and release exactly
+          // one JS file-handle slot. The probe's fresh-wrapper chmod adds none.
+          await waitForTrace(7);
+
+          const moduleExit = waitForExit(frame.contentWindow);
+          frame.contentWindow.Module
+            ._wasmfs_opfs_file_handle_cache_shutdown();
+          await moduleExit;
+          traceChannel.close();
+          frame.remove();
+          reportResultToServer('0');
+        })().catch((error) => {
+          traceChannel.close();
+          if (frame) {
+            frame.remove();
+          }
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=60)
+
+  @no_firefox('no OPFS support yet')
   @no_safari('no Web Locks support yet')
   @no_wasm64()
   def test_wasmfs_opfs_profile_lease(self):
