@@ -156,6 +156,25 @@ EM_JS(void, test_wasmfs_stat_error_stack, (int enoent), {
   expectENOENT(() => FS.stat('missing-js-api-stat'));
   expectENOENT(() => FS.lstat('missing-js-api-lstat'));
 });
+
+EM_JS(void, test_wasmfs_ftruncate_malformed_fd, (int ebadf), {
+  const path = 'wasmfs-ftruncate-wrapped-fd';
+  FS.writeFile(path, 'four');
+  const stream = FS.open(path, 'r+');
+  var ex;
+  try {
+    // The old i32 bridge coerced this back to stream.fd and truncated the
+    // actual file to one byte.
+    FS.ftruncate(stream.fd + 0x100000000, 1);
+  } catch (err) {
+    ex = err;
+  }
+  assert(ex && ex.name === 'ErrnoError' && ex.errno === ebadf,
+         `expected EBADF, got ${ex && ex.errno}`);
+  assert(FS.stat(path).size === 4);
+  FS.close(stream);
+  FS.unlink(path);
+});
 #endif
 
 // createPath should succeed when called on existing paths ( https://github.com/emscripten-core/emscripten/issues/23602 )
@@ -760,6 +779,7 @@ int main() {
   test_fs_error_propagation();
 #if WASMFS
   test_wasmfs_stat_error_stack(ENOENT);
+  test_wasmfs_ftruncate_malformed_fd(EBADF);
 #endif
 #if defined(NODERAWFS) && !WASMFS
   test_fs_readFile(EBADF, 0);

@@ -364,6 +364,11 @@ addToLibrary({
       return FS.handleError(withStackSave(() => (__wasmfs_truncate(stringToUTF8OnStack(path), {{{ splitI64('len') }}}))));
     },
     ftruncate(fd, len) {
+      // The Wasm bridge takes an i32, so reject values that JavaScript would
+      // coerce into a different descriptor.
+      if (!Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff) {
+        throw new FS.ErrnoError({{{ cDefs.EBADF }}});
+      }
       return FS.handleError(__wasmfs_ftruncate(fd, {{{ splitI64('len') }}}));
     },
     findObject(path) {
