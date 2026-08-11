@@ -55,21 +55,30 @@ int __syscall_dup3(int oldfd, int newfd, int flags) {
     return -EINVAL;
   }
 
-  auto fileTable = wasmFS.getFileTable().locked();
-  auto oldOpenFile = fileTable.getEntry(oldfd);
-  if (!oldOpenFile) {
-    return -EBADF;
-  }
-  if (newfd < 0 || newfd >= WASMFS_FD_MAX) {
-    return -EBADF;
-  }
-  if (oldfd == newfd) {
-    return -EINVAL;
-  }
+  std::shared_ptr<DataFile> closee;
+  {
+    auto fileTable = wasmFS.getFileTable().locked();
+    auto oldOpenFile = fileTable.getEntry(oldfd);
+    if (!oldOpenFile) {
+      return -EBADF;
+    }
+    if (newfd < 0 || newfd >= WASMFS_FD_MAX) {
+      return -EBADF;
+    }
+    if (oldfd == newfd) {
+      return -EINVAL;
+    }
 
-  // If the file descriptor newfd was previously open, it will just be
-  // overwritten silently.
-  (void)fileTable.setEntry(newfd, oldOpenFile);
+    // If the file descriptor newfd was previously open, it will just be
+    // overwritten silently. If it was the last reference to its open file
+    // state, close the data file after releasing the file table lock.
+    closee = fileTable.setEntry(newfd, oldOpenFile);
+  }
+  if (closee) {
+    // As with Linux dup2/dup3, errors from closing the overwritten descriptor
+    // cannot be returned after the replacement succeeds.
+    (void)closee->locked().close();
+  }
   return newfd;
 }
 
