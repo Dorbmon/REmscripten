@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 static void ExpectUnsupportedLockCommand(int fd, int command) {
@@ -21,6 +22,12 @@ static void ExpectUnsupportedLockCommand(int fd, int command) {
   assert(errno == ENOTSUP || errno == EOPNOTSUPP);
 }
 
+static void ExpectUnsupportedFlock(int fd, int operation) {
+  errno = 0;
+  assert(flock(fd, operation) == -1);
+  assert(errno == ENOTSUP || errno == EOPNOTSUPP);
+}
+
 int main(void) {
   const int fd = open("wasmfs_fcntl_locks", O_CREAT | O_RDWR | O_TRUNC, 0600);
   assert(fd >= 0);
@@ -28,6 +35,8 @@ int main(void) {
   ExpectUnsupportedLockCommand(fd, F_GETLK);
   ExpectUnsupportedLockCommand(fd, F_SETLK);
   ExpectUnsupportedLockCommand(fd, F_SETLKW);
+  ExpectUnsupportedFlock(fd, LOCK_EX | LOCK_NB);
+  ExpectUnsupportedFlock(fd, LOCK_UN);
 
   assert(close(fd) == 0);
   puts("success");
