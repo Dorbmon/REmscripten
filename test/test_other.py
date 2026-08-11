@@ -13289,6 +13289,15 @@ Module.postRun = () => {{
     self.do_run_in_out_file_test(
         'wasmfs/wasmfs_metadata_mutation.c', cflags=args)
 
+  @parameterized({
+    '': ([],),
+    'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
+  def test_wasmfs_ftruncate_descriptor_mode(self, args):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test(
+        'wasmfs/wasmfs_ftruncate_descriptor_mode.c', cflags=args)
+
   def test_wasmfs_mmap_shared_write_unsupported(self):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test(

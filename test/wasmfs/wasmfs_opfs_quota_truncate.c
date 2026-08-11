@@ -23,7 +23,9 @@ int main(void) {
   // The test may be rerun against the same OPFS origin after an interrupted
   // browser run.
   (void)unlink(kPath);
-  int fd = open(kPath, O_CREAT | O_EXCL | O_RDWR, 0600);
+  // OPFS cannot persist POSIX mode bits. A writable descriptor must still
+  // authorize ftruncate when the newly-created wrapper has no write bits.
+  int fd = open(kPath, O_CREAT | O_EXCL | O_RDWR, 0000);
   assert(fd >= 0);
 
   const size_t original_size = sizeof(kContents) - 1;

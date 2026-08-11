@@ -48,8 +48,9 @@ class PipeFile : public DataFile {
 
   off_t getSize() override { return data->size(); }
 
-  // TODO: Should this return an error?
-  int setSize(off_t size) override { return 0; }
+  // Pipes cannot be resized. In particular, ftruncate must not report a
+  // successful no-op when it has not changed the pipe's buffered data.
+  int setSize(off_t size) override { return -EINVAL; }
 
 public:
   // PipeFiles do not have or need a backend. Pass NullBackend to the parent for

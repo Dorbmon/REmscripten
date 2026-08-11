@@ -1460,7 +1460,12 @@ int __syscall_faccessat(int dirfd, intptr_t path, int amode, int flags) {
   return 0;
 }
 
-static int doTruncate(std::shared_ptr<File>& file, off_t size) {
+// Pathname truncation uses the file's current mode to authorize the operation.
+// ftruncate has already authorized a writable open file description instead;
+// that authorization remains valid if the logical file mode changes later.
+static int doTruncate(std::shared_ptr<File>& file,
+                      off_t size,
+                      bool checkFileWritePermission) {
   auto dataFile = file->dynCast<DataFile>();
 
   if (!dataFile) {
@@ -1468,7 +1473,8 @@ static int doTruncate(std::shared_ptr<File>& file, off_t size) {
   }
 
   auto locked = dataFile->locked();
-  if (!(locked.getMode() & WASMFS_PERM_WRITE)) {
+  if (checkFileWritePermission &&
+      !(locked.getMode() & WASMFS_PERM_WRITE)) {
     return -EACCES;
   }
 
@@ -1486,7 +1492,7 @@ int __syscall_truncate64(intptr_t path, off_t size) {
   if (auto err = parsed.getError()) {
     return err;
   }
-  return doTruncate(parsed.getFile(), size);
+  return doTruncate(parsed.getFile(), size, true);
 }
 
 int __syscall_ftruncate64(int fd, off_t size) {
@@ -1498,14 +1504,7 @@ int __syscall_ftruncate64(int fd, off_t size) {
   if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_RDONLY) {
     return -EINVAL;
   }
-  auto ret = doTruncate(lockedOpenFile.getFile(), size);
-  // XXX It is not clear from the docs why ftruncate would differ from
-  //     truncate here. However, on Linux this definitely happens, and the old
-  //     FS matches that as well, so do the same here.
-  if (ret == -EACCES) {
-    ret = -EINVAL;
-  }
-  return ret;
+  return doTruncate(lockedOpenFile.getFile(), size, false);
 }
 
 static bool isTTY(std::shared_ptr<File>& file) {
