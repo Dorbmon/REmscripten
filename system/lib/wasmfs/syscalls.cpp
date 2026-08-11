@@ -946,10 +946,15 @@ int __syscall_mkdirat(int dirfd, intptr_t path, int mode) {
   return doMkdir(path::parseParent((char*)path, dirfd), mode);
 }
 
-__wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
-                              __wasi_filedelta_t offset,
-                              __wasi_whence_t whence,
-                              __wasi_filesize_t* newoffset) {
+// The JavaScript-facing WasmFS bridge returns an f64, so it must not change a
+// descriptor position outside JavaScript's exact-integer i53 range.
+constexpr off_t JSExactOffsetLimit = INT64_C(1) << 53;
+
+static __wasi_errno_t doFdSeek(__wasi_fd_t fd,
+                               __wasi_filedelta_t offset,
+                               __wasi_whence_t whence,
+                               __wasi_filesize_t* newoffset,
+                               off_t maxPosition) {
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return __WASI_ERRNO_BADF;
@@ -986,6 +991,9 @@ __wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
   if (position < 0) {
     return __WASI_ERRNO_INVAL;
   }
+  if (position > maxPosition) {
+    return __WASI_ERRNO_OVERFLOW;
+  }
 
   lockedOpenFile.setPosition(position);
 
@@ -994,6 +1002,23 @@ __wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
   }
 
   return __WASI_ERRNO_SUCCESS;
+}
+
+__wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
+                              __wasi_filedelta_t offset,
+                              __wasi_whence_t whence,
+                              __wasi_filesize_t* newoffset) {
+  return doFdSeek(
+    fd, offset, whence, newoffset, std::numeric_limits<off_t>::max());
+}
+
+// This private variant preserves the JS bridge's exact-integer contract
+// without constraining native POSIX or WASI callers.
+__wasi_errno_t __wasmfs_fd_seek_for_js(__wasi_fd_t fd,
+                                       __wasi_filedelta_t offset,
+                                       __wasi_whence_t whence,
+                                       __wasi_filesize_t* newoffset) {
+  return doFdSeek(fd, offset, whence, newoffset, JSExactOffsetLimit);
 }
 
 static int doChdir(WasmFS::CWDTransition& cwdTransition,

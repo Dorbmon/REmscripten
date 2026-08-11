@@ -22,6 +22,13 @@
 
 extern "C" {
 
+// This private helper applies the JS bridge's f64 result limit while keeping
+// the public WASI seek entry point available for full-width native offsets.
+__wasi_errno_t __wasmfs_fd_seek_for_js(__wasi_fd_t fd,
+                                       __wasi_filedelta_t offset,
+                                       __wasi_whence_t whence,
+                                       __wasi_filesize_t* newoffset);
+
 // Copy the file specified by the pathname into JS.
 // Return zero on success, errno on failure.
 // Output point and length are written to `out_buf` and `out_size` params.
@@ -256,7 +263,7 @@ int _wasmfs_lchmod(const char* path, mode_t mode) {
 
 double _wasmfs_llseek(int fd, off_t offset, int whence) {
   __wasi_filesize_t newOffset;
-  int err = __wasi_fd_seek(fd, offset, whence, &newOffset);
+  int err = __wasmfs_fd_seek_for_js(fd, offset, whence, &newOffset);
   if (err > 0) {
     return -static_cast<double>(err);
   }
