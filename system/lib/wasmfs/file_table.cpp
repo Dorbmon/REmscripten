@@ -57,7 +57,7 @@ FileTable::Handle::addEntry(std::shared_ptr<OpenFileState> openFileState) {
       return i;
     }
   }
-  return -EBADF;
+  return -EMFILE;
 }
 
 int OpenFileState::create(std::shared_ptr<File> file,

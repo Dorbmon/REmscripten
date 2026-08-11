@@ -424,6 +424,41 @@ int __syscall_fstat64(int fd, intptr_t buf) {
 // success).
 enum class OpenReturnMode { FD, Nothing };
 
+// An OpenFileState opens its DataFile before it can be installed in the file
+// table. If installing it fails, close that physical open before discarding the
+// state. In particular, an OPFS file must not retain a SyncAccessHandle merely
+// because the WasmFS descriptor table is full.
+static int installOpenFile(std::shared_ptr<OpenFileState> openFile) {
+  int fd;
+  {
+    auto fileTable = wasmFS.getFileTable().locked();
+    fd = fileTable.addEntry(openFile);
+  }
+  if (fd >= 0) {
+    return fd;
+  }
+
+  auto dataFile = openFile->locked().getFile()->dynCast<DataFile>();
+  if (!dataFile) {
+    return fd;
+  }
+  if (int err = dataFile->locked().close()) {
+    return err;
+  }
+  return fd;
+}
+
+// Close a newly opened state before returning an error from a later part of
+// open(). The state has never entered the file table, so its physical open
+// cannot otherwise be reached by fd_close.
+static int abandonOpenFile(std::shared_ptr<OpenFileState> openFile) {
+  auto dataFile = openFile->locked().getFile()->dynCast<DataFile>();
+  if (!dataFile) {
+    return 0;
+  }
+  return dataFile->locked().close();
+}
+
 static __wasi_fd_t doOpen(path::ParsedParent parsed,
                           int flags,
                           mode_t mode,
@@ -504,7 +539,7 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
         assert(err < 0);
         return err;
       }
-      return wasmFS.getFileTable().locked().addEntry(openFile);
+      return installOpenFile(std::move(openFile));
     }
   }
 
@@ -559,16 +594,22 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
   // If O_TRUNC, truncate the file if possible.
   if (flags & O_TRUNC) {
     if (!child->is<DataFile>()) {
+      if (int err = abandonOpenFile(std::move(openFile))) {
+        return err;
+      }
       return -EISDIR;
     }
     if ((fileMode & WASMFS_PERM_WRITE) == 0) {
+      if (int err = abandonOpenFile(std::move(openFile))) {
+        return err;
+      }
       return -EACCES;
     }
     // Try to truncate the file, continuing silently if we cannot.
     (void)child->cast<DataFile>()->locked().setSize(0);
   }
 
-  return wasmFS.getFileTable().locked().addEntry(openFile);
+  return installOpenFile(std::move(openFile));
 }
 
 // This function is exposed to users and allows users to create a file in a

@@ -5600,6 +5600,131 @@ Module["preRun"] = () => {
     self.run_browser('a.html', '/report_result?0', timeout=60)
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_fd_table_full_close(self):
+    test = test_file('wasmfs/wasmfs_opfs_fd_table_full_close.c')
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD',
+                   '-sEXIT_RUNTIME', '-lopfs.js']
+    create_file('fd-table-holder-pre.js', r'''
+      // This runs on the browser main runtime after native atexit handlers.
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-fd-table-full-close',
+          },
+          window.location.origin);
+      };
+    ''')
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_FD_TABLE_FULL_HOLDER', '--pre-js',
+                     'fd-table-holder-pre.js', '-o', 'fd-table-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-o', 'fd-table-contender.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kModuleTimeoutMs = 30000;
+        const pendingModules = new Map();
+        const pendingHolderExits = new Map();
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for holder shutdown'));
+            }, kModuleTimeoutMs);
+            pendingHolderExits.set(
+              frame.contentWindow, {resolve, reject, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != 'wasmfs-opfs-fd-table-full-close') {
+            return;
+          }
+          if (event.data.event == 'holder-exit') {
+            const pending = pendingHolderExits.get(event.source);
+            if (!pending) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pending.timeout);
+            if (event.data.status != 0) {
+              pending.reject(new Error(
+                'holder did not exit cleanly: status=' + event.data.status));
+            } else {
+              pending.resolve();
+            }
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        (async () => {
+          const holder = await startModule('fd-table-holder.html');
+          if (holder.message.role != kHolder || holder.message.error != 0) {
+            throw new Error('holder failed: role=' + holder.message.role +
+                            ', errno=' + holder.message.error);
+          }
+
+          const contender = await startModule('fd-table-contender.html');
+          if (contender.message.role != kContender ||
+              contender.message.error != 0) {
+            throw new Error('contender could not acquire victim access: role=' +
+                            contender.message.role + ', errno=' +
+                            contender.message.error);
+          }
+
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_fd_table_full_holder_shutdown();
+          await holderExit;
+          contender.frame.remove();
+          holder.frame.remove();
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=90)
+
+  @no_firefox('no OPFS support yet')
   @no_safari('TODO: Fails with exception:Did not get expected EIO when unlinking file') # Fails in Safari 17.6 (17618.3.11.11.7, 17618) and Safari 26.0.1 (21622.1.22.11.15)
   def test_wasmfs_opfs_errors(self):
     test = test_file('wasmfs/wasmfs_opfs_errors.c')
