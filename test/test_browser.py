@@ -5589,6 +5589,22 @@ Module["preRun"] = () => {
                             '-sWASMFS_OPFS_TEST_QUOTA_TRUNCATE=1'])
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_writable_truncate(self):
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    # The first build covers a healthy pathname truncate. The second injects
+    # QuotaExceededError after createWritable succeeds, before its native
+    # truncate, and verifies that the cleanup releases the writable lock.
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_writable_truncate.c',
+      cflags=common_args)
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_writable_truncate.c',
+      cflags=common_args + ['-DWASMFS_OPFS_WRITABLE_TRUNCATE_INJECTED',
+                            '-sWASMFS_OPFS_TEST_QUOTA_WRITABLE_TRUNCATE=1'])
+
+  @no_firefox('no OPFS support yet')
   @no_safari('no Web Locks support yet')
   @no_wasm64()
   def test_wasmfs_opfs_profile_lease(self):

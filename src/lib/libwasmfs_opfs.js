@@ -24,6 +24,10 @@
 #error "WASMFS_OPFS_TEST_QUOTA_TRUNCATE must be 0 or 1"
 #endif
 
+#if WASMFS_OPFS_TEST_QUOTA_WRITABLE_TRUNCATE != 0 && WASMFS_OPFS_TEST_QUOTA_WRITABLE_TRUNCATE != 1
+#error "WASMFS_OPFS_TEST_QUOTA_WRITABLE_TRUNCATE must be 0 or 1"
+#endif
+
 addToLibrary({
   $wasmfsOPFSDirectoryHandles__deps: ['$HandleAllocator'],
   $wasmfsOPFSDirectoryHandles: "new HandleAllocator()",
@@ -724,12 +728,31 @@ addToLibrary({
   _wasmfs_opfs_set_size_file__async: 'auto',
   _wasmfs_opfs_set_size_file: async (ctx, fileID, size, errPtr) => {
     let fileHandle = wasmfsOPFSFileHandles.get(fileID);
+    let writable;
     try {
-      let writable = await fileHandle.createWritable({keepExistingData: true});
+      writable = await fileHandle.createWritable({keepExistingData: true});
+#if WASMFS_OPFS_TEST_QUOTA_WRITABLE_TRUNCATE && PTHREADS
+      // This focused test hook must run after the browser has created its
+      // writable stream but before native truncate can change the file.
+      throw new DOMException('injected OPFS quota failure',
+                             'QuotaExceededError');
+#endif
       await writable.truncate(size);
       await writable.close();
-    } catch {
+    } catch (e) {
       let err = -{{{ cDefs.EIO }}};
+      if (e && e.name == 'QuotaExceededError') {
+        err = -{{{ cDefs.ENOSPC }}};
+      }
+      // In the injected post-create/pre-operation path, abort releases the
+      // writable stream's lock. A real truncate or close rejection may have
+      // already errored the stream, so this remains best-effort cleanup only.
+      // Retain the original operation error even if abort rejects as well.
+      if (writable) {
+        try {
+          await writable.abort();
+        } catch {}
+      }
       {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
     }
     wasmfsOPFSProxyFinish(ctx);

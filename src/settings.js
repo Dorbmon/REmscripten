@@ -1859,6 +1859,13 @@ var WASMFS_OPFS_TEST_QUOTA_WRITE = 0;
 // [link]
 var WASMFS_OPFS_TEST_QUOTA_TRUNCATE = 0;
 
+// Test-only selector that injects QuotaExceededError after a pathname OPFS
+// FileSystemWritableFileStream is created and before it truncates. This
+// controls code emitted at link time only; it does not emulate physical quota
+// exhaustion.
+// [link]
+var WASMFS_OPFS_TEST_QUOTA_WRITABLE_TRUNCATE = 0;
+
 // If set to 1, embeds all subresources in the emitted file as base64 string
 // literals. Embedded subresources may include (but aren't limited to) wasm,
 // asm.js, and static memory initialization code.
