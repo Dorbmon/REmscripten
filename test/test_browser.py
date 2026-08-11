@@ -5340,6 +5340,136 @@ Module["preRun"] = () => {
     self.btest_exit(test, cflags=args + ['-DWASMFS_RESUME'])
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no Web Locks support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_lease(self):
+    self.compile_btest(
+      'wasmfs/wasmfs_opfs_profile_lease.c',
+      ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME',
+       '-lopfs.js',
+       '--pre-js',
+       test_file('wasmfs/wasmfs_opfs_profile_lease_trace_pre.js'),
+       '-o', 'lease.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kAcquired = 0;
+        const kBusy = 1;
+        const kReleaseDeadlineMs = 10000;
+        const kReleaseRetryDelayMs = 100;
+        const kModuleTimeoutMs = 15000;
+        const pendingModules = new Map();
+        const opfsTrace = new BroadcastChannel('wasmfs-opfs-profile-lease-trace');
+        let opfsRootRequests = 0;
+        let nextModuleId = 0;
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        async function expectOpfsRootRequests(expected, stage) {
+          const deadline = Date.now() + 1000;
+          while (Date.now() < deadline && opfsRootRequests < expected) {
+            await delay(10);
+          }
+          if (opfsRootRequests != expected) {
+            throw new Error(stage + ' made ' + opfsRootRequests +
+                            ' OPFS root requests, expected ' + expected);
+          }
+        }
+
+        opfsTrace.onmessage = (event) => {
+          if (event.data?.type == 'opfs-root-request') {
+            ++opfsRootRequests;
+          }
+        };
+
+        function startModule() {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for leased module'));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = `lease.html?instance=${nextModuleId++}`;
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != 'wasmfs-opfs-profile-lease') {
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function acquireAfterOwnerShutdown() {
+          const deadline = Date.now() + kReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            await delay(kReleaseRetryDelayMs);
+            const candidate = await startModule();
+            if (candidate.message.result == kAcquired) {
+              return candidate;
+            }
+            candidate.frame.remove();
+            if (candidate.message.result != kBusy) {
+              throw new Error('lease recovery failed with result ' +
+                              candidate.message.result + ', errno ' +
+                              candidate.message.error);
+            }
+          }
+          throw new Error(
+            'lease was not released by the 10 second orderly shutdown deadline');
+        }
+
+        (async () => {
+          const owner = await startModule();
+          if (owner.message.result != kAcquired) {
+            throw new Error('owner did not acquire lease: ' +
+                            owner.message.result + ', errno ' +
+                            owner.message.error);
+          }
+          await expectOpfsRootRequests(1, 'owner');
+
+          const contender = await startModule();
+          if (contender.message.result != kBusy) {
+            throw new Error('contender did not get EBUSY: ' +
+                            contender.message.result + ', errno ' +
+                            contender.message.error);
+          }
+          contender.frame.remove();
+          await expectOpfsRootRequests(1, 'contender');
+
+          owner.frame.contentWindow.Module
+            ._wasmfs_test_request_profile_lease_shutdown();
+          const recovered = await acquireAfterOwnerShutdown();
+          await expectOpfsRootRequests(2, 'recovered owner');
+          owner.frame.remove();
+          recovered.frame.remove();
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=60)
+
+  @no_firefox('no OPFS support yet')
   @no_safari('TODO: Fails with exception:Did not get expected EIO when unlinking file') # Fails in Safari 17.6 (17618.3.11.11.7, 17618) and Safari 26.0.1 (21622.1.22.11.15)
   def test_wasmfs_opfs_errors(self):
     test = test_file('wasmfs/wasmfs_opfs_errors.c')

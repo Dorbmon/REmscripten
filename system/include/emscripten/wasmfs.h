@@ -90,6 +90,34 @@ backend_t wasmfs_create_node_backend(const char* _Nonnull root);
 // thread.
 backend_t wasmfs_create_opfs_backend(void);
 
+// Creates an OPFS backend that holds an exclusive, storage-bucket-scoped
+// profile lease for the lifetime of the WasmFS instance. This is intended to
+// coordinate independent Wasm modules that mount the same persistent profile;
+// it is not a replacement for POSIX record locks or database locking.
+//
+// Web Locks are cooperative. Every profile writer that needs this protection
+// must opt into this API with the same canonical `profile_name`. A default
+// OPFS backend or another same-storage-bucket writer can ignore the lease, so
+// this API does not establish physical ownership of OPFS data.
+//
+// `profile_name` must be a non-empty ASCII identifier of at most 128
+// characters containing only letters, digits, '.', '-', and '_'. The lease is
+// acquired by the OPFS backend's dedicated worker before it requests the OPFS
+// root directory or any OPFS handle. A malformed name returns NULL and EINVAL.
+// This API otherwise requires pthreads and returns NULL and ENOTSUP when built
+// without them. With pthreads, it returns NULL and ENOSYS when Web Locks are
+// unavailable, EBUSY when another module sharing the storage bucket already
+// holds the lease, or EIO for an unexpected Web Locks failure.
+//
+// During orderly whole-WasmFS/module teardown, the lease is released after
+// WasmFS tears down its filesystem state. `wasmfs_unmount` does not release
+// it, because WasmFS retains created backends until teardown. There is
+// intentionally no API to release it while the backend can still service
+// filesystem operations. Abrupt execution-context termination relies on Web
+// Locks' context cleanup and does not imply that open files were flushed.
+backend_t wasmfs_create_opfs_backend_with_profile_lease(
+  const char* profile_name);
+
 // Creates a generic JSIMPL backend
 backend_t wasmfs_create_jsimpl_backend(void);
 

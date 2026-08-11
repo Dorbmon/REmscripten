@@ -13,6 +13,12 @@ addToLibrary({
   $wasmfsOPFSAccessHandles: "new HandleAllocator()",
   $wasmfsOPFSBlobs__deps: ["$HandleAllocator"],
   $wasmfsOPFSBlobs: "new HandleAllocator()",
+  // This state lives in an OPFS backend's dedicated worker. A lease is held
+  // by keeping the Web Locks callback pending until C++ tears the backend down.
+  $wasmfsOPFSProfileLease: {
+    release: undefined,
+    request: undefined,
+  },
 
 #if !PTHREADS
   // OPFS will only be used on modern browsers that supports JS classes.
@@ -66,6 +72,92 @@ addToLibrary({
 #if PTHREADS
     _emscripten_proxy_finish(ctx);
 #endif
+  },
+
+  _wasmfs_opfs_acquire_profile_lease__deps: [
+    '$wasmfsOPFSProfileLease',
+    '$wasmfsOPFSProxyFinish',
+  ],
+  _wasmfs_opfs_acquire_profile_lease__async: 'auto',
+  _wasmfs_opfs_acquire_profile_lease: async (ctx, profileNamePtr, errPtr) => {
+    let err = 0;
+    try {
+      if (typeof navigator == 'undefined' || !navigator.locks ||
+          typeof navigator.locks.request != 'function') {
+        err = -{{{ cDefs.ENOSYS }}};
+      } else if (wasmfsOPFSProfileLease.release ||
+                 wasmfsOPFSProfileLease.request) {
+        err = -{{{ cDefs.EBUSY }}};
+      } else {
+        let resolveAcquisition;
+        let acquisitionSettled = false;
+        let acquisition = new Promise((resolve) => {
+          resolveAcquisition = resolve;
+        });
+        let settleAcquisition = (result) => {
+          if (!acquisitionSettled) {
+            acquisitionSettled = true;
+            resolveAcquisition(result);
+          }
+        };
+        let release;
+        let released = new Promise((resolve) => {
+          release = resolve;
+        });
+        let lockName = 'emscripten.wasmfs.opfs-profile/' +
+                       UTF8ToString(profileNamePtr);
+        let request = navigator.locks.request(
+          lockName, {mode: 'exclusive', ifAvailable: true}, async (lock) => {
+            if (!lock) {
+              settleAcquisition(-{{{ cDefs.EBUSY }}});
+              return;
+            }
+            wasmfsOPFSProfileLease.release = release;
+            settleAcquisition(0);
+            try {
+              await released;
+            } finally {
+              wasmfsOPFSProfileLease.release = undefined;
+              wasmfsOPFSProfileLease.request = undefined;
+            }
+          });
+        wasmfsOPFSProfileLease.request = request;
+        request.catch(() => {
+          settleAcquisition(-{{{ cDefs.EIO }}});
+        });
+        err = await acquisition;
+        if (err != 0) {
+          wasmfsOPFSProfileLease.request = undefined;
+        }
+      }
+    } catch {
+      err = -{{{ cDefs.EIO }}};
+    }
+    {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
+    wasmfsOPFSProxyFinish(ctx);
+  },
+
+  _wasmfs_opfs_release_profile_lease__deps: [
+    '$wasmfsOPFSProfileLease',
+    '$wasmfsOPFSProxyFinish',
+  ],
+  _wasmfs_opfs_release_profile_lease__async: 'auto',
+  _wasmfs_opfs_release_profile_lease: async (ctx, errPtr) => {
+    let err = 0;
+    let release = wasmfsOPFSProfileLease.release;
+    let request = wasmfsOPFSProfileLease.request;
+    if (!release || !request) {
+      err = -{{{ cDefs.EIO }}};
+    } else {
+      release();
+      try {
+        await request;
+      } catch {
+        err = -{{{ cDefs.EIO }}};
+      }
+    }
+    {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
+    wasmfsOPFSProxyFinish(ctx);
   },
 
   _wasmfs_opfs_init_root_directory__deps: ['$wasmfsOPFSDirectoryHandles', '$wasmfsOPFSProxyFinish'],

@@ -4,7 +4,10 @@
 // found in the LICENSE file.
 
 #include <emscripten/threading.h>
+#include <errno.h>
 #include <stdlib.h>
+
+#include <string>
 
 #include "backend.h"
 #include "file.h"
@@ -19,6 +22,30 @@ namespace {
 
 using ProxyWorker = emscripten::ProxyWorker;
 using ProxyingQueue = emscripten::ProxyingQueue;
+
+constexpr size_t kMaxProfileLeaseNameLength = 128;
+
+bool IsValidProfileLeaseName(const char* name) {
+  if (!name) {
+    return false;
+  }
+
+  for (size_t i = 0; i <= kMaxProfileLeaseNameLength; ++i) {
+    unsigned char c = name[i];
+    if (c == '\0') {
+      return i != 0;
+    }
+    if (i == kMaxProfileLeaseNameLength) {
+      return false;
+    }
+    if (!(('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') ||
+          ('0' <= c && c <= '9') || c == '.' || c == '-' || c == '_')) {
+      return false;
+    }
+  }
+
+  WASMFS_UNREACHABLE("Profile lease name validation should always return");
+}
 
 class Worker {
 public:
@@ -377,6 +404,29 @@ class OPFSBackend : public Backend {
 public:
   Worker proxy;
 
+  ~OPFSBackend() override {
+    if (!profileLeaseHeld) {
+      return;
+    }
+
+    int err = 0;
+    proxy([&](auto ctx) {
+      _wasmfs_opfs_release_profile_lease(ctx.ctx, &err);
+    });
+    assert(err == 0 && "Failed to release OPFS profile lease");
+  }
+
+  int acquireProfileLease(const std::string& profileName) {
+    int err = 0;
+    proxy([&](auto ctx) {
+      _wasmfs_opfs_acquire_profile_lease(ctx.ctx, profileName.c_str(), &err);
+    });
+    if (err == 0) {
+      profileLeaseHeld = true;
+    }
+    return err;
+  }
+
   std::shared_ptr<DataFile> createFile(mode_t mode) override {
     // No way to support a raw file without a parent directory.
     // TODO: update the core system to document this as a possible result of
@@ -393,6 +443,9 @@ public:
     // Symlinks not supported.
     return nullptr;
   }
+
+private:
+  bool profileLeaseHeld = false;
 };
 
 } // anonymous namespace
@@ -408,6 +461,37 @@ backend_t wasmfs_create_opfs_backend() {
       "Cannot safely create OPFS backend on main browser thread without Asyncify or JSPI");
 
   return wasmFS.addBackend(std::make_unique<OPFSBackend>());
+}
+
+backend_t wasmfs_create_opfs_backend_with_profile_lease(
+  const char* profile_name) {
+  if (!IsValidProfileLeaseName(profile_name)) {
+    errno = EINVAL;
+    return nullptr;
+  }
+
+#ifndef __EMSCRIPTEN_PTHREADS__
+  // A lease must live in the dedicated OPFS worker that owns the backend.
+  // JSPI and Asyncify use the caller's JS realm instead, so they cannot safely
+  // provide independent per-backend lease ownership.
+  errno = ENOTSUP;
+  return nullptr;
+#else
+  // The lease is obtained by the dedicated worker before this backend has
+  // initialized an OPFS directory or file handle.
+  assert(
+    !emscripten_is_main_browser_thread() &&
+    "Cannot safely create leased OPFS backend on main browser thread");
+
+  auto backend = std::make_unique<OPFSBackend>();
+  int err = backend->acquireProfileLease(profile_name);
+  if (err != 0) {
+    assert(err < 0);
+    errno = -err;
+    return nullptr;
+  }
+  return wasmFS.addBackend(std::move(backend));
+#endif
 }
 
 void EMSCRIPTEN_KEEPALIVE _wasmfs_opfs_record_entry(

@@ -13292,6 +13292,20 @@ Module.postRun = () => {{
     self.set_setting('WASMFS')
     self.do_runf('wasmfs/wasmfs_fcntl_locks.c', 'success')
 
+  @requires_pthreads
+  def test_wasmfs_opfs_profile_lease_no_web_locks(self):
+    self.set_setting('WASMFS')
+    self.do_runf('wasmfs/wasmfs_opfs_profile_lease_no_locks.c', 'success',
+                 cflags=['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME',
+                         '-lopfs.js',
+                         '--pre-js',
+                         test_file('wasmfs/wasmfs_opfs_profile_lease_no_locks_pre.js')])
+
+  def test_wasmfs_opfs_profile_lease_no_pthreads(self):
+    self.set_setting('WASMFS')
+    self.do_runf('wasmfs/wasmfs_opfs_profile_lease_no_pthreads.c', 'success',
+                 cflags=['-sEXIT_RUNTIME', '-lopfs.js'])
+
   def test_hello_world_above_2gb(self):
     self.do_run_in_out_file_test('hello_world.c', cflags=['-sGLOBAL_BASE=2GB', '-sINITIAL_MEMORY=3GB'])
 

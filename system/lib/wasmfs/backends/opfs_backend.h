@@ -11,6 +11,15 @@ extern "C" {
 // Ensure that the root OPFS directory is initialized with ID 0.
 void _wasmfs_opfs_init_root_directory(em_proxying_ctx* ctx);
 
+// Acquire and release the opt-in storage-bucket-scoped OPFS profile lease.
+// These run on the OPFS backend's dedicated worker and do not touch OPFS
+// handles. The Web Locks lease is cooperative, not physical OPFS ownership.
+void _wasmfs_opfs_acquire_profile_lease(em_proxying_ctx* ctx,
+                                        const char* profile_name,
+                                        int* err);
+
+void _wasmfs_opfs_release_profile_lease(em_proxying_ctx* ctx, int* err);
+
 // Look up the child under `parent` with `name`. Write 1 to `child_type` if it's
 // a regular file or 2 if it's a directory. Write the child's file or directory
 // ID to `child_id`, or -1 if the child does not exist, or -2 if the child
