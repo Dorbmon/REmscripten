@@ -1838,19 +1838,18 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
       va_start(v1, cmd);
       newfd = va_arg(v1, int);
       va_end(v1);
-      if (newfd < 0) {
+      if (newfd < 0 || newfd >= WASMFS_FD_MAX) {
         return -EINVAL;
       }
 
       // Find the first available fd at arg or after.
-      // TODO: Should we check for a limit on the max FD number, if we have one?
-      while (1) {
+      for (; newfd < WASMFS_FD_MAX; ++newfd) {
         if (!fileTable.getEntry(newfd)) {
           (void)fileTable.setEntry(newfd, openFile);
           return newfd;
         }
-        newfd++;
       }
+      return -EMFILE;
     }
     case F_GETFD:
     case F_SETFD:

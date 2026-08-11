@@ -13376,6 +13376,16 @@ Module.postRun = () => {{
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test('wasmfs/wasmfs_pipe2_full.c')
 
+  @parameterized({
+    '': ([],),
+    'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',
+                          '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
+  def test_wasmfs_fcntl_dupfd_limit(self, args):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test(
+        'wasmfs/wasmfs_fcntl_dupfd_limit.c', cflags=args)
+
   def test_wasmfs_unmount_cwd_busy(self):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test('wasmfs/wasmfs_unmount_cwd_busy.c')
