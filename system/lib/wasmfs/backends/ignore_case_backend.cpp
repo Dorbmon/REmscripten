@@ -208,6 +208,10 @@ public:
     backend = createBackend();
   }
 
+  bool supportsExplicitMetadataMutation() const override {
+    return backend->supportsExplicitMetadataMutation();
+  }
+
   std::shared_ptr<DataFile> createFile(mode_t mode) override {
     return virtualize(backend->createFile(mode), this);
   }

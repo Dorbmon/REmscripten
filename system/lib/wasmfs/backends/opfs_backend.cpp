@@ -543,6 +543,8 @@ class OPFSBackend : public Backend {
 public:
   Worker proxy;
 
+  bool supportsExplicitMetadataMutation() const override { return false; }
+
   ~OPFSBackend() override {
     if (!profileLeaseHeld) {
       return;

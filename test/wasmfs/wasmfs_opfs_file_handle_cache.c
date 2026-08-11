@@ -123,8 +123,10 @@ static int ExerciseMetadataLookup(void) {
     return error < 0 ? -error : EIO;
   }
   // The alias mount has an empty dcache. chmod must discover a fresh
-  // OPFSFile wrapper without retaining a FileSystemFileHandle slot.
-  if (chmod(probe_alias_path, 0600) != 0) {
+  // OPFSFile wrapper, then reject its non-persistent metadata change without
+  // retaining a FileSystemFileHandle slot.
+  errno = 0;
+  if (chmod(probe_alias_path, 0600) != -1 || errno != ENOTSUP) {
     return ErrorOrEIO();
   }
   if (wasmfs_unmount(kAliasMountPath) != 0) {

@@ -5535,7 +5535,8 @@ Module["preRun"] = () => {
           }
           // One initial open plus stat, truncate, rename, reopen, final stat,
           // and the separate metadata probe each acquire and release exactly
-          // one JS file-handle slot. The probe's fresh-wrapper chmod adds none.
+          // one JS file-handle slot. The probe's fresh-wrapper rejected chmod
+          // adds none.
           await waitForTrace(7);
 
           const moduleExit = waitForExit(frame.contentWindow);
@@ -5555,6 +5556,14 @@ Module["preRun"] = () => {
       </script>
     ''')
     self.run_browser('a.html', '/report_result?0', timeout=60)
+
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_metadata_unsupported(self):
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_metadata_unsupported.c',
+      cflags=['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js'])
 
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')

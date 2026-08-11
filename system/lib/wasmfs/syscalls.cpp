@@ -73,6 +73,13 @@ bool cwdIsAtOrBelow(wasmfs::WasmFS::CWDTransition& cwdTransition,
   return false;
 }
 
+bool canMutateExplicitMetadata(const std::shared_ptr<wasmfs::File>& file) {
+  if (auto* backend = file->getBackend()) {
+    return backend->supportsExplicitMetadataMutation();
+  }
+  return true;
+}
+
 } // anonymous namespace
 
 extern "C" {
@@ -1296,7 +1303,8 @@ int __syscall_utimensat(int dirFD, intptr_t path_, intptr_t times_, int flags) {
   // https://man7.org/linux/man-pages/man2/utimensat.2.html
   //
   // TODO: Handle AT_SYMLINK_NOFOLLOW once we traverse symlinks correctly.
-  auto parsed = path::getFileAt(dirFD, path, flags | AT_EMPTY_PATH);
+  auto parsed =
+    path::getFileAt(dirFD, path ? path : "", flags | AT_EMPTY_PATH);
   if (auto err = parsed.getError()) {
     return err;
   }
@@ -1312,7 +1320,19 @@ int __syscall_utimensat(int dirFD, intptr_t path_, intptr_t times_, int flags) {
     mTime = timespec_to_ms(times[1]);
   }
 
-  auto locked = parsed.getFile()->locked();
+  // A pair of UTIME_OMIT values does not mutate any metadata, so it remains a
+  // successful no-op even for a backend that cannot represent explicit
+  // metadata changes.
+  if (aTime == INFINITY && mTime == INFINITY) {
+    return 0;
+  }
+
+  auto file = parsed.getFile();
+  if (!canMutateExplicitMetadata(file)) {
+    return -ENOTSUP;
+  }
+
+  auto locked = file->locked();
   if (aTime != INFINITY) {
     locked.setATime(aTime);
   }
@@ -1333,7 +1353,11 @@ int __syscall_fchmodat2(int dirfd, intptr_t path, int mode, int flags) {
   if (auto err = parsed.getError()) {
     return err;
   }
-  auto lockedFile = parsed.getFile()->locked();
+  auto file = parsed.getFile();
+  if (!canMutateExplicitMetadata(file)) {
+    return -ENOTSUP;
+  }
+  auto lockedFile = file->locked();
   lockedFile.setMode(mode);
   // On POSIX, ctime is updated on metadata changes, like chmod.
   lockedFile.updateCTime();
@@ -1349,7 +1373,11 @@ int __syscall_fchmod(int fd, int mode) {
   if (!openFile) {
     return -EBADF;
   }
-  auto lockedFile = openFile->locked().getFile()->locked();
+  auto file = openFile->locked().getFile();
+  if (!canMutateExplicitMetadata(file)) {
+    return -ENOTSUP;
+  }
+  auto lockedFile = file->locked();
   lockedFile.setMode(mode);
   lockedFile.updateCTime();
   return 0;
