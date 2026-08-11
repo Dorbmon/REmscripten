@@ -1140,7 +1140,11 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
       return -EBUSY;
     }
     // A directory can only be removed if it has no entries.
-    if (dir->locked().getNumEntries() > 0) {
+    auto numEntries = dir->locked().getNumEntries();
+    if (numEntries < 0) {
+      return numEntries;
+    }
+    if (numEntries > 0) {
       return -ENOTEMPTY;
     }
   } else {
@@ -1372,7 +1376,11 @@ int __syscall_renameat(int olddirfd,
         return -EISDIR;
       }
       // Cannot overwrite a non-empty directory.
-      if (newDir->locked().getNumEntries() > 0) {
+      auto numEntries = newDir->locked().getNumEntries();
+      if (numEntries < 0) {
+        return numEntries;
+      }
+      if (numEntries > 0) {
         return -ENOTEMPTY;
       }
     } else {

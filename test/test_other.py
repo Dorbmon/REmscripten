@@ -13332,6 +13332,16 @@ Module.postRun = () => {{
     'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',
                           '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
   })
+  def test_wasmfs_directory_entry_error(self, args):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test(
+        'wasmfs/wasmfs_directory_entry_error.cpp', cflags=args)
+
+  @parameterized({
+    '': ([],),
+    'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',
+                          '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
   def test_wasmfs_iov_validation(self, args):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test(
