@@ -9,20 +9,20 @@ var wasmFSNodeLibrary = {
 
   $wasmfsNodeConvertNodeCode__deps: ['$ERRNO_CODES'],
   $wasmfsNodeConvertNodeCode: (e) => {
-    var code = e.code;
-#if ASSERTIONS
-    assert(code in ERRNO_CODES, `unexpected node error code: ${code} (${e})`);
-#endif
-    return ERRNO_CODES[code];
+    var errno = ERRNO_CODES[e.code];
+    // Node-specific errors, including malformed `code` values, cannot be
+    // represented as POSIX errno values. Do not let an undefined JS return
+    // coerce to the successful i32 value zero.
+    return typeof errno == 'number' ? errno : {{{ cDefs.EIO }}};
   },
 
   $wasmfsTry__deps: ['$wasmfsNodeConvertNodeCode'],
-  $wasmfsTry: (f) => {
+  $wasmfsTry: (f, errorSign = 1) => {
     try {
       return f();
     } catch (e) {
-      if (!e.code) throw e;
-      return wasmfsNodeConvertNodeCode(e);
+      if (!Object.prototype.hasOwnProperty.call(e, 'code')) throw e;
+      return errorSign * wasmfsNodeConvertNodeCode(e);
     }
   },
 
@@ -172,7 +172,8 @@ var wasmFSNodeLibrary = {
 
   _wasmfs_node_open__deps: ['$wasmfsTry'],
   _wasmfs_node_open: (path_p, mode_p) => {
-    return wasmfsTry(() => fs.openSync(UTF8ToString(path_p), UTF8ToString(mode_p)));
+    return wasmfsTry(
+      () => fs.openSync(UTF8ToString(path_p), UTF8ToString(mode_p)), -1);
   },
 
   _wasmfs_node_rename__deps: ['$wasmfsTry'],
@@ -187,18 +188,22 @@ var wasmFSNodeLibrary = {
 
   _wasmfs_node_readlink__deps: ['$wasmfsTry'],
   _wasmfs_node_readlink: (path_p, target_p, bufsize) => {
-    return wasmfsTry(() => {
-      var target = fs.readlinkSync(UTF8ToString(path_p));
-      return stringToUTF8(target, target_p, bufsize);
-    });
+    return wasmfsTry(
+      () => {
+        var target = fs.readlinkSync(UTF8ToString(path_p));
+        return stringToUTF8(target, target_p, bufsize);
+      },
+      -1);
   },
 
   _wasmfs_node_close__deps: ['$wasmfsTry'],
   _wasmfs_node_close: (fd) => {
-    return wasmfsTry(() => {
-      fs.closeSync(fd);
-      // implicitly return 0
-    });
+    return wasmfsTry(
+      () => {
+        fs.closeSync(fd);
+        // implicitly return 0
+      },
+      -1);
   },
 
   _wasmfs_node_read__deps: ['$wasmfsTry'],
@@ -238,7 +243,7 @@ function makeStub(x, library) {
   delete library[x + '__deps'];
   library[x] = modifyJSFunction(t, (args, body) => {
     return `(${args}) => {\n` +
-      (ASSERTIONS ? "abort('attempt to call Node.js backend function without ENVIRONMENT_MAY_BE_NODE');\n" : '') +
+      "abort('attempt to call Node.js backend function without ENVIRONMENT_MAY_BE_NODE');\n" +
       '}';
   });
 }
