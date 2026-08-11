@@ -218,6 +218,52 @@ EM_JS(void, test_wasmfs_readlink_bounds, (int path_max), {
   FS.unlink('/readlink-short-target');
   FS.unlink('/readlink-full-target');
 });
+
+EM_JS(void, test_wasmfs_readdir_errors, (int enoent, int enotdir), {
+  function expectErrno(path, expected) {
+    var ex;
+    try {
+      FS.readdir(path);
+    } catch (err) {
+      ex = err;
+    }
+    assert(ex && ex.name === 'ErrnoError' && ex.errno === expected);
+  }
+
+  const file = '/wasmfs-readdir-file';
+  const dir = '/wasmfs-readdir-dir';
+  FS.writeFile(file, "");
+  FS.mkdir(dir);
+  FS.writeFile(`${dir}/entry`, "");
+
+  expectErrno('/wasmfs-readdir-missing', enoent);
+  expectErrno(file, enotdir);
+  assert(FS.readdir(dir).includes('entry'));
+
+  // The enumeration state is allocated in Wasm. Force an exception while
+  // converting its first entry and verify that the next enumeration remains
+  // usable after the bridge's finally block runs.
+  const oldPush = Array.prototype.push;
+  const stack = stackSave();
+  let ex;
+  Array.prototype.push = function() {
+    throw new Error('injected FS.readdir consumer failure');
+  };
+  try {
+    FS.readdir(dir);
+  } catch (err) {
+    ex = err;
+  } finally {
+    Array.prototype.push = oldPush;
+  }
+  assert(ex && ex.message === 'injected FS.readdir consumer failure');
+  assert(stackSave() === stack);
+  assert(FS.readdir(dir).includes('entry'));
+
+  FS.unlink(`${dir}/entry`);
+  FS.rmdir(dir);
+  FS.unlink(file);
+});
 #endif
 
 EM_JS(void, test_fs_read, (), {
@@ -556,6 +602,7 @@ int main() {
   test_fs_readlink();
 #if defined(WASMFS) && !defined(NODEFS) && !defined(NODERAWFS)
   test_wasmfs_readlink_bounds(PATH_MAX);
+  test_wasmfs_readdir_errors(ENOENT, ENOTDIR);
 #endif
   test_fs_rmdir();
 #endif

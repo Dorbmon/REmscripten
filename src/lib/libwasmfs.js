@@ -345,21 +345,43 @@ addToLibrary({
         isDevice: false, // TODO: wasmfs support for devices
       };
     },
-    readdir: (path) => withStackSave(() => {
-      var pathBuffer = stringToUTF8OnStack(path);
-      var entries = [];
-      var state = __wasmfs_readdir_start(pathBuffer);
+    readdir(path) {
+      var result = 0;
+      var state = 0;
+      withStackSave(() => {
+        var pathBuffer = stringToUTF8OnStack(path);
+#if hasExportedSymbol('_wasmfs_readdir_start_with_error')
+        var statePtr = stackAlloc({{{ POINTER_SIZE }}});
+        result = __wasmfs_readdir_start_with_error(pathBuffer, statePtr);
+        if (result === 0) {
+          state = {{{ makeGetValue('statePtr', '0', '*') }}};
+        }
+#else
+        // A raw linker export can retain only the old pointer-returning
+        // bridge. It cannot report the underlying errno, so fail closed
+        // instead of preserving its historical generic Error.
+        state = __wasmfs_readdir_start(pathBuffer);
+        if (!state) {
+          result = -{{{ cDefs.EIO }}};
+        }
+#endif
+      });
+      FS.handleError(result);
       if (!state) {
-        // TODO: The old FS threw an ErrnoError here.
-        throw new Error("No such directory");
+        throw new FS.ErrnoError({{{ cDefs.EIO }}});
       }
-      var entry;
-      while (entry = __wasmfs_readdir_get(state)) {
-        entries.push(UTF8ToString(entry));
+
+      var entries = [];
+      try {
+        var entry;
+        while (entry = __wasmfs_readdir_get(state)) {
+          entries.push(UTF8ToString(entry));
+        }
+        return entries;
+      } finally {
+        __wasmfs_readdir_finish(state);
       }
-      __wasmfs_readdir_finish(state);
-      return entries;
-    }),
+    },
     mount: (type, opts, mountpoint) => {
 #if ASSERTIONS
       if (typeof type == 'string') {

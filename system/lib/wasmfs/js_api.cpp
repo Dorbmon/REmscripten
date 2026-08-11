@@ -387,20 +387,45 @@ struct wasmfs_readdir_state {
   struct dirent** entries;
 };
 
-struct wasmfs_readdir_state* _wasmfs_readdir_start(const char* path) {
-  struct dirent** entries;
+static void freeReaddirEntries(struct dirent** entries, int nentries) {
+  for (int i = 0; i < nentries; i++) {
+    free(entries[i]);
+  }
+  free(entries);
+}
+
+// Start an enumeration while preserving the POSIX error from scandir. The
+// pointer-returning bridge below predates JS ErrnoError support and must remain
+// available for embedders that use it directly.
+int _wasmfs_readdir_start_with_error(const char* path,
+                                     struct wasmfs_readdir_state** out_state) {
+  if (!out_state) {
+    return -EINVAL;
+  }
+  *out_state = nullptr;
+
+  struct dirent** entries = nullptr;
   int nentries = scandir(path, &entries, NULL, alphasort);
   if (nentries == -1) {
-    return NULL;
+    return -(errno ? errno : EIO);
   }
+
   struct wasmfs_readdir_state* state =
     (struct wasmfs_readdir_state*)malloc(sizeof(*state));
   if (state == NULL) {
-    return NULL;
+    freeReaddirEntries(entries, nentries);
+    return -ENOMEM;
   }
   state->i = 0;
   state->nentries = nentries;
   state->entries = entries;
+  *out_state = state;
+  return 0;
+}
+
+struct wasmfs_readdir_state* _wasmfs_readdir_start(const char* path) {
+  struct wasmfs_readdir_state* state = nullptr;
+  _wasmfs_readdir_start_with_error(path, &state);
   return state;
 }
 
@@ -412,10 +437,7 @@ const char* _wasmfs_readdir_get(struct wasmfs_readdir_state* state) {
 }
 
 void _wasmfs_readdir_finish(struct wasmfs_readdir_state* state) {
-  for (int i = 0; i < state->nentries; i++) {
-    free(state->entries[i]);
-  }
-  free(state->entries);
+  freeReaddirEntries(state->entries, state->nentries);
   free(state);
 }
 

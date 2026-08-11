@@ -13345,8 +13345,16 @@ Module.postRun = () => {{
   })
   def test_wasmfs_node_error(self, args):
     self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
     self.do_run_in_out_file_test(
         'wasmfs/wasmfs_node_error.c', cflags=['-sENVIRONMENT=node'] + args)
+
+  @requires_wasm64
+  def test_wasmfs_readdir_memory64(self):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf('wasmfs/wasmfs_readdir_memory64.c', 'ok',
+                 cflags=['-sMEMORY64'])
 
   @parameterized({
     '': ([],),
@@ -13386,17 +13394,28 @@ Module.postRun = () => {{
 
   def test_wasmfs_manual_read_file_export(self):
     self.set_setting('WASMFS')
-    self.set_setting('EXPORTED_FUNCTIONS', ['_main', '__wasmfs_read_file'])
+    # An explicitly requested legacy readdir bridge must also retain its
+    # errno-aware companion, even when the reduced JS API does not use it.
+    self.set_setting('EXPORTED_FUNCTIONS', [
+        '_main', '__wasmfs_read_file', '__wasmfs_readdir_start'])
     self.set_setting('EXPORTED_RUNTIME_METHODS', ['FS'])
-    self.do_runf('wasmfs/wasmfs_dylink_read_file.c', 'ok')
+    js_file = self.build('wasmfs/wasmfs_dylink_read_file.c')
+    wasm_file = os.path.splitext(js_file)[0] + '.wasm'
+    self.assertTrue(self.is_exported_in_wasm(
+        '_wasmfs_readdir_start_with_error', wasm_file))
+    self.assertContained('ok', self.run_js(js_file))
 
   def test_wasmfs_raw_read_file_export(self):
     self.set_setting('WASMFS')
     self.set_setting('EXPORTED_RUNTIME_METHODS', ['FS'])
-    self.do_runf(
+    js_file = self.build(
         'wasmfs/wasmfs_read_file_legacy_bridge.c',
-        'ok',
-        cflags=['-Wl,--export=_wasmfs_read_file'])
+        cflags=['-Wl,--export=_wasmfs_read_file',
+                '-Wl,--export=_wasmfs_readdir_start'])
+    wasm_file = os.path.splitext(js_file)[0] + '.wasm'
+    self.assertFalse(self.is_exported_in_wasm(
+        '_wasmfs_readdir_start_with_error', wasm_file))
+    self.assertContained('ok', self.run_js(js_file))
 
   @parameterized({
     '': ([],),

@@ -81,8 +81,20 @@ EM_JS(int, restoreUnknownNodeError, (int closeFailedFD), {
   return 0;
 });
 
+EM_JS(int, expectFSReaddirError, (const char* path, int expectedErrno), {
+  var error;
+  try {
+    FS.readdir(UTF8ToString(path));
+  } catch (err) {
+    error = err;
+  }
+  return error && error.name === 'ErrnoError' &&
+                 error.errno === expectedErrno ? 0 : 1;
+});
+
 static void testReaddirError(void) {
   injectUnknownNodeError(Readdir);
+  assert(expectFSReaddirError(MountPath, EIO) == 0);
   errno = 0;
   assert(opendir(MountPath) == NULL);
   assert(errno == EIO);

@@ -1418,6 +1418,11 @@ def phase_linker_setup(options, linker_args):  # noqa: C901, PLR0912, PLR0915
     # exporting the flags-aware bridge it now calls.
     if '__wasmfs_read_file' in settings.EXPORTED_FUNCTIONS:
       settings.REQUIRED_EXPORTS += ['_wasmfs_read_file_with_flags']
+    # The legacy readdir bridge returns only a state pointer, so it cannot
+    # expose scandir errors to JS. Pair an explicitly requested legacy export
+    # with the errno-aware bridge used by the full JS API.
+    if '__wasmfs_readdir_start' in settings.EXPORTED_FUNCTIONS:
+      settings.REQUIRED_EXPORTS += ['_wasmfs_readdir_start_with_error']
     if settings.ASSERTIONS:
       # used in assertion checks for unflushed content
       settings.REQUIRED_EXPORTS += ['wasmfs_flush']
@@ -1463,6 +1468,7 @@ def phase_linker_setup(options, linker_args):  # noqa: C901, PLR0912, PLR0915
         '_wasmfs_llseek',
         '_wasmfs_identify',
         '_wasmfs_readlink',
+        '_wasmfs_readdir_start_with_error',
         '_wasmfs_readdir_start',
         '_wasmfs_readdir_get',
         '_wasmfs_readdir_finish',
