@@ -13314,10 +13314,14 @@ Module.postRun = () => {{
   def test_unistd_cwd(self):
     self.do_run_in_out_file_test('wasmfs/wasmfs_chdir.c')
 
-  def test_unistd_chown(self):
+  @parameterized({
+    '': ([],),
+    'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
+  def test_unistd_chown(self, args):
     # TODO: Remove this test in favor of unistd/misc.c
     self.set_setting('WASMFS')
-    self.do_run_in_out_file_test('wasmfs/wasmfs_chown.c')
+    self.do_run_in_out_file_test('wasmfs/wasmfs_chown.c', cflags=args)
 
   @wasmfs_all_backends
   def test_wasmfs_getdents(self):

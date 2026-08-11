@@ -1405,9 +1405,10 @@ int __syscall_fchownat(
     return err;
   }
 
-  // Ignore the actual owner and group because we don't track those.
-  // TODO: Update metadata time stamp.
-  return 0;
+  // WasmFS does not track ownership metadata, so an ownership change cannot
+  // succeed. Resolve the target first so validation and lookup errors retain
+  // their normal precedence.
+  return owner == -1 && group == -1 ? 0 : -ENOTSUP;
 }
 
 int __syscall_fchown32(int fd, int owner, int group) {
