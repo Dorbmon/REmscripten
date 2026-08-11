@@ -264,8 +264,15 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
 
   size_t bytesWritten = 0;
   for (size_t i = 0; i < iovs_len; i++) {
-    const uint8_t* buf = iovs[i].buf;
     off_t len = iovs[i].buf_len;
+
+    // A zero-length iovec is a no-op and must not invoke a backend write. In
+    // particular, a write must not inspect or extend a file at its offset.
+    if (len == 0) {
+      continue;
+    }
+
+    const uint8_t* buf = iovs[i].buf;
 
     // Check if buf_len specifies a positive length buffer but buf is a
     // null pointer
@@ -369,8 +376,15 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
 
   size_t bytesRead = 0;
   for (size_t i = 0; i < iovs_len; i++) {
-    uint8_t* buf = iovs[i].buf;
     size_t len = iovs[i].buf_len;
+
+    // A zero-length iovec is a no-op and must not invoke a backend read. In
+    // particular, a read must not inspect its offset or buffer.
+    if (len == 0) {
+      continue;
+    }
+
+    uint8_t* buf = iovs[i].buf;
 
     if (!buf && len > 0) {
       return __WASI_ERRNO_INVAL;
