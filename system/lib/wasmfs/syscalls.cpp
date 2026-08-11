@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -101,6 +102,31 @@ bool fitsPositionedIOVRange(const IOV* iovs,
   return true;
 }
 
+// The POSIX vector APIs take a signed iovcnt, but the WASI ABI receives a
+// size_t. Validate the converted count and the total result size before
+// looking through the vector.
+template <typename IOV>
+__wasi_errno_t validateIOVs(const IOV* iovs, size_t iovs_len) {
+  if (iovs_len > UIO_MAXIOV) {
+    return __WASI_ERRNO_INVAL;
+  }
+  if (iovs_len && !iovs) {
+    return __WASI_ERRNO_FAULT;
+  }
+
+  const auto maxBytes =
+    static_cast<size_t>(std::numeric_limits<ssize_t>::max());
+  size_t totalBytes = 0;
+  for (size_t i = 0; i < iovs_len; ++i) {
+    auto length = static_cast<size_t>(iovs[i].buf_len);
+    if (length > maxBytes - totalBytes) {
+      return __WASI_ERRNO_INVAL;
+    }
+    totalBytes += length;
+  }
+  return __WASI_ERRNO_SUCCESS;
+}
+
 } // anonymous namespace
 
 extern "C" {
@@ -176,7 +202,7 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
     return __WASI_ERRNO_BADF;
   }
 
-  if (iovs_len < 0 || !isValidOffset(offset)) {
+  if (!isValidOffset(offset)) {
     return __WASI_ERRNO_INVAL;
   }
 
@@ -193,6 +219,14 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
   // returns EBADF when the file descriptor is not open for writing.
   if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_RDONLY) {
     return __WASI_ERRNO_BADF;
+  }
+
+  if (auto err = validateIOVs(iovs, iovs_len)) {
+    return err;
+  }
+  if (iovs_len == 0) {
+    *nwritten = 0;
+    return __WASI_ERRNO_SUCCESS;
   }
 
   auto dataFile = file->dynCast<DataFile>();
@@ -287,7 +321,7 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
 
   if (setOffset == OffsetHandling::OpenFileState) {
     offset = lockedOpenFile.getPosition();
-    if (iovs_len < 0 || !isValidOffset(offset)) {
+    if (!isValidOffset(offset)) {
       return __WASI_ERRNO_INVAL;
     }
   }
@@ -303,6 +337,14 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
   // returns EBADF when the file descriptor is not open for reading.
   if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_WRONLY) {
     return __WASI_ERRNO_BADF;
+  }
+
+  if (auto err = validateIOVs(iovs, iovs_len)) {
+    return err;
+  }
+  if (iovs_len == 0) {
+    *nread = 0;
+    return __WASI_ERRNO_SUCCESS;
   }
 
   auto dataFile = file->dynCast<DataFile>();
