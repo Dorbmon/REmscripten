@@ -264,6 +264,47 @@ EM_JS(void, test_wasmfs_readdir_errors, (int enoent, int enotdir), {
   FS.rmdir(dir);
   FS.unlink(file);
 });
+
+EM_JS(void, test_wasmfs_cwd_errors, (int path_max, int eio), {
+  // A 255-byte component contributes 256 bytes to every non-root absolute
+  // pathname level. Keep one such component free so the 254- and 255-byte
+  // final components exercise both sides of the PATH_MAX boundary.
+  const component = 'x'.repeat(255);
+  const shortComponent = 'y'.repeat(254);
+  const depth = path_max / (component.length + 1) - 1;
+  assert(Number.isInteger(depth));
+  for (let i = 0; i < depth; ++i) {
+    FS.mkdir(component);
+    FS.chdir(component);
+  }
+
+  FS.mkdir(shortComponent);
+  FS.chdir(shortComponent);
+  const shortCwd = FS.cwd();
+  assert(shortCwd.length === path_max - 1,
+         `expected ${path_max - 1}-byte cwd, got ${shortCwd.length}`);
+  FS.chdir('..');
+  FS.rmdir(shortComponent);
+
+  FS.mkdir(component);
+  FS.chdir(component);
+  var ex;
+  try {
+    FS.cwd();
+  } catch (err) {
+    ex = err;
+  }
+  assert(ex && ex.name === 'ErrnoError' && ex.errno === eio,
+         `expected EIO, got ${ex && ex.errno}`);
+
+  for (let i = 0; i < depth; ++i) {
+    FS.chdir('..');
+    FS.rmdir(component);
+  }
+  FS.chdir('..');
+  FS.rmdir(component);
+  assert(FS.cwd() === '/');
+});
 #endif
 
 EM_JS(void, test_fs_read, (), {
@@ -603,6 +644,7 @@ int main() {
 #if defined(WASMFS) && !defined(NODEFS) && !defined(NODERAWFS)
   test_wasmfs_readlink_bounds(PATH_MAX);
   test_wasmfs_readdir_errors(ENOENT, ENOTDIR);
+  test_wasmfs_cwd_errors(PATH_MAX, EIO);
 #endif
   test_fs_rmdir();
 #endif

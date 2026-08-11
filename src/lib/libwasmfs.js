@@ -171,7 +171,15 @@ addToLibrary({
 #endif
 
 #if hasExportedSymbol('_wasmfs_get_cwd') // Similar to readFile, above.
-    cwd: () => UTF8ToString(__wasmfs_get_cwd()),
+    cwd() {
+      var path = __wasmfs_get_cwd();
+      if (!path) {
+        // The legacy bridge returns only a pointer, so preserve its ABI while
+        // failing closed when getcwd or its thread-local allocation fails.
+        throw new FS.ErrnoError({{{ cDefs.EIO }}});
+      }
+      return UTF8ToString(path);
+    },
 #endif
 
 #if FORCE_FILESYSTEM || INCLUDE_FULL_LIBRARY // see comment above

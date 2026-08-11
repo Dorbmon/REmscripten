@@ -444,6 +444,10 @@ void _wasmfs_readdir_finish(struct wasmfs_readdir_state* state) {
 char* _wasmfs_get_cwd(void) {
   // TODO: PATH_MAX is 4K atm, so it might be good to reduce this somehow.
   static thread_local char* path = (char*)malloc(PATH_MAX);
+  if (!path) {
+    errno = ENOMEM;
+    return nullptr;
+  }
   return getcwd(path, PATH_MAX);
 }
 
