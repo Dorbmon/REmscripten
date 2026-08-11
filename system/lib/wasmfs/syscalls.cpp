@@ -461,6 +461,42 @@ int __syscall_fstat64(int fd, intptr_t buf) {
 // success).
 enum class OpenReturnMode { FD, Nothing };
 
+static int validateOpenFlags(int flags) {
+  int accessMode = (flags & O_ACCMODE);
+  if (accessMode != O_WRONLY && accessMode != O_RDONLY &&
+      accessMode != O_RDWR) {
+    return -EINVAL;
+  }
+
+  // WasmFS does not provide a per-write durability contract for these flags.
+  // Reject them rather than report a successful write that was not synced.
+  // O_RSYNC is an alias of O_SYNC on Emscripten and is caught here as well.
+  if (flags & (O_SYNC | O_DSYNC)) {
+    return -ENOTSUP;
+  }
+
+  // O_TMPFILE includes O_DIRECTORY, which is otherwise supported. Reject only
+  // the full temporary-file operation; its private bit alone remains invalid.
+  if ((flags & O_TMPFILE) == O_TMPFILE) {
+    return -ENOTSUP;
+  }
+
+  constexpr int unsupportedFlags = O_DIRECT | O_ASYNC | O_NOATIME;
+  if (flags & unsupportedFlags) {
+    return -ENOTSUP;
+  }
+
+  // O_NOCTTY is a harmless no-op because WasmFS has no controlling terminal.
+  constexpr int allowedFlags =
+    O_CREAT | O_EXCL | O_DIRECTORY | O_TRUNC | O_APPEND | O_RDWR | O_WRONLY |
+    O_RDONLY | O_LARGEFILE | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | O_NOCTTY;
+  if (flags & ~allowedFlags) {
+    return -EINVAL;
+  }
+
+  return 0;
+}
+
 // An OpenFileState opens its DataFile before it can be installed in the file
 // table. If installing it fails, close that physical open before discarding the
 // state. In particular, an OPFS file must not retain a SyncAccessHandle merely
@@ -501,23 +537,11 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
                           mode_t mode,
                           backend_t backend = NullBackend,
                           OpenReturnMode returnMode = OpenReturnMode::FD) {
+  if (auto err = validateOpenFlags(flags)) {
+    return err;
+  }
+
   int accessMode = (flags & O_ACCMODE);
-  if (accessMode != O_WRONLY && accessMode != O_RDONLY &&
-      accessMode != O_RDWR) {
-    return -EINVAL;
-  }
-
-  // WasmFS does not provide a per-write durability contract for these flags.
-  // Reject them rather than report a successful write that was not synced.
-  // O_RSYNC is an alias of O_SYNC on Emscripten and is caught here as well.
-  if (flags & (O_SYNC | O_DSYNC)) {
-    return -ENOTSUP;
-  }
-
-  // TODO: remove assert when all functionality is complete.
-  assert((flags & ~(O_CREAT | O_EXCL | O_DIRECTORY | O_TRUNC | O_APPEND |
-                    O_RDWR | O_WRONLY | O_RDONLY | O_LARGEFILE | O_NOFOLLOW |
-                    O_CLOEXEC | O_NONBLOCK)) == 0);
 
   if (auto err = parsed.getError()) {
     return err;
@@ -672,6 +696,12 @@ int __syscall_openat(int dirfd, intptr_t path, int flags, ...) {
   va_start(v1, flags);
   mode = va_arg(v1, int);
   va_end(v1);
+
+  // Validate before resolving the path, so unsupported O_CREAT combinations
+  // cannot create a file as a side effect.
+  if (auto err = validateOpenFlags(flags)) {
+    return err;
+  }
 
   return doOpen(path::parseParent((char*)path, dirfd), flags, mode);
 }
