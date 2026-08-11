@@ -204,7 +204,9 @@ addToLibrary({
     create: (path, mode) => FS_create(path, mode),
     close: (stream) => FS.handleError(-__wasmfs_close(stream.fd)),
     unlink: (path) => FS_unlink(path),
-    chdir: (path) => withStackSave(() => __wasmfs_chdir(stringToUTF8OnStack(path))),
+    chdir: (path) => FS.handleError(
+      withStackSave(() => __wasmfs_chdir(stringToUTF8OnStack(path)))
+    ),
     read(stream, buffer, offset, length, position) {
       var seeking = typeof position != 'undefined';
 
@@ -257,9 +259,11 @@ addToLibrary({
     munmap: (addr, length) => (
       FS.handleError(__wasmfs_munmap(addr, length))
     ),
-    symlink: (target, linkpath) => withStackSave(() => (
-      __wasmfs_symlink(stringToUTF8OnStack(target), stringToUTF8OnStack(linkpath))
-    )),
+    symlink: (target, linkpath) => FS.handleError(
+      withStackSave(() => (
+        __wasmfs_symlink(stringToUTF8OnStack(target), stringToUTF8OnStack(linkpath))
+      ))
+    ),
     readlink(path) {
       return withStackSave(() => {
         var bufPtr = stackAlloc({{{ POINTER_SIZE }}});
@@ -619,10 +623,10 @@ addToLibrary({
   },
 
   $FS_unlink__deps: ['_wasmfs_unlink'],
-  $FS_unlink: (path) => withStackSave(() => {
+  $FS_unlink: (path) => FS.handleError(withStackSave(() => {
     var buffer = stringToUTF8OnStack(path);
     return __wasmfs_unlink(buffer);
-  }),
+  })),
 
   // Wasm access calls.
 

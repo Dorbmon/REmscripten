@@ -105,6 +105,24 @@ EM_JS(void, test_fs_readFile,
   FS.unlink(createdPath);
 });
 
+EM_JS(void, test_fs_error_propagation, (), {
+  function expectENOENT(operation) {
+    var ex;
+    try {
+      operation();
+    } catch (err) {
+      ex = err;
+    }
+    assert(ex && ex.name === 'ErrnoError' && ex.errno === 44 /* ENOENT */);
+  }
+
+  // These APIs all use direct WasmFS syscall bridges. They must not expose a
+  // negative errno as a successful JavaScript return value.
+  expectENOENT(() => FS.unlink('missing-js-api-unlink'));
+  expectENOENT(() => FS.chdir('missing-js-api-chdir'));
+  expectENOENT(() => FS.symlink('target', 'missing-js-api-parent/link'));
+});
+
 // createPath should succeed when called on existing paths ( https://github.com/emscripten-core/emscripten/issues/23602 )
 EM_JS(void, test_fs_createPath, (), {
   FS.createPath('/', 'home', true, true);
@@ -514,6 +532,7 @@ int main() {
   test_fs_rmdir();
 #endif
   test_fs_open();
+  test_fs_error_propagation();
 #if defined(NODERAWFS) && !WASMFS
   test_fs_readFile(EBADF, 0);
 #else
