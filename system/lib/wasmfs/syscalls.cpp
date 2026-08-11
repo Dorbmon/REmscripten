@@ -331,7 +331,9 @@ __wasi_errno_t __wasi_fd_sync(__wasi_fd_t fd) {
 
 int __syscall_fdatasync(int fd) {
   // TODO: Optimize this to avoid unnecessarily flushing unnecessary metadata.
-  return __wasi_fd_sync(fd);
+  // `__syscall_*` functions use negative errno values, while the WASI entry
+  // point returns a positive WASI errno.
+  return -__wasi_fd_sync(fd);
 }
 
 backend_t wasmfs_get_backend_by_fd(int fd) {
