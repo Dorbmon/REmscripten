@@ -316,14 +316,19 @@ __wasi_errno_t __wasi_fd_sync(__wasi_fd_t fd) {
     return __WASI_ERRNO_BADF;
   }
 
-  // Nothing to flush for anything but a data file, but also not an error either
-  // way. TODO: in the future we may want syncing of directories.
-  auto dataFile = openFile->locked().getFile()->dynCast<DataFile>();
+  auto file = openFile->locked().getFile();
+  auto dataFile = file->dynCast<DataFile>();
   if (dataFile) {
     auto ret = dataFile->locked().flush();
     assert(ret <= 0);
     // Translate to WASI standard of positive return codes.
     return -ret;
+  }
+
+  // WasmFS does not provide a directory flushing operation, so do not report a
+  // successful sync that cannot persist directory metadata.
+  if (file->is<Directory>()) {
+    return ENOTSUP;
   }
 
   return __WASI_ERRNO_SUCCESS;
