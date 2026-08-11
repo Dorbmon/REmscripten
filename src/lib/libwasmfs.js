@@ -227,39 +227,66 @@ addToLibrary({
       withStackSave(() => __wasmfs_chdir(stringToUTF8OnStack(path)))
     ),
     read(stream, buffer, offset, length, position) {
+      if (length < 0 || position < 0) {
+        throw new FS.ErrnoError({{{ cDefs.EINVAL }}});
+      }
       var seeking = typeof position != 'undefined';
 
-      var dataBuffer = _malloc(length);
+      var dataBuffer = 0;
+      if (length) {
+        dataBuffer = _malloc(length);
+        if (!dataBuffer) {
+          throw new FS.ErrnoError({{{ cDefs.ENOMEM }}});
+        }
+      }
 
       var bytesRead;
-      if (seeking) {
-        bytesRead = __wasmfs_pread(stream.fd, dataBuffer, length, {{{ splitI64('position') }}});
-      } else {
-        bytesRead = __wasmfs_read(stream.fd, dataBuffer, length);
+      try {
+        if (seeking) {
+          bytesRead = __wasmfs_pread(stream.fd, dataBuffer, length, {{{ splitI64('position') }}});
+        } else {
+          bytesRead = __wasmfs_read(stream.fd, dataBuffer, length);
+        }
+        if (bytesRead > 0) {
+          buffer.set(HEAPU8.subarray(dataBuffer, dataBuffer + bytesRead), offset);
+        }
+      } finally {
+        if (dataBuffer) {
+          _free(dataBuffer);
+        }
       }
-      if (bytesRead > 0) {
-        buffer.set(HEAPU8.subarray(dataBuffer, dataBuffer + bytesRead), offset);
-      }
-
-      _free(dataBuffer);
       return FS.handleError(bytesRead);
     },
     // Note that canOwn is an optimization that we ignore for now in WasmFS.
     write(stream, buffer, offset, length, position, canOwn) {
+      if (length < 0 || position < 0) {
+        throw new FS.ErrnoError({{{ cDefs.EINVAL }}});
+      }
       var seeking = typeof position != 'undefined';
 
-      var dataBuffer = _malloc(length);
-      for (var i = 0; i < length; i++) {
-        {{{ makeSetValue('dataBuffer', 'i', 'buffer[offset + i]', 'i8') }}};
+      var dataBuffer = 0;
+      if (length) {
+        dataBuffer = _malloc(length);
+        if (!dataBuffer) {
+          throw new FS.ErrnoError({{{ cDefs.ENOMEM }}});
+        }
       }
 
       var bytesRead;
-      if (seeking) {
-        bytesRead = __wasmfs_pwrite(stream.fd, dataBuffer, length, {{{ splitI64('position') }}});
-      } else {
-        bytesRead = __wasmfs_write(stream.fd, dataBuffer, length);
+      try {
+        for (var i = 0; i < length; i++) {
+          {{{ makeSetValue('dataBuffer', 'i', 'buffer[offset + i]', 'i8') }}};
+        }
+        if (seeking) {
+          bytesRead = __wasmfs_pwrite(stream.fd, dataBuffer, length, {{{ splitI64('position') }}});
+        } else {
+          bytesRead = __wasmfs_write(stream.fd, dataBuffer, length);
+        }
+      } finally {
+        if (dataBuffer) {
+          _free(dataBuffer);
+        }
       }
-      _free(dataBuffer);
       return FS.handleError(bytesRead);
     },
     writeFile: (path, data, opts) => FS_writeFile(path, data, opts),

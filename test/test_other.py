@@ -13387,6 +13387,16 @@ Module.postRun = () => {{
         'wasmfs/wasmfs_read_file_cleanup.c',
         cflags=['-sFORCE_FILESYSTEM'] + args)
 
+  @parameterized({
+    '': ([],),
+    'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',
+                          '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
+  def test_wasmfs_js_io_memory(self, args):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_run_in_out_file_test('wasmfs/wasmfs_js_io_memory.c', cflags=args)
+
   def test_wasmfs_dylink_read_file(self):
     self.set_setting('WASMFS')
     self.set_setting('MAIN_MODULE', 2)
