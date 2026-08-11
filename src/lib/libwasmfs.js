@@ -586,7 +586,13 @@ addToLibrary({
     },
     // TODO: syncfs
     llseek(stream, offset, whence) {
-      return FS.handleError(__wasmfs_llseek(stream.fd, {{{ splitI64('offset') }}}, whence));
+      var fd = stream?.fd;
+      // The Wasm bridge takes an i32, so reject values that JavaScript would
+      // coerce into a different descriptor.
+      if (!Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff) {
+        throw new FS.ErrnoError({{{ cDefs.EBADF }}});
+      }
+      return FS.handleError(__wasmfs_llseek(fd, {{{ splitI64('offset') }}}, whence));
     }
     // TODO: ioctl
 

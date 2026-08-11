@@ -196,6 +196,26 @@ EM_JS(void, test_wasmfs_fchmod_malformed_fd, (int ebadf), {
   FS.close(stream);
   FS.unlink(path);
 });
+
+EM_JS(void, test_wasmfs_llseek_malformed_fd, (int ebadf), {
+  const path = 'wasmfs-llseek-wrapped-fd';
+  FS.writeFile(path, 'abcdef');
+  const stream = FS.open(path, 'r');
+  assert(FS.llseek(stream, 2, 0) === 2);
+  var ex;
+  try {
+    // The old i32 bridge coerced this back to stream.fd and changed the
+    // actual stream's position.
+    FS.llseek({fd: stream.fd + 0x100000000}, 4, 0);
+  } catch (err) {
+    ex = err;
+  }
+  assert(ex && ex.name === 'ErrnoError' && ex.errno === ebadf,
+         `expected EBADF, got ${ex && ex.errno}`);
+  assert(FS.llseek(stream, 0, 1) === 2);
+  FS.close(stream);
+  FS.unlink(path);
+});
 #endif
 
 // createPath should succeed when called on existing paths ( https://github.com/emscripten-core/emscripten/issues/23602 )
@@ -802,6 +822,7 @@ int main() {
   test_wasmfs_stat_error_stack(ENOENT);
   test_wasmfs_ftruncate_malformed_fd(EBADF);
   test_wasmfs_fchmod_malformed_fd(EBADF);
+  test_wasmfs_llseek_malformed_fd(EBADF);
 #endif
 #if defined(NODERAWFS) && !WASMFS
   test_fs_readFile(EBADF, 0);
