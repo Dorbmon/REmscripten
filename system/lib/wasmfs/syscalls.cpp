@@ -1239,9 +1239,6 @@ int __syscall_getdents64(int fd, intptr_t dirp, size_t count) {
   }
   auto lockedDir = dir->locked();
 
-  // A directory's position corresponds to the index in its entries vector.
-  int index = lockedOpenFile.getPosition();
-
   // If this directory has been unlinked and has no parent, then it is
   // completely empty.
   auto parent = lockedDir.getParent();
@@ -1249,11 +1246,35 @@ int __syscall_getdents64(int fd, intptr_t dirp, size_t count) {
     return 0;
   }
 
-  off_t bytesRead = 0;
   const auto& dirents = openFile->dirents;
-  for (; index < dirents.size() && bytesRead + sizeof(dirent) <= count;
+  // A directory's position corresponds to the index in its entries vector.
+  // Keep it as an off_t so that an out-of-range directory cookie cannot wrap
+  // to a negative index and poison the open file state.
+  off_t index = lockedOpenFile.getPosition();
+  if (index < 0) {
+    return -EINVAL;
+  }
+  if (static_cast<__wasi_filesize_t>(index) >= dirents.size()) {
+    return 0;
+  }
+
+  // Check every entry that can fit before modifying the output buffer or the
+  // directory position. Backends may expose entries that were not created
+  // through WasmFS's path validation.
+  size_t entriesThatFit = count / sizeof(dirent);
+  for (size_t candidate = static_cast<size_t>(index);
+       candidate < dirents.size() && entriesThatFit;
+       ++candidate, --entriesThatFit) {
+    if (dirents[candidate].name.size() >= sizeof(result->d_name)) {
+      return -ENAMETOOLONG;
+    }
+  }
+
+  off_t bytesRead = 0;
+  for (; static_cast<size_t>(index) < dirents.size() &&
+         bytesRead + sizeof(dirent) <= count;
        index++) {
-    const auto& entry = dirents[index];
+    const auto& entry = dirents[static_cast<size_t>(index)];
     result->d_ino = entry.ino;
     result->d_off = index + 1;
     result->d_reclen = sizeof(dirent);
@@ -1274,7 +1295,6 @@ int __syscall_getdents64(int fd, intptr_t dirp, size_t count) {
         result->d_type = DT_UNKNOWN;
         break;
     }
-    assert(entry.name.size() + 1 <= sizeof(result->d_name));
     strcpy(result->d_name, entry.name.c_str());
     ++result;
     bytesRead += sizeof(dirent);
