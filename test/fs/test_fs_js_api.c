@@ -39,9 +39,10 @@ EM_JS(void, test_fs_open, (), {
   assert(createFileNotHere && createFileNotHere.fd >= 0);
 });
 
-EM_JS(void, test_fs_readFile, (), {
-  // Reading existing files is already covered by other tests here, so
-  // just test the error conditions.
+EM_JS(void, test_fs_readFile,
+      (int expectedEBADF, int expectWriteOnlyReadError), {
+  // Reading existing files is already covered by other tests here. Check the
+  // error conditions and the flags which FS.readFile shares with FS.open.
   var ex;
   try {
     var output = FS.readFile("root/no-exist", {encoding : 'utf8'});
@@ -49,6 +50,59 @@ EM_JS(void, test_fs_readFile, (), {
     ex = err;
   }
   assert(ex.name === "ErrnoError" && ex.errno === 44 /* ENOENT */);
+
+  function expectReadError(path, flags) {
+    var error;
+    try {
+      FS.readFile(path, {flags: flags, encoding: 'utf8'});
+    } catch (err) {
+      error = err;
+    }
+    assert(error && error.name === 'ErrnoError' &&
+           error.errno === expectedEBADF);
+  }
+
+  const path = 'read-file-flags';
+  const createdPath = 'read-file-created-by-w-plus';
+  try {
+    FS.unlink(createdPath);
+  } catch {}
+
+  // O_TRUNC happens before the read. The later zero-byte read must still
+  // reject the O_WRONLY descriptor rather than falsely reporting success.
+  FS.writeFile(path, 'abc');
+  if (expectWriteOnlyReadError) {
+    expectReadError(path, 'w');
+  } else {
+    // Node's raw-fs readSync short-circuits zero-byte reads before checking
+    // descriptor access. Its legacy FS.readFile therefore returns empty here.
+    assert(FS.readFile(path, {flags: 'w', encoding: 'utf8'}) === "");
+  }
+  assert(FS.stat(path).size === 0);
+
+  FS.writeFile(path, 'abc');
+  assert(FS.readFile(path, {flags: 'w+', encoding: 'utf8'}) === "");
+  assert(FS.stat(path).size === 0);
+
+  // Creation must happen before readFile obtains metadata.
+  assert(FS.readFile(createdPath, {flags: 'w+', encoding: 'utf8'}) === "");
+  assert(FS.stat(createdPath).size === 0);
+
+  FS.writeFile(path, 'abc');
+  expectReadError(path, 'a');
+  assert(FS.readFile(path, {encoding: 'utf8'}) === 'abc');
+
+  assert(FS.readFile(path, {flags: 'a+', encoding: 'utf8'}) === 'abc');
+
+  try {
+    FS.readFile(path, {flags: 'not-a-mode', encoding: 'utf8'});
+  } catch (err) {
+    ex = err;
+  }
+  assert(ex.name === 'Error');
+  assert(FS.readFile(path, {encoding: 'utf8'}) === 'abc');
+  FS.unlink(path);
+  FS.unlink(createdPath);
 });
 
 // createPath should succeed when called on existing paths ( https://github.com/emscripten-core/emscripten/issues/23602 )
@@ -460,7 +514,11 @@ int main() {
   test_fs_rmdir();
 #endif
   test_fs_open();
-  test_fs_readFile();
+#if defined(NODERAWFS) && !WASMFS
+  test_fs_readFile(EBADF, 0);
+#else
+  test_fs_readFile(EBADF, 1);
+#endif
   test_fs_rename();
   test_fs_read();
   test_fs_mknod();

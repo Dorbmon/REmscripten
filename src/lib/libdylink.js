@@ -1022,7 +1022,7 @@ var LibraryDylink = {
     '$PATH',
 #if WASMFS
     '_wasmfs_identify',
-    '_wasmfs_read_file',
+    '_wasmfs_read_file_with_flags',
 #endif
   ],
   $findLibraryFS: (libName, rpath) => {

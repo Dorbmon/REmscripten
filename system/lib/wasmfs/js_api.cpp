@@ -25,36 +25,63 @@ extern "C" {
 // Copy the file specified by the pathname into JS.
 // Return zero on success, errno on failure.
 // Output point and length are written to `out_buf` and `out_size` params.
-int _wasmfs_read_file(const char* path, uint8_t** out_buf, off_t* out_size) {
+static int readFile(const char* path,
+                    int flags,
+                    uint8_t** out_buf,
+                    off_t* out_size) {
   static_assert(sizeof(off_t) == 8, "File offset type must be 64-bit");
 
-  struct stat file;
-  if (stat(path, &file) < 0) {
-    return errno;
-  }
-
-  off_t size = file.st_size;
-  if (size < 0 || static_cast<uintmax_t>(size) > SIZE_MAX) {
-    return EFBIG;
-  }
-  size_t readSize = static_cast<size_t>(size);
-
-  static thread_local uint8_t* buffer = nullptr;
-  auto newBuffer = static_cast<uint8_t*>(realloc(buffer, readSize));
-  if (readSize && !newBuffer) {
-    return ENOMEM;
-  }
-  buffer = newBuffer;
-
-  int fd = open(path, O_RDONLY);
+  // Open first so that flags such as O_CREAT and O_TRUNC take effect before
+  // we obtain metadata from the opened file. Pass a mode for O_CREAT, as
+  // FS.open does.
+  int fd = open(path, flags, 0666);
   if (fd < 0) {
-    return errno;
+    return errno ? errno : EIO;
   }
 
   int readErr = 0;
+  struct stat file;
+  if (fstat(fd, &file) < 0) {
+    readErr = errno ? errno : EIO;
+  }
+
+  off_t size = 0;
+  size_t readSize = 0;
+  if (!readErr) {
+    size = file.st_size;
+    if (size < 0 || static_cast<uintmax_t>(size) > SIZE_MAX) {
+      readErr = EFBIG;
+    } else {
+      readSize = static_cast<size_t>(size);
+    }
+  }
+
+  static thread_local uint8_t* buffer = nullptr;
+  if (!readErr) {
+    auto newBuffer = static_cast<uint8_t*>(realloc(buffer, readSize));
+    if (readSize && !newBuffer) {
+      readErr = ENOMEM;
+    } else {
+      buffer = newBuffer;
+    }
+  }
+
+  if (!readErr && readSize == 0) {
+    // A zero-byte read still validates descriptor access. In particular, an
+    // O_WRONLY O_TRUNC open has already made the file empty but must report
+    // EBADF rather than falsely succeeding.
+    uint8_t byte;
+    ssize_t numRead = read(fd, &byte, 0);
+    if (numRead < 0) {
+      readErr = errno ? errno : EIO;
+    } else if (numRead != 0) {
+      readErr = EIO;
+    }
+  }
+
   const size_t maxReadSize = static_cast<size_t>(SSIZE_MAX);
   size_t totalRead = 0;
-  while (totalRead < readSize) {
+  while (!readErr && totalRead < readSize) {
     size_t chunkSize = readSize - totalRead;
     if (chunkSize > maxReadSize) {
       chunkSize = maxReadSize;
@@ -86,6 +113,19 @@ int _wasmfs_read_file(const char* path, uint8_t** out_buf, off_t* out_size) {
   *out_size = size;
   *out_buf = buffer;
   return 0;
+}
+
+// Preserve the original three-argument low-level ABI for existing callers.
+int _wasmfs_read_file(const char* path, uint8_t** out_buf, off_t* out_size) {
+  return readFile(path, O_RDONLY, out_buf, out_size);
+}
+
+// Copy the file using the same flags accepted by the public FS.readFile API.
+int _wasmfs_read_file_with_flags(const char* path,
+                                 int flags,
+                                 uint8_t** out_buf,
+                                 off_t* out_size) {
+  return readFile(path, flags, out_buf, out_size);
 }
 
 // Write the complete buffer using the legacy FS.writeFile default flags.

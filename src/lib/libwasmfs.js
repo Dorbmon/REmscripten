@@ -37,11 +37,13 @@ addToLibrary({
     '$FS_getMode',
     // For FS.readFile
     '$UTF8ArrayToString',
+#if hasExportedSymbol('_wasmfs_read_file_with_flags') || hasExportedSymbol('_wasmfs_read_file')
+    '$FS_modeStringToFlags',
+#endif
 #if FORCE_FILESYSTEM || INCLUDE_FULL_LIBRARY // FULL_LIBRARY will include JS
                                              // code in other places that ends
                                              // up requiring all of our code
                                              // here.
-    '$FS_modeStringToFlags',
     '$FS_create',
     '$FS_mknod',
     '$FS_mkdir',
@@ -122,30 +124,44 @@ addToLibrary({
       return FS_preloadFile(parent, name, url, canRead, canWrite, dontCreateFile, canOwn, preFinish);
     },
 
-#if hasExportedSymbol('_wasmfs_read_file') // Support the JS function exactly
-                                           // when the __wasmfs_* function is
-                                           // present to be called (otherwise,
-                                           // we'd error anyhow). This depends
-                                           // on other code including the
-                                           // __wasmfs_* method properly.
+#if hasExportedSymbol('_wasmfs_read_file_with_flags') || hasExportedSymbol('_wasmfs_read_file')
+    // Support the JS function exactly when one of its bridges is present.
     readFile(path, opts = {}) {
+      opts.flags = opts.flags || {{{ cDefs.O_RDONLY }}};
       opts.encoding = opts.encoding || 'binary';
       if (opts.encoding !== 'utf8' && opts.encoding !== 'binary') {
         throw new Error(`Invalid encoding type "${opts.encoding}"`);
       }
+      var flags = FS_modeStringToFlags(opts.flags);
 
       var buf, length, result;
-      // Copy the file into a JS buffer on the heap.
-      withStackSave(() => {
-        var bufPtr = stackAlloc({{{ POINTER_SIZE }}});
-        // _wasmfs_read_file stores a 64-bit off_t in this slot.
-        var sizePtr = stackAlloc({{{ getNativeTypeSize('i64') }}});
-        result = __wasmfs_read_file(stringToUTF8OnStack(path), bufPtr, sizePtr);
-        if (result === 0) {
-          buf = {{{ makeGetValue('bufPtr', '0', '*') }}};
-          length = {{{ makeGetValue('sizePtr', '0', 'i53') }}};
-        }
-      });
+#if !hasExportedSymbol('_wasmfs_read_file_with_flags')
+      // A raw linker export can retain only the legacy bridge. Do not let
+      // that configuration falsely accept flags the old bridge cannot pass
+      // through to open(2). Keep error handling outside withStackSave so
+      // the stack is restored before FS.handleError throws.
+      if (flags !== {{{ cDefs.O_RDONLY }}}) {
+        result = {{{ cDefs.ENOTSUP }}};
+      } else
+#endif
+      {
+        // Copy the file into a JS buffer on the heap.
+        withStackSave(() => {
+          var bufPtr = stackAlloc({{{ POINTER_SIZE }}});
+          // The read-file bridges store a 64-bit off_t in this slot.
+          var sizePtr = stackAlloc({{{ getNativeTypeSize('i64') }}});
+#if hasExportedSymbol('_wasmfs_read_file_with_flags')
+          result = __wasmfs_read_file_with_flags(
+            stringToUTF8OnStack(path), flags, bufPtr, sizePtr);
+#else
+          result = __wasmfs_read_file(stringToUTF8OnStack(path), bufPtr, sizePtr);
+#endif
+          if (result === 0) {
+            buf = {{{ makeGetValue('bufPtr', '0', '*') }}};
+            length = {{{ makeGetValue('sizePtr', '0', 'i53') }}};
+          }
+        });
+      }
       FS.handleError(-result);
 
       // Default return type is binary.

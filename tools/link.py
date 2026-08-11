@@ -1412,6 +1412,12 @@ def phase_linker_setup(options, linker_args):  # noqa: C901, PLR0912, PLR0915
     settings.FILESYSTEM = 1
     settings.SYSCALLS_REQUIRE_FILESYSTEM = 0
     add_system_js_lib('libwasmfs.js')
+    # The legacy low-level bridge is a public export whose C identifier begins
+    # with an underscore, so its user-facing EXPORTED_FUNCTIONS spelling has
+    # two. Keep FS.readFile available for that existing configuration by also
+    # exporting the flags-aware bridge it now calls.
+    if '__wasmfs_read_file' in settings.EXPORTED_FUNCTIONS:
+      settings.REQUIRED_EXPORTS += ['_wasmfs_read_file_with_flags']
     if settings.ASSERTIONS:
       # used in assertion checks for unflushed content
       settings.REQUIRED_EXPORTS += ['wasmfs_flush']
@@ -1428,6 +1434,7 @@ def phase_linker_setup(options, linker_args):  # noqa: C901, PLR0912, PLR0915
         'wasmfs_unmount',
         '_wasmfs_mount',
         '_wasmfs_read_file',
+        '_wasmfs_read_file_with_flags',
         '_wasmfs_write_file',
         '_wasmfs_open',
         '_wasmfs_close',

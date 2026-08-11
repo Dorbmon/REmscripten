@@ -7,6 +7,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 
 #include <emscripten/emscripten.h>
@@ -57,8 +58,44 @@ EM_JS(int, exerciseReadFileCleanup, (int expectedErrno, int failedReadCount), {
   return 0;
 });
 
+EM_JS(int, exerciseReadFileBridge,
+      (int pointerSize, int writeFlags, int expectedErrno), {
+  const path = 'wasmfs-read-file-bridge';
+  FS.writeFile(path, 'abc');
+
+  let oldResult;
+  let oldLength;
+  let flagsResult;
+  withStackSave(() => {
+    const bufferPtr = stackAlloc(pointerSize);
+    const sizePtr = stackAlloc(8);
+    oldResult = __wasmfs_read_file(
+      stringToUTF8OnStack(path), bufferPtr, sizePtr);
+    if (oldResult === 0) {
+      oldLength = readI53FromI64(sizePtr);
+    }
+    flagsResult = __wasmfs_read_file_with_flags(
+      stringToUTF8OnStack(path), writeFlags, bufferPtr, sizePtr);
+  });
+
+  if (oldResult !== 0 || oldLength !== 3) {
+    return 1;
+  }
+  if (flagsResult !== expectedErrno) {
+    return 2;
+  }
+  if (FS.stat(path).size !== 0) {
+    return 3;
+  }
+  FS.unlink(path);
+  return 0;
+});
+
 int main(void) {
   assert(exerciseReadFileCleanup(EISDIR, kFailedReadCount) == 0);
+  assert(exerciseReadFileBridge(sizeof(void*),
+                                O_TRUNC | O_CREAT | O_WRONLY,
+                                EBADF) == 0);
   puts("ok");
   return 0;
 }

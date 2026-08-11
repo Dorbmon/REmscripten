@@ -13338,6 +13338,25 @@ Module.postRun = () => {{
         'wasmfs/wasmfs_read_file_cleanup.c',
         cflags=['-sFORCE_FILESYSTEM'] + args)
 
+  def test_wasmfs_dylink_read_file(self):
+    self.set_setting('WASMFS')
+    self.set_setting('MAIN_MODULE', 2)
+    self.do_runf('wasmfs/wasmfs_dylink_read_file.c', 'ok')
+
+  def test_wasmfs_manual_read_file_export(self):
+    self.set_setting('WASMFS')
+    self.set_setting('EXPORTED_FUNCTIONS', ['_main', '__wasmfs_read_file'])
+    self.set_setting('EXPORTED_RUNTIME_METHODS', ['FS'])
+    self.do_runf('wasmfs/wasmfs_dylink_read_file.c', 'ok')
+
+  def test_wasmfs_raw_read_file_export(self):
+    self.set_setting('WASMFS')
+    self.set_setting('EXPORTED_RUNTIME_METHODS', ['FS'])
+    self.do_runf(
+        'wasmfs/wasmfs_read_file_legacy_bridge.c',
+        'ok',
+        cflags=['-Wl,--export=_wasmfs_read_file'])
+
   @parameterized({
     '': ([],),
     'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',

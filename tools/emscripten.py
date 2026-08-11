@@ -1170,6 +1170,7 @@ def create_pointer_conversion_wrappers(metadata):
     '_wasmfs_get_cwd': 'p_',
     '_wasmfs_identify': '_p',
     '_wasmfs_read_file': '_ppp',
+    '_wasmfs_read_file_with_flags': '_p_pp',
     '_wasmfs_node_record_dirent': '_pp_',
     '__dl_seterr': '_pp',
     '_emscripten_run_js_on_main_thread': '__p_p_',
