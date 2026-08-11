@@ -353,6 +353,11 @@ addToLibrary({
       }));
     },
     fchmod(fd, mode) {
+      // The Wasm bridge takes an i32, so reject values that JavaScript would
+      // coerce into a different descriptor.
+      if (!Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff) {
+        throw new FS.ErrnoError({{{ cDefs.EBADF }}});
+      }
       return FS.handleError(__wasmfs_fchmod(fd, mode));
     },
     utime: (path, atime, mtime) => (

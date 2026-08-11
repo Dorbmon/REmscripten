@@ -175,6 +175,27 @@ EM_JS(void, test_wasmfs_ftruncate_malformed_fd, (int ebadf), {
   FS.close(stream);
   FS.unlink(path);
 });
+
+EM_JS(void, test_wasmfs_fchmod_malformed_fd, (int ebadf), {
+  const path = 'wasmfs-fchmod-wrapped-fd';
+  FS.writeFile(path, 'data');
+  FS.chmod(path, 0o600);
+  const originalMode = FS.stat(path).mode;
+  const stream = FS.open(path, 'r');
+  var ex;
+  try {
+    // The old i32 bridge coerced this back to stream.fd and changed the
+    // actual file's mode.
+    FS.fchmod(stream.fd + 0x100000000, 0o777);
+  } catch (err) {
+    ex = err;
+  }
+  assert(ex && ex.name === 'ErrnoError' && ex.errno === ebadf,
+         `expected EBADF, got ${ex && ex.errno}`);
+  assert(FS.stat(path).mode === originalMode);
+  FS.close(stream);
+  FS.unlink(path);
+});
 #endif
 
 // createPath should succeed when called on existing paths ( https://github.com/emscripten-core/emscripten/issues/23602 )
@@ -780,6 +801,7 @@ int main() {
 #if WASMFS
   test_wasmfs_stat_error_stack(ENOENT);
   test_wasmfs_ftruncate_malformed_fd(EBADF);
+  test_wasmfs_fchmod_malformed_fd(EBADF);
 #endif
 #if defined(NODERAWFS) && !WASMFS
   test_fs_readFile(EBADF, 0);
