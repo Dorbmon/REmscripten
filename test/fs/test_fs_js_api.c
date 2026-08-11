@@ -305,6 +305,59 @@ EM_JS(void, test_wasmfs_cwd_errors, (int path_max, int eio), {
   FS.rmdir(component);
   assert(FS.cwd() === '/');
 });
+
+EM_JS(void, test_wasmfs_register_device_errors,
+      (int eio, int einval, int eperm), {
+  function expectErrno(operation, expected) {
+    var ex;
+    try {
+      operation();
+    } catch (err) {
+      ex = err;
+    }
+    assert(ex && ex.name === 'ErrnoError' && ex.errno === expected,
+           `expected errno ${expected}, got ${ex && ex.errno}`);
+  }
+
+  function testDevice(path, dev, ops, expected) {
+    FS.registerDevice(dev, ops);
+    FS.mkdev(path, dev);
+    var stream = FS.open(path, 'r+');
+    expectErrno(() => FS.read(stream, new Uint8Array(1), 0, 1, 0), expected);
+    expectErrno(() => FS.write(stream, new Uint8Array([1]), 0, 1, 0), expected);
+    FS.close(stream);
+    FS.unlink(path);
+  }
+
+  const errorPath = '/wasmfs-register-device-error';
+  const errorDev = FS.makedev(93, 1);
+  FS.registerDevice(errorDev, {
+    read() { throw new Error('injected read error'); },
+    write() { throw new Error('injected write error'); },
+  });
+  FS.mkdev(errorPath, errorDev);
+  var errorStream = FS.open(errorPath, 'r+');
+  expectErrno(() => FS.read(errorStream, new Uint8Array(1), 0, 1, 0), eio);
+  expectErrno(() => FS.write(errorStream, new Uint8Array([1]), 0, 1, 0), eio);
+  expectErrno(() => FS.ftruncate(errorStream.fd, 0), eperm);
+  FS.close(errorStream);
+  FS.unlink(errorPath);
+
+  // Missing callbacks previously threw TypeError, whose undefined errno was
+  // coerced to a successful i32 zero at the JS/Wasm boundary.
+  testDevice('/wasmfs-register-device-missing', FS.makedev(93, 2), {}, einval);
+
+  // Likewise, invalid successful results must not silently become zero or
+  // exceed the byte-count contract enforced by WasmFS.
+  testDevice('/wasmfs-register-device-undefined', FS.makedev(93, 3), {
+    read() {},
+    write() {},
+  }, eio);
+  testDevice('/wasmfs-register-device-oversize', FS.makedev(93, 4), {
+    read(stream, buffer, offset, length) { return length + 1; },
+    write(stream, buffer, offset, length) { return length + 1; },
+  }, eio);
+});
 #endif
 
 EM_JS(void, test_fs_read, (), {
@@ -645,6 +698,7 @@ int main() {
   test_wasmfs_readlink_bounds(PATH_MAX);
   test_wasmfs_readdir_errors(ENOENT, ENOTDIR);
   test_wasmfs_cwd_errors(PATH_MAX, EIO);
+  test_wasmfs_register_device_errors(EIO, EINVAL, EPERM);
 #endif
   test_fs_rmdir();
 #endif

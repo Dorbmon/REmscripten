@@ -409,6 +409,25 @@ addToLibrary({
     makedev: (ma, mi) => ((ma) << 8 | (mi)),
     registerDevice(dev, ops) {
       var backendPointer = _wasmfs_create_jsimpl_backend();
+
+      function deviceError(e) {
+        var errno = e?.errno;
+        if (Number.isInteger(errno) && errno > 0 && errno <= 0x7fffffff) {
+          return -errno;
+        }
+        return -{{{ cDefs.EIO }}};
+      }
+
+      function deviceResult(result, length) {
+        // The JSImpl imports return i32. Reject values that would be coerced
+        // by the Wasm boundary or violate the byte-count contract.
+        if (!Number.isInteger(result) || result < -0x7fffffff ||
+            result > Math.min(length, 0x7fffffff)) {
+          return -{{{ cDefs.EIO }}};
+        }
+        return result;
+      }
+
       var definedOps = {
         userRead: ops.read,
         userWrite: ops.write,
@@ -421,23 +440,37 @@ addToLibrary({
         },
         getSize: (file) => {},
         // Devices cannot be resized.
-        setSize: (file, size) => 0,
+        setSize: (file, size) => -{{{ cDefs.EPERM }}},
         read: (file, buffer, length, offset) => {
+          if (!definedOps.userRead) {
+            return -{{{ cDefs.EINVAL }}};
+          }
           var bufferArray = HEAP8.subarray(buffer, buffer + length);
           try {
             var bytesRead = definedOps.userRead(wasmFSDeviceStreams[file], bufferArray, 0, length, offset);
           } catch (e) {
-            return -e.errno;
+            return deviceError(e);
+          }
+          bytesRead = deviceResult(bytesRead, length);
+          if (bytesRead < 0) {
+            return bytesRead;
           }
           HEAP8.set(bufferArray, buffer);
           return bytesRead;
         },
         write: (file, buffer, length, offset) => {
+          if (!definedOps.userWrite) {
+            return -{{{ cDefs.EINVAL }}};
+          }
           var bufferArray = HEAP8.subarray(buffer, buffer + length);
           try {
             var bytesWritten = definedOps.userWrite(wasmFSDeviceStreams[file], bufferArray, 0, length, offset);
           } catch (e) {
-            return -e.errno;
+            return deviceError(e);
+          }
+          bytesWritten = deviceResult(bytesWritten, length);
+          if (bytesWritten < 0) {
+            return bytesWritten;
           }
           HEAP8.set(bufferArray, buffer);
           return bytesWritten;
