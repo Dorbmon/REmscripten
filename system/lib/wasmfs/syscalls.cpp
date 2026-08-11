@@ -13,6 +13,7 @@
 #include <emscripten/html5.h>
 #include <emscripten/syscalls.h>
 #include <errno.h>
+#include <limits>
 #include <mutex>
 #include <poll.h>
 #include <stdarg.h>
@@ -133,6 +134,14 @@ int __syscall_dup(int fd) {
 // state or provided by argument in the case of pread or pwrite.
 enum class OffsetHandling { OpenFileState, Argument };
 
+// POSIX gives pread and pwrite a signed off_t, but the WASI ABI represents an
+// offset as an unsigned filesize. Reject negative POSIX values converted at
+// the ABI boundary, as well as any other value not representable by off_t.
+static bool isValidOffset(__wasi_filesize_t offset) {
+  return offset <=
+         static_cast<__wasi_filesize_t>(std::numeric_limits<off_t>::max());
+}
+
 // Internal write function called by __wasi_fd_write and __wasi_fd_pwrite
 // Receives an open file state offset.
 // Optionally sets open file state offset.
@@ -147,7 +156,7 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
     return __WASI_ERRNO_BADF;
   }
 
-  if (iovs_len < 0 || offset < 0) {
+  if (iovs_len < 0 || !isValidOffset(offset)) {
     return __WASI_ERRNO_INVAL;
   }
 
@@ -244,7 +253,7 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
     offset = lockedOpenFile.getPosition();
   }
 
-  if (iovs_len < 0 || offset < 0) {
+  if (iovs_len < 0 || !isValidOffset(offset)) {
     return __WASI_ERRNO_INVAL;
   }
 

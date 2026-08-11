@@ -39,6 +39,13 @@ int main(void) {
   errno = 0;
   assert(write(fd, msg, len) == -1);
   assert(errno == EBADF);
+
+  // An invalid positioned I/O offset takes precedence over the descriptor
+  // access and file-type errors that this directory would otherwise trigger.
+  errno = 0;
+  assert(pwrite(fd, msg, len, (off_t)-1) == -1);
+  assert(errno == EINVAL);
+
   assert(close(fd) == 0);
 #endif
 
@@ -55,6 +62,12 @@ int main(void) {
   assert(errno == EBADF);
 
 #ifdef WASMFS
+  // Invalid positioned I/O offsets take precedence over descriptor access
+  // errors.
+  errno = 0;
+  assert(pwrite(fd, msg, len, (off_t)-1) == -1);
+  assert(errno == EINVAL);
+
   // ftruncate requires a descriptor that was opened for writing. Its failed
   // request must not change the file's size or contents.
   errno = 0;
@@ -85,7 +98,8 @@ int main(void) {
   assert(errno == EBADF);
 
 #ifdef WASMFS
-  // Invalid offsets take precedence over descriptor access errors.
+  // Invalid positioned I/O offsets take precedence over descriptor access
+  // errors.
   errno = 0;
   assert(pread(fd, buf, sizeof(buf), (off_t)-1) == -1);
   assert(errno == EINVAL);
@@ -101,6 +115,29 @@ int main(void) {
   assert(fd >= 0);
 
 #ifdef WASMFS
+  // Negative POSIX offsets must be rejected at the unsigned WASI ABI boundary
+  // before they reach a readable and writable DataFile.
+  struct stat before;
+  assert(fstat(fd, &before) == 0);
+  char original[sizeof(buf)] = {0};
+  assert(pread(fd, original, sizeof(original), 0) == (ssize_t)len);
+
+  errno = 0;
+  assert(pread(fd, buf, sizeof(buf), (off_t)-1) == -1);
+  assert(errno == EINVAL);
+
+  const char marker = 'X';
+  errno = 0;
+  assert(pwrite(fd, &marker, sizeof(marker), (off_t)-1) == -1);
+  assert(errno == EINVAL);
+
+  struct stat after;
+  assert(fstat(fd, &after) == 0);
+  assert(after.st_size == before.st_size);
+  memset(buf, 0, sizeof(buf));
+  assert(pread(fd, buf, sizeof(buf), 0) == (ssize_t)len);
+  assert(memcmp(buf, original, len) == 0);
+
   // F_SETFL may change O_APPEND, but must preserve O_ACCMODE. In particular,
   // clearing O_APPEND must not turn this descriptor into an O_RDONLY one.
   assert(fcntl(fd, F_SETFL, O_APPEND) == 0);
