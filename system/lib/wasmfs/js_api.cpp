@@ -214,10 +214,18 @@ int _wasmfs_symlink(const char* old_path, const char* new_path) {
 
 int _wasmfs_readlink(const char* path, char** out_ptr) {
   static thread_local char* readBuf = (char*)malloc(PATH_MAX);
+  if (!readBuf) {
+    return -ENOMEM;
+  }
   int bytes =
     __syscall_readlinkat(AT_FDCWD, (intptr_t)path, (intptr_t)readBuf, PATH_MAX);
   if (bytes < 0) {
     return bytes;
+  }
+  // The JS API has no caller-provided output capacity. Do not report a
+  // truncated target as a successful string, and leave room for its terminator.
+  if (bytes >= PATH_MAX) {
+    return -ENAMETOOLONG;
   }
   readBuf[bytes] = '\0';
   *out_ptr = readBuf;

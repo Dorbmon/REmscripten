@@ -265,12 +265,17 @@ addToLibrary({
       ))
     ),
     readlink(path) {
-      return withStackSave(() => {
+      var result;
+      var readBuffer;
+      withStackSave(() => {
         var bufPtr = stackAlloc({{{ POINTER_SIZE }}});
-        FS.handleError(__wasmfs_readlink(stringToUTF8OnStack(path), bufPtr));
-        var readBuffer = {{{ makeGetValue('bufPtr', '0', '*') }}};
-        return UTF8ToString(readBuffer);
+        result = __wasmfs_readlink(stringToUTF8OnStack(path), bufPtr);
+        if (result >= 0) {
+          readBuffer = {{{ makeGetValue('bufPtr', '0', '*') }}};
+        }
       });
+      FS.handleError(result);
+      return UTF8ToString(readBuffer);
     },
     statBufToObject(statBuf) {
       // i53/u53 are enough for times and ino in practice.

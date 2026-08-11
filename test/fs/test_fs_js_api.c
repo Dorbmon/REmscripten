@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <limits.h>
 
 EM_JS(void, test_fs_open, (), {
   FS.writeFile('testfile', 'a=1\nb=2\n');
@@ -194,6 +195,30 @@ EM_JS(void, test_fs_readlink,(), {
   }
   assert(ex.name === "ErrnoError" && ex.errno === 28 /* EINVAL */);
 });
+
+#if defined(WASMFS) && !defined(NODEFS) && !defined(NODERAWFS)
+EM_JS(void, test_wasmfs_readlink_bounds, (int path_max), {
+  const shortTarget = 'x'.repeat(path_max - 1);
+  FS.symlink(shortTarget, '/readlink-short-target');
+  assert(FS.readlink('/readlink-short-target') === shortTarget);
+
+  const fullTarget = 'x'.repeat(path_max);
+  FS.symlink(fullTarget, '/readlink-full-target');
+  var stack = stackSave();
+  var ex;
+  try {
+    FS.readlink('/readlink-full-target');
+  } catch (err) {
+    ex = err;
+  }
+  assert(ex && ex.name === 'ErrnoError' &&
+         ex.errno === 37 /* ENAMETOOLONG */);
+  assert(stackSave() === stack);
+  assert(FS.readlink('/readlink-short-target') === shortTarget);
+  FS.unlink('/readlink-short-target');
+  FS.unlink('/readlink-full-target');
+});
+#endif
 
 EM_JS(void, test_fs_read, (), {
   FS.writeFile("readtestfile", 'a=1_b=2_');
@@ -529,6 +554,9 @@ int main() {
   test_fs_mkdirTree();
   test_fs_close();
   test_fs_readlink();
+#if defined(WASMFS) && !defined(NODEFS) && !defined(NODERAWFS)
+  test_wasmfs_readlink_bounds(PATH_MAX);
+#endif
   test_fs_rmdir();
 #endif
   test_fs_open();
