@@ -4,6 +4,10 @@
  * SPDX-License-Identifier: MIT
  */
 
+#if WASMFS_OPFS_TEST_MOVE_INTERRUPT != 0 && WASMFS_OPFS_TEST_MOVE_INTERRUPT != 1 && WASMFS_OPFS_TEST_MOVE_INTERRUPT != 2
+#error "WASMFS_OPFS_TEST_MOVE_INTERRUPT must be 0, 1, or 2"
+#endif
+
 addToLibrary({
   $wasmfsOPFSDirectoryHandles__deps: ['$HandleAllocator'],
   $wasmfsOPFSDirectoryHandles: "new HandleAllocator()",
@@ -19,6 +23,20 @@ addToLibrary({
     release: undefined,
     request: undefined,
   },
+
+#if WASMFS_OPFS_TEST_MOVE_INTERRUPT
+  // This is compiled only into the focused interruption test. It has no
+  // production configuration surface: once the witness is emitted, leave the
+  // proxy callback pending until its containing document is disposed.
+  $wasmfsOPFSTestMoveInterrupt: async (phase) => {
+    let channel = new BroadcastChannel('wasmfs-opfs-test-move-interrupt');
+    channel.postMessage({
+      phase,
+      type: 'wasmfs-opfs-test-move-interrupt',
+    });
+    await new Promise(() => {});
+  },
+#endif
 
 #if !PTHREADS
   // OPFS will only be used on modern browsers that supports JS classes.
@@ -292,18 +310,31 @@ addToLibrary({
 
   _wasmfs_opfs_move_file__deps: ['$wasmfsOPFSFileHandles',
                                  '$wasmfsOPFSDirectoryHandles',
+#if WASMFS_OPFS_TEST_MOVE_INTERRUPT
+                                 '$wasmfsOPFSTestMoveInterrupt',
+#endif
                                  '$wasmfsOPFSProxyFinish'],
   _wasmfs_opfs_move_file__async: 'auto',
   _wasmfs_opfs_move_file: async (ctx, fileID, newParentID, namePtr, errPtr) => {
     let name = UTF8ToString(namePtr);
     let fileHandle = wasmfsOPFSFileHandles.get(fileID);
     let newDirHandle = wasmfsOPFSDirectoryHandles.get(newParentID);
+#if WASMFS_OPFS_TEST_MOVE_INTERRUPT == 1
+    await wasmfsOPFSTestMoveInterrupt('before');
+#endif
     try {
       await fileHandle.move(newDirHandle, name);
     } catch {
       let err = -{{{ cDefs.EIO }}};
       {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
+      wasmfsOPFSProxyFinish(ctx);
+      return;
     }
+#if WASMFS_OPFS_TEST_MOVE_INTERRUPT == 2
+    // Keep this outside the move error mapping. A test-hook failure must not
+    // become a backend EIO result.
+    await wasmfsOPFSTestMoveInterrupt('after');
+#endif
     wasmfsOPFSProxyFinish(ctx);
   },
 

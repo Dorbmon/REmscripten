@@ -169,6 +169,10 @@ no_firefox = skip_if('no_firefox', lambda _: is_firefox(), 'firefox is not suppo
 
 no_safari = skip_if('no_safari', lambda _: is_safari(), 'safari is not supported')
 
+only_chromium = skip_if_simple(
+  'only_chromium', lambda _: not is_chrome(),
+  'this test uses Chromium OPFS move interruption behavior')
+
 
 def requires_version(name, version_getter):
   assert callable(version_getter)
@@ -5468,6 +5472,207 @@ Module["preRun"] = () => {
       </script>
     ''')
     self.run_browser('a.html', '/report_result?0', timeout=60)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_move_interrupt(self):
+    # This is intentionally narrower than an OPFS atomicity, browser-crash,
+    # renderer-crash, SQLite, or LevelDB recovery test. It disposes an iframe
+    # while the generated ProxyWorker callback is deliberately pending at one
+    # side of the actual move() call, then checks the resulting namespace from
+    # a fresh leased module without letting page JavaScript access OPFS.
+    test = 'wasmfs/wasmfs_opfs_move_interrupt.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_MOVE_INTERRUPT_OWNER', '-o', 'owner.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_MOVE_INTERRUPT_MUTATOR',
+                     '-sWASMFS_OPFS_TEST_MOVE_INTERRUPT=1',
+                     '-o', 'mutator-before.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_MOVE_INTERRUPT_MUTATOR',
+                     '-sWASMFS_OPFS_TEST_MOVE_INTERRUPT=2',
+                     '-o', 'mutator-after.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_MOVE_INTERRUPT_VERIFIER',
+                     '-o', 'verifier.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        // This is a controlled pending ProxyWorker callback interruption
+        // only. It does not claim FileSystemFileHandle.move() atomicity,
+        // browser or renderer crash recovery, or SQLite/LevelDB/database
+        // recovery semantics.
+        const kOwner = 0;
+        const kMutator = 1;
+        const kVerifier = 2;
+        const kReady = 0;
+        const kBusy = 1;
+        const kPreMove = 2;
+        const kPostMove = 3;
+        const kModuleTimeoutMs = 15000;
+        const kLeaseReleaseDeadlineMs = 10000;
+        const kLeaseRetryDelayMs = 100;
+        const kWitnessType = 'wasmfs-opfs-test-move-interrupt';
+        const pendingModules = new Map();
+        const pendingWitnesses = [];
+        let witnessWaiter = undefined;
+        const witnessChannel = new BroadcastChannel(
+          'wasmfs-opfs-test-move-interrupt');
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        async function startLeasedModule(path, role, description) {
+          const deadline = Date.now() + kLeaseReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            const candidate = await startModule(path);
+            if (candidate.message.role != role) {
+              candidate.frame.remove();
+              throw new Error(description + ' reported role ' +
+                              candidate.message.role + ', expected ' + role);
+            }
+            if (candidate.message.result != kBusy) {
+              return candidate;
+            }
+            candidate.frame.remove();
+            await delay(kLeaseRetryDelayMs);
+          }
+          throw new Error(description +
+                          ' did not acquire a fresh OPFS profile lease');
+        }
+
+        function settleWitness(witness) {
+          if (witnessWaiter && witnessWaiter.phase == witness.phase) {
+            const {resolve, timeout} = witnessWaiter;
+            witnessWaiter = undefined;
+            clearTimeout(timeout);
+            resolve(witness);
+          } else {
+            pendingWitnesses.push(witness);
+          }
+        }
+
+        function waitForWitness(phase) {
+          const index = pendingWitnesses.findIndex(
+            (witness) => witness.phase == phase);
+          if (index >= 0) {
+            return Promise.resolve(pendingWitnesses.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              witnessWaiter = undefined;
+              reject(new Error('timed out waiting for ' + phase +
+                               ' move interruption witness'));
+            }, kModuleTimeoutMs);
+            witnessWaiter = {phase, resolve, timeout};
+          });
+        }
+
+        witnessChannel.onmessage = (event) => {
+          if (event.data?.type == kWitnessType &&
+              (event.data.phase == 'before' || event.data.phase == 'after')) {
+            settleWitness(event.data);
+          }
+        };
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != 'wasmfs-opfs-move-interrupt' ||
+              event.data.event != 'result') {
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function runInterruptionCase(mutatorPath, phase, disposition) {
+          const owner = await startLeasedModule('owner.html', kOwner, 'owner');
+          if (owner.message.result != kReady || owner.message.error != 0) {
+            owner.frame.remove();
+            throw new Error('owner failed: result=' + owner.message.result +
+                            ', errno=' + owner.message.error);
+          }
+
+          // The owner is a separate leased module. Disposing its iframe is
+          // deliberately not an orderly WasmFS/backend shutdown assertion.
+          owner.frame.remove();
+
+          const mutator = await startLeasedModule(
+            mutatorPath, kMutator, phase + ' mutator');
+          if (mutator.message.result != kReady || mutator.message.error != 0) {
+            mutator.frame.remove();
+            throw new Error(phase + ' mutator failed: result=' +
+                            mutator.message.result + ', errno=' +
+                            mutator.message.error);
+          }
+
+          await waitForWitness(phase);
+          // This disposes the document whose ProxyWorker callback remains
+          // pending. No page JavaScript reads or writes OPFS on its behalf.
+          mutator.frame.remove();
+
+          const verifier = await startLeasedModule(
+            'verifier.html', kVerifier, phase + ' verifier');
+          if (verifier.message.result != disposition ||
+              verifier.message.error != 0) {
+            verifier.frame.remove();
+            const expected = disposition == kPreMove ? 'A + tmp-B' :
+                                                       'B + no-tmp';
+            throw new Error(phase + ' fresh verifier observed result=' +
+                            verifier.message.result + ', errno=' +
+                            verifier.message.error + ', expected ' + expected);
+          }
+          verifier.frame.remove();
+        }
+
+        (async () => {
+          await runInterruptionCase(
+            'mutator-before.html', 'before', kPreMove);
+          await runInterruptionCase(
+            'mutator-after.html', 'after', kPostMove);
+          witnessChannel.close();
+          reportResultToServer('0');
+        })().catch((error) => {
+          witnessChannel.close();
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=90)
 
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')

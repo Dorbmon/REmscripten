@@ -1827,6 +1827,14 @@ var FETCH_STREAMING = 0;
 // [experimental]
 var WASMFS = false;
 
+// Test-only selector for a controlled interruption of the OPFS move proxy
+// callback.  0 disables the hook, 1 pauses immediately before the browser
+// `FileSystemFileHandle.move()` call, and 2 pauses immediately after that call
+// fulfills.  This controls code emitted at link time only; it intentionally
+// provides no runtime configuration API.
+// [link]
+var WASMFS_OPFS_TEST_MOVE_INTERRUPT = 0;
+
 // If set to 1, embeds all subresources in the emitted file as base64 string
 // literals. Embedded subresources may include (but aren't limited to) wasm,
 // asm.js, and static memory initialization code.
