@@ -13233,6 +13233,15 @@ Module.postRun = () => {{
   def test_unistd_dup(self):
     self.do_run_in_out_file_test('wasmfs/wasmfs_dup.c')
 
+  @parameterized({
+    '': ([],),
+    'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
+  def test_wasmfs_dup3_flags(self, args):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test(
+        'wasmfs/wasmfs_dup3_flags.c', cflags=['-sASSERTIONS=0'] + args)
+
   @also_with_wasmfs
   def test_unistd_open(self):
     self.do_run_in_out_file_test('wasmfs/wasmfs_open.c')
