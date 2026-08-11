@@ -20,6 +20,10 @@
 #error "WASMFS_OPFS_TEST_QUOTA_WRITE must be 0 or 1"
 #endif
 
+#if WASMFS_OPFS_TEST_QUOTA_TRUNCATE != 0 && WASMFS_OPFS_TEST_QUOTA_TRUNCATE != 1
+#error "WASMFS_OPFS_TEST_QUOTA_TRUNCATE must be 0 or 1"
+#endif
+
 addToLibrary({
   $wasmfsOPFSDirectoryHandles__deps: ['$HandleAllocator'],
   $wasmfsOPFSDirectoryHandles: "new HandleAllocator()",
@@ -697,9 +701,19 @@ addToLibrary({
   _wasmfs_opfs_set_size_access: async (ctx, accessID, size, errPtr) => {
     let accessHandle = wasmfsOPFSAccessHandles.get(accessID);
     try {
+#if WASMFS_OPFS_TEST_QUOTA_TRUNCATE && PTHREADS
+      // This focused test hook must run before the native SyncAccessHandle
+      // truncate, so it proves the error translation without consuming OPFS
+      // quota or changing the file.
+      throw new DOMException('injected OPFS quota failure',
+                             'QuotaExceededError');
+#endif
       await accessHandle.truncate(size);
-    } catch {
+    } catch (e) {
       let err = -{{{ cDefs.EIO }}};
+      if (e.name == "QuotaExceededError") {
+        err = -{{{ cDefs.ENOSPC }}};
+      }
       {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
     }
     wasmfsOPFSProxyFinish(ctx);

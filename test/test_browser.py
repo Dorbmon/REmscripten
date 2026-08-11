@@ -5573,6 +5573,22 @@ Module["preRun"] = () => {
                             '-sWASMFS_OPFS_TEST_QUOTA_WRITE=1'])
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_quota_truncate(self):
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    # First prove that the default-off setting leaves the pthread
+    # SyncAccessHandle truncate path unchanged. The second build injects a
+    # QuotaExceededError immediately before that native truncate.
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_quota_truncate.c',
+      cflags=common_args)
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_quota_truncate.c',
+      cflags=common_args + ['-DWASMFS_OPFS_QUOTA_TRUNCATE_INJECTED',
+                            '-sWASMFS_OPFS_TEST_QUOTA_TRUNCATE=1'])
+
+  @no_firefox('no OPFS support yet')
   @no_safari('no Web Locks support yet')
   @no_wasm64()
   def test_wasmfs_opfs_profile_lease(self):
