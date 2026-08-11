@@ -81,6 +81,26 @@ bool canMutateExplicitMetadata(const std::shared_ptr<wasmfs::File>& file) {
   return true;
 }
 
+// WASI represents offsets as unsigned values, while WasmFS backends receive a
+// signed off_t. Check a complete positioned I/O vector before handing any part
+// of it to a backend so `offset + length` cannot overflow there after an
+// otherwise valid starting offset.
+template <typename IOV>
+bool fitsPositionedIOVRange(const IOV* iovs,
+                            size_t iovs_len,
+                            __wasi_filesize_t offset) {
+  const auto maxOffset =
+    static_cast<__wasi_filesize_t>(std::numeric_limits<off_t>::max());
+  for (size_t i = 0; i < iovs_len; ++i) {
+    auto length = static_cast<__wasi_filesize_t>(iovs[i].buf_len);
+    if (length > maxOffset - offset) {
+      return false;
+    }
+    offset += length;
+  }
+  return true;
+}
+
 } // anonymous namespace
 
 extern "C" {
@@ -162,18 +182,30 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
 
   auto lockedOpenFile = openFile->locked();
 
+  auto file = lockedOpenFile.getFile();
+  // Positioned I/O needs a seekable file even when the open descriptor's
+  // access mode would independently reject the operation.
+  if (setOffset == OffsetHandling::Argument && !file->isSeekable()) {
+    return __WASI_ERRNO_SPIPE;
+  }
+
   // A file opened for reading only (O_RDONLY) cannot be written. POSIX write(2)
   // returns EBADF when the file descriptor is not open for writing.
   if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_RDONLY) {
     return __WASI_ERRNO_BADF;
   }
 
-  auto file = lockedOpenFile.getFile()->dynCast<DataFile>();
-  if (!file) {
+  auto dataFile = file->dynCast<DataFile>();
+  if (!dataFile) {
     return __WASI_ERRNO_ISDIR;
   }
 
-  auto lockedFile = file->locked();
+  if (setOffset == OffsetHandling::Argument &&
+      !fitsPositionedIOVRange(iovs, iovs_len, offset)) {
+    return __WASI_ERRNO_INVAL;
+  }
+
+  auto lockedFile = dataFile->locked();
 
   if (setOffset == OffsetHandling::OpenFileState) {
     if (lockedOpenFile.getFlags() & O_APPEND) {
@@ -247,14 +279,24 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
     return __WASI_ERRNO_BADF;
   }
 
+  if (setOffset == OffsetHandling::Argument && !isValidOffset(offset)) {
+    return __WASI_ERRNO_INVAL;
+  }
+
   auto lockedOpenFile = openFile->locked();
 
   if (setOffset == OffsetHandling::OpenFileState) {
     offset = lockedOpenFile.getPosition();
+    if (iovs_len < 0 || !isValidOffset(offset)) {
+      return __WASI_ERRNO_INVAL;
+    }
   }
 
-  if (iovs_len < 0 || !isValidOffset(offset)) {
-    return __WASI_ERRNO_INVAL;
+  auto file = lockedOpenFile.getFile();
+  // Positioned I/O needs a seekable file even when the open descriptor's
+  // access mode would independently reject the operation.
+  if (setOffset == OffsetHandling::Argument && !file->isSeekable()) {
+    return __WASI_ERRNO_SPIPE;
   }
 
   // A file opened for writing only (O_WRONLY) cannot be read. POSIX read(2)
@@ -263,14 +305,19 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
     return __WASI_ERRNO_BADF;
   }
 
-  auto file = lockedOpenFile.getFile()->dynCast<DataFile>();
+  auto dataFile = file->dynCast<DataFile>();
 
   // If file is nullptr, then the file was not a DataFile.
-  if (!file) {
+  if (!dataFile) {
     return __WASI_ERRNO_ISDIR;
   }
 
-  auto lockedFile = file->locked();
+  if (setOffset == OffsetHandling::Argument &&
+      !fitsPositionedIOVRange(iovs, iovs_len, offset)) {
+    return __WASI_ERRNO_INVAL;
+  }
+
+  auto lockedFile = dataFile->locked();
 
   size_t bytesRead = 0;
   for (size_t i = 0; i < iovs_len; i++) {

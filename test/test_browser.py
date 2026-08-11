@@ -5616,6 +5616,14 @@ Module["preRun"] = () => {
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')
   @no_wasm64()
+  def test_wasmfs_opfs_positioned_io_range(self):
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_positioned_io_range.c',
+      cflags=['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js'])
+
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
   def test_wasmfs_opfs_open_truncate(self):
     common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
     # A writable O_TRUNC must not return a descriptor if the access-handle
