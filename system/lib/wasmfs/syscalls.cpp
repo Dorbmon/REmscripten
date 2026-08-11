@@ -83,13 +83,13 @@ bool canMutateExplicitMetadata(const std::shared_ptr<wasmfs::File>& file) {
 }
 
 // WASI represents offsets as unsigned values, while WasmFS backends receive a
-// signed off_t. Check a complete positioned I/O vector before handing any part
-// of it to a backend so `offset + length` cannot overflow there after an
-// otherwise valid starting offset.
+// signed off_t. Check a complete I/O vector before handing any part of it to a
+// backend so `offset + length` cannot overflow there after an otherwise valid
+// starting offset.
 template <typename IOV>
-bool fitsPositionedIOVRange(const IOV* iovs,
-                            size_t iovs_len,
-                            __wasi_filesize_t offset) {
+bool fitsIOVRange(const IOV* iovs,
+                  size_t iovs_len,
+                  __wasi_filesize_t offset) {
   const auto maxOffset =
     static_cast<__wasi_filesize_t>(std::numeric_limits<off_t>::max());
   for (size_t i = 0; i < iovs_len; ++i) {
@@ -235,7 +235,7 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
   }
 
   if (setOffset == OffsetHandling::Argument &&
-      !fitsPositionedIOVRange(iovs, iovs_len, offset)) {
+      !fitsIOVRange(iovs, iovs_len, offset)) {
     return __WASI_ERRNO_INVAL;
   }
 
@@ -249,9 +249,16 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
         return -size;
       }
       offset = size;
-      lockedOpenFile.setPosition(offset);
     } else {
       offset = lockedOpenFile.getPosition();
+    }
+
+    if (!isValidOffset(offset) || !fitsIOVRange(iovs, iovs_len, offset)) {
+      return __WASI_ERRNO_INVAL;
+    }
+
+    if (lockedOpenFile.getFlags() & O_APPEND) {
+      lockedOpenFile.setPosition(offset);
     }
   }
 
@@ -354,8 +361,7 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
     return __WASI_ERRNO_ISDIR;
   }
 
-  if (setOffset == OffsetHandling::Argument &&
-      !fitsPositionedIOVRange(iovs, iovs_len, offset)) {
+  if (!fitsIOVRange(iovs, iovs_len, offset)) {
     return __WASI_ERRNO_INVAL;
   }
 
@@ -370,7 +376,6 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
       return __WASI_ERRNO_INVAL;
     }
 
-    // TODO: Check for overflow when adding offset + bytesRead.
     auto result = lockedFile.read(buf, len, offset + bytesRead);
     if (result < 0) {
       // This individual read failed. Report the error unless we've already read
@@ -945,7 +950,10 @@ __wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
   if (whence == SEEK_SET) {
     position = offset;
   } else if (whence == SEEK_CUR) {
-    position = lockedOpenFile.getPosition() + offset;
+    if (__builtin_add_overflow(
+          lockedOpenFile.getPosition(), offset, &position)) {
+      return __WASI_ERRNO_INVAL;
+    }
   } else if (whence == SEEK_END) {
     // Only the open file state is altered in seek. Locking the underlying
     // data file here once is sufficient.
@@ -954,7 +962,9 @@ __wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
       // Translate to WASI standard of positive return codes.
       return -size;
     }
-    position = size + offset;
+    if (__builtin_add_overflow(size, offset, &position)) {
+      return __WASI_ERRNO_INVAL;
+    }
   } else {
     return __WASI_ERRNO_INVAL;
   }
