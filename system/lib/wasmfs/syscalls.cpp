@@ -743,13 +743,25 @@ int __syscall_openat(int dirfd, intptr_t path, int flags, ...) {
 }
 
 int __syscall_mknodat(int dirfd, intptr_t path, int mode, int dev) {
-  assert(dev == 0); // TODO: support special devices
-  if (mode & S_IFDIR) {
-    return -EINVAL;
+  // Validate the requested node type before resolving the path. WasmFS can
+  // create regular files, but has no implementations for special nodes.
+  switch (mode & S_IFMT) {
+    case 0:
+    case S_IFREG:
+      break;
+    case S_IFCHR:
+    case S_IFBLK:
+    case S_IFIFO:
+    case S_IFSOCK:
+      return -ENOTSUP;
+    case S_IFDIR:
+    case S_IFLNK:
+    default:
+      return -EINVAL;
   }
-  if (mode & S_IFIFO) {
-    return -EPERM;
-  }
+
+  // Device numbers apply only to special node types, which WasmFS rejects.
+  (void)dev;
   return doOpen(path::parseParent((char*)path, dirfd),
                 O_CREAT | O_EXCL,
                 mode,

@@ -41,7 +41,11 @@ void test() {
   // mknod fifo
   err = mknod("mknod-fifo", S_IFIFO | 0777, 0);
   assert(err);
+#ifdef WASMFS
+  assert(errno == ENOTSUP);
+#else
   assert(errno == EPERM);
+#endif
 
   // mknod a file
   err = mknod("mknod-file", S_IFREG | 0777, 0);
