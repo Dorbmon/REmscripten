@@ -1406,11 +1406,37 @@ int __syscall_pipe2(intptr_t fd, int flags) {
   (void)OpenFileState::create(reader, O_RDONLY, openReader);
   (void)OpenFileState::create(writer, O_WRONLY, openWriter);
 
-  auto fileTable = wasmFS.getFileTable().locked();
-  fds[0] = fileTable.addEntry(openReader);
-  fds[1] = fileTable.addEntry(openWriter);
+  std::shared_ptr<DataFile> closee;
+  int readerFD = -EMFILE;
+  int writerFD = -EMFILE;
+  {
+    auto fileTable = wasmFS.getFileTable().locked();
+    readerFD = fileTable.addEntry(openReader);
+    if (readerFD >= 0) {
+      writerFD = fileTable.addEntry(openWriter);
+      if (writerFD >= 0) {
+        // pipe2() must leave pipefd unchanged on failure, so do not publish
+        // either descriptor until both ends have been installed.
+        fds[0] = readerFD;
+        fds[1] = writerFD;
+        return 0;
+      }
 
-  return 0;
+      // The reader was installed but the writer could not be. Remove the
+      // reader before releasing the lock, then close it below.
+      closee = fileTable.setEntry(readerFD, nullptr);
+    }
+  }
+
+  if (closee) {
+    (void)closee->locked().close();
+  }
+  if (readerFD < 0) {
+    (void)abandonOpenFile(std::move(openReader));
+  }
+  (void)abandonOpenFile(std::move(openWriter));
+
+  return readerFD < 0 ? readerFD : writerFD;
 }
 
 // int poll(struct pollfd* fds, nfds_t nfds, int timeout);
