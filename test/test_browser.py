@@ -5557,6 +5557,22 @@ Module["preRun"] = () => {
     self.run_browser('a.html', '/report_result?0', timeout=60)
 
   @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_quota_write(self):
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    # First prove that the default-off setting leaves the pthread
+    # SyncAccessHandle write path unchanged. The second build injects a
+    # QuotaExceededError immediately before that native write.
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_quota_write.c',
+      cflags=common_args)
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_quota_write.c',
+      cflags=common_args + ['-DWASMFS_OPFS_QUOTA_WRITE_INJECTED',
+                            '-sWASMFS_OPFS_TEST_QUOTA_WRITE=1'])
+
+  @no_firefox('no OPFS support yet')
   @no_safari('no Web Locks support yet')
   @no_wasm64()
   def test_wasmfs_opfs_profile_lease(self):

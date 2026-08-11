@@ -16,6 +16,10 @@
 #error "WASMFS_OPFS_TEST_FILE_HANDLE_CACHE must be 0 or 1"
 #endif
 
+#if WASMFS_OPFS_TEST_QUOTA_WRITE != 0 && WASMFS_OPFS_TEST_QUOTA_WRITE != 1
+#error "WASMFS_OPFS_TEST_QUOTA_WRITE must be 0 or 1"
+#endif
+
 addToLibrary({
   $wasmfsOPFSDirectoryHandles__deps: ['$HandleAllocator'],
   $wasmfsOPFSDirectoryHandles: "new HandleAllocator()",
@@ -630,10 +634,20 @@ addToLibrary({
     let accessHandle = wasmfsOPFSAccessHandles.get(accessID);
     let data = HEAPU8.subarray(bufPtr, bufPtr + len);
     try {
+#if WASMFS_OPFS_TEST_QUOTA_WRITE && PTHREADS
+      // This focused test hook must run before the native SyncAccessHandle
+      // write, so it proves the error translation without consuming OPFS
+      // quota or changing the file.
+      throw new DOMException('injected OPFS quota failure',
+                             'QuotaExceededError');
+#endif
       return {{{ awaitIf(!PTHREADS) }}}accessHandle.write(data, {at: pos});
     } catch (e) {
       if (e.name == "TypeError") {
         return -{{{ cDefs.EINVAL }}};
+      }
+      if (e.name == "QuotaExceededError") {
+        return -{{{ cDefs.ENOSPC }}};
       }
 #if ASSERTIONS
       err('unexpected error:', e, e.stack);
