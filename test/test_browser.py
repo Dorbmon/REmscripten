@@ -5600,6 +5600,22 @@ Module["preRun"] = () => {
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')
   @no_wasm64()
+  def test_wasmfs_opfs_fallocate(self):
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    # The default build grows the file through an OPFS SyncAccessHandle. The
+    # injected build fails before the native truncate, proving that
+    # posix_fallocate propagates quota exhaustion instead of reporting success.
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_fallocate.c',
+      cflags=common_args)
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_fallocate.c',
+      cflags=common_args + ['-DWASMFS_OPFS_FALLOCATE_INJECTED',
+                            '-sWASMFS_OPFS_TEST_QUOTA_TRUNCATE=1'])
+
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
   def test_wasmfs_opfs_open_truncate(self):
     common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
     # A writable O_TRUNC must not return a descriptor if the access-handle

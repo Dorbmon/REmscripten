@@ -1668,27 +1668,53 @@ int __syscall_poll(intptr_t fds_, int nfds, int timeout) {
 }
 
 int __syscall_fallocate(int fd, int mode, off_t offset, off_t len) {
-  assert(mode == 0); // TODO, but other modes were never supported in the old FS
-
   auto fileTable = wasmFS.getFileTable().locked();
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
     return -EBADF;
   }
 
-  auto dataFile = openFile->locked().getFile()->dynCast<DataFile>();
+  // Match Linux's validation order: after resolving the descriptor, reject an
+  // invalid range before evaluating the requested allocation mode.
+  if (offset < 0 || len <= 0) {
+    return -EINVAL;
+  }
+
+  // WasmFS can grow a file, but has no backend API for reserving space while
+  // preserving its size, punching holes, or any other fallocate mode. Do not
+  // treat those requests as the default allocation operation in release
+  // builds, where an assert would otherwise disappear.
+  if (mode != 0) {
+    return -ENOTSUP;
+  }
+
+  auto lockedOpenFile = openFile->locked();
+  if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_RDONLY) {
+    return -EBADF;
+  }
+
+  auto file = lockedOpenFile.getFile();
+  // A pipe can have buffered data already covering the requested range, in
+  // which case a size comparison alone would report a false success without
+  // calling PipeFile::setSize().
+  if (!file->isSeekable()) {
+    return -ESPIPE;
+  }
+
+  auto dataFile = file->dynCast<DataFile>();
   // TODO: support for symlinks.
   if (!dataFile) {
     return -ENODEV;
   }
 
+  // The writable open file description above authorizes this operation even
+  // if a later chmod changes the logical file mode.
   auto locked = dataFile->locked();
-  if (!(locked.getMode() & WASMFS_PERM_WRITE)) {
-    return -EBADF;
-  }
 
-  if (offset < 0 || len <= 0) {
-    return -EINVAL;
+  // `offset + len` must not wrap and turn a request too large for WasmFS into
+  // a successful no-op.
+  if (offset > std::numeric_limits<off_t>::max() - len) {
+    return -EFBIG;
   }
 
   // TODO: We could only fill zeros for regions that were completely unused
