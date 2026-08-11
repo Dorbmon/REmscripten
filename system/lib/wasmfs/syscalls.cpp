@@ -152,6 +152,13 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
   }
 
   auto lockedOpenFile = openFile->locked();
+
+  // A file opened for reading only (O_RDONLY) cannot be written. POSIX write(2)
+  // returns EBADF when the file descriptor is not open for writing.
+  if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_RDONLY) {
+    return __WASI_ERRNO_BADF;
+  }
+
   auto file = lockedOpenFile.getFile()->dynCast<DataFile>();
   if (!file) {
     return __WASI_ERRNO_ISDIR;
@@ -172,8 +179,6 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
       offset = lockedOpenFile.getPosition();
     }
   }
-
-  // TODO: Check open file access mode for write permissions.
 
   size_t bytesWritten = 0;
   for (size_t i = 0; i < iovs_len; i++) {
@@ -243,7 +248,11 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
     return __WASI_ERRNO_INVAL;
   }
 
-  // TODO: Check open file access mode for read permissions.
+  // A file opened for writing only (O_WRONLY) cannot be read. POSIX read(2)
+  // returns EBADF when the file descriptor is not open for reading.
+  if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_WRONLY) {
+    return __WASI_ERRNO_BADF;
+  }
 
   auto file = lockedOpenFile.getFile()->dynCast<DataFile>();
 
@@ -701,8 +710,10 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
 int wasmfs_create_file(char* pathname, mode_t mode, backend_t backend) {
   static_assert(std::is_same_v<decltype(doOpen(0, 0, 0, 0)), unsigned int>,
                 "unexpected conversion from result of doOpen to int");
-  return doOpen(
-    path::parseParent((char*)pathname), O_CREAT | O_EXCL, mode, backend);
+  return doOpen(path::parseParent((char*)pathname),
+                O_CREAT | O_EXCL | O_RDWR,
+                mode,
+                backend);
 }
 
 // TODO: Test this with non-AT_FDCWD values.
@@ -1483,7 +1494,11 @@ int __syscall_ftruncate64(int fd, off_t size) {
   if (!openFile) {
     return -EBADF;
   }
-  auto ret = doTruncate(openFile->locked().getFile(), size);
+  auto lockedOpenFile = openFile->locked();
+  if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_RDONLY) {
+    return -EINVAL;
+  }
+  auto ret = doTruncate(lockedOpenFile.getFile(), size);
   // XXX It is not clear from the docs why ftruncate would differ from
   //     truncate here. However, on Linux this definitely happens, and the old
   //     FS matches that as well, so do the same here.
@@ -1714,6 +1729,8 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
       va_start(v1, cmd);
       flags = va_arg(v1, int);
       va_end(v1);
+      auto lockedOpenFile = openFile->locked();
+      auto oldFlags = lockedOpenFile.getFlags();
       // This syscall should ignore most flags.
       flags = flags & ~(O_RDONLY | O_WRONLY | O_RDWR | O_CREAT | O_EXCL |
                         O_NOCTTY | O_TRUNC);
@@ -1726,7 +1743,9 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
       if (flags != supportedFlags) {
         return -EINVAL;
       }
-      openFile->locked().setFlags(flags);
+      // F_SETFL can change O_APPEND, but must preserve the descriptor's
+      // immutable flags, including its access mode.
+      lockedOpenFile.setFlags((oldFlags & ~O_APPEND) | supportedFlags);
       return 0;
     }
     case F_GETLK: {

@@ -5913,6 +5913,14 @@ got: 10
     self.do_run_in_out_file_test('fs/test_writeFile.cpp')
 
   @with_all_fs
+  def test_fs_access_mode(self):
+    # Writing to an O_RDONLY fd and reading from an O_WRONLY fd must fail with
+    # EBADF, consistently across all filesystems.
+    if self.get_setting('WASMFS'):
+      self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf('fs/test_access_mode.c', 'done\n')
+
+  @with_all_fs
   @crossplatform
   def test_fs_js_api(self):
     nodefs = '-DNODEFS' in self.cflags or '-DNODERAWFS' in self.cflags
