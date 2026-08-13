@@ -4,7 +4,9 @@
 // found in the LICENSE file.
 
 #include <emscripten/threading.h>
+#include <atomic>
 #include <errno.h>
+#include <memory>
 #include <mutex>
 #include <stdlib.h>
 
@@ -71,6 +73,25 @@ public:
     }
   }
 #endif
+};
+
+// File wrappers can outlive the particular OpenFileState that observed a
+// rejected SyncAccessHandle close. Keep this per-backend state separately so a
+// later terminal drain cannot mistake an already-removed descriptor table for
+// proof that browser-side access handles are no longer live.
+class TerminalCloseState {
+  std::atomic<int> firstError = 0;
+
+public:
+  void recordFailedAccessClose(int error) {
+    if (error >= 0) {
+      error = -EIO;
+    }
+    int expected = 0;
+    (void)firstError.compare_exchange_strong(expected, error);
+  }
+
+  int getFailedAccessCloseError() const { return firstError.load(); }
 };
 
 class OpenState {
@@ -190,6 +211,7 @@ class OPFSFile : public DataFile {
   int parentID;
   std::string name;
   OpenState state;
+  std::shared_ptr<TerminalCloseState> terminalCloseState;
 
   // The File mutex protects the open state, JS file-handle ID, and locator.
   // Keep the locator locally rather than deriving it from Directory::getName:
@@ -236,9 +258,10 @@ public:
            backend_t backend,
            int parentID,
            std::string name,
-           Worker& proxy)
+           Worker& proxy,
+           std::shared_ptr<TerminalCloseState> terminalCloseState)
     : DataFile(mode, backend), proxy(proxy), parentID(parentID),
-      name(std::move(name)) {}
+      name(std::move(name)), terminalCloseState(std::move(terminalCloseState)) {}
 
   ~OPFSFile() override {
     // A rejected AccessHandle close remains intentionally quarantined in the
@@ -358,6 +381,13 @@ private:
 
   int close() override {
     int err = state.close(proxy);
+    if (err) {
+      // __wasi_fd_close has already removed this descriptor's OpenFileState
+      // before it calls us. Remember an ambiguous SyncAccessHandle close at
+      // backend scope so terminalDrainFinished() retains a profile lease even
+      // when the descriptor table is otherwise empty.
+      terminalCloseState->recordFailedAccessClose(err);
+    }
     // Keep a rejected close's FileSystemFileHandle only alongside its
     // quarantined SyncAccessHandle. A successful final close has no need for
     // an idle strong JS file-handle reference.
@@ -429,9 +459,15 @@ public:
 
   // The ID of this directory in the JS library.
   int dirID = 0;
+  std::shared_ptr<TerminalCloseState> terminalCloseState;
 
-  OPFSDirectory(mode_t mode, backend_t backend, int dirID, Worker& proxy)
-    : Directory(mode, backend), proxy(proxy), dirID(dirID) {}
+  OPFSDirectory(mode_t mode,
+                backend_t backend,
+                int dirID,
+                Worker& proxy,
+                std::shared_ptr<TerminalCloseState> terminalCloseState)
+    : Directory(mode, backend), proxy(proxy), dirID(dirID),
+      terminalCloseState(std::move(terminalCloseState)) {}
 
   ~OPFSDirectory() override {
     // The root handle is shared by all mounts of this backend, so only child
@@ -454,10 +490,10 @@ private:
     }
     if (childType == 1) {
       return std::make_shared<OPFSFile>(
-        0777, getBackend(), dirID, name, proxy);
+        0777, getBackend(), dirID, name, proxy, terminalCloseState);
     } else if (childType == 2) {
       return std::make_shared<OPFSDirectory>(
-        0777, getBackend(), childID, proxy);
+        0777, getBackend(), childID, proxy, terminalCloseState);
     } else {
       WASMFS_UNREACHABLE("Unexpected child type");
     }
@@ -474,7 +510,7 @@ private:
       return nullptr;
     }
     return std::make_shared<OPFSFile>(
-      mode, getBackend(), dirID, name, proxy);
+      mode, getBackend(), dirID, name, proxy, terminalCloseState);
   }
 
   std::shared_ptr<Directory> insertDirectory(const std::string& name,
@@ -487,7 +523,8 @@ private:
       // TODO: Propagate specific errors.
       return nullptr;
     }
-    return std::make_shared<OPFSDirectory>(mode, getBackend(), childID, proxy);
+    return std::make_shared<OPFSDirectory>(
+      mode, getBackend(), childID, proxy, terminalCloseState);
   }
 
   std::shared_ptr<Symlink> insertSymlink(const std::string& name,
@@ -545,8 +582,58 @@ public:
 
   bool supportsExplicitMetadataMutation() const override { return false; }
 
-  ~OPFSBackend() override {
+  int terminalDrainFinished(bool success) override {
+    // The generic drain has already recorded a descriptor flush/close error.
+    // Retain the lease without reporting the same failed close a second time
+    // through the backend-finalizer counter. A close that failed before drain
+    // begins is different: it is absent from FileTable and must be surfaced by
+    // the backend latch below while `success` is still true.
+    if (!success) {
+      terminalDrainFailed = true;
+      return 0;
+    }
+
+    if (int error = terminalCloseState->getFailedAccessCloseError()) {
+      // An ordinary close can fail before terminalDrain begins, after which
+      // its descriptor has already left FileTable. Surface that terminal
+      // resource failure and retain any cooperative lease rather than treating
+      // an empty table as a safe browser-side handoff.
+      terminalDrainFailed = true;
+      return error;
+    }
+
     if (!profileLeaseHeld) {
+      return 0;
+    }
+
+    int err = 0;
+    proxy([&](auto ctx) {
+      _wasmfs_opfs_release_profile_lease(ctx.ctx, &err);
+    });
+    if (err) {
+      // Do not retry an ambiguous Web Locks release from the destructor. The
+      // result-bearing terminal drain reports this error to its caller and
+      // leaves the browser-side lease live until context teardown.
+      terminalDrainFailed = true;
+      return err;
+    }
+
+    // A synchronous successful release is now part of the terminal-drain
+    // result. Do not release it again during object destruction.
+    profileLeaseHeld = false;
+    return 0;
+  }
+
+  bool releasesTerminalLease() const override { return profileLeaseHeld; }
+
+  ~OPFSBackend() override {
+    // A failed terminal drain has detached every descriptor but leaves a
+    // browser-side close result ambiguous. Do not explicitly release the
+    // cooperative lease in that state. Destruction of the worker context can
+    // still make the browser release Web Locks; that is not a durability
+    // acknowledgement and is documented by wasmfs_terminal_drain().
+    if (!profileLeaseHeld || terminalDrainFailed ||
+        terminalCloseState->getFailedAccessCloseError()) {
       return;
     }
 
@@ -578,7 +665,7 @@ public:
   std::shared_ptr<Directory> createDirectory(mode_t mode) override {
     proxy([](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); });
     return std::make_shared<OPFSDirectory>(
-      mode, this, kOPFSRootDirectoryID, proxy);
+      mode, this, kOPFSRootDirectoryID, proxy, terminalCloseState);
   }
 
   std::shared_ptr<Symlink> createSymlink(std::string target) override {
@@ -587,7 +674,10 @@ public:
   }
 
 private:
+  std::shared_ptr<TerminalCloseState> terminalCloseState =
+    std::make_shared<TerminalCloseState>();
   bool profileLeaseHeld = false;
+  bool terminalDrainFailed = false;
 };
 
 } // anonymous namespace
@@ -595,6 +685,11 @@ private:
 extern "C" {
 
 backend_t wasmfs_create_opfs_backend() {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
   // ProxyWorker cannot safely be synchronously spawned from the main browser
   // thread. See comment in thread_utils.h for more details.
   assert(
@@ -607,6 +702,11 @@ backend_t wasmfs_create_opfs_backend() {
 
 backend_t wasmfs_create_opfs_backend_with_profile_lease(
   const char* profile_name) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
   if (!IsValidProfileLeaseName(profile_name)) {
     errno = EINVAL;
     return nullptr;
@@ -619,6 +719,15 @@ backend_t wasmfs_create_opfs_backend_with_profile_lease(
   errno = ENOTSUP;
   return nullptr;
 #else
+  // Reserve before constructing ProxyWorker or asking Web Locks. One WasmFS
+  // instance has one terminal-drain lease handoff, so a second leased backend
+  // must fail locally rather than acquiring an unrelated browser lock that
+  // terminalDrain cannot coordinate transactionally.
+  if (!wasmFS.reserveTerminalLeaseOwner()) {
+    errno = EBUSY;
+    return NullBackend;
+  }
+
   // The lease is obtained by the dedicated worker before this backend has
   // initialized an OPFS directory or file handle.
   assert(
@@ -629,6 +738,7 @@ backend_t wasmfs_create_opfs_backend_with_profile_lease(
   int err = backend->acquireProfileLease(profile_name);
   if (err != 0) {
     assert(err < 0);
+    wasmFS.cancelTerminalLeaseOwnerReservation();
     errno = -err;
     return nullptr;
   }

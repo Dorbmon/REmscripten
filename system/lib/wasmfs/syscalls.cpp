@@ -133,7 +133,57 @@ extern "C" {
 
 using namespace wasmfs;
 
+// Every public WasmFS filesystem entrypoint below takes one of these guards.
+// The guard is reentrant, so wrappers that delegate to another syscall remain
+// one admitted operation while a terminal drain is waiting for them.
+static __wasi_errno_t operationErrorToWasiErrno(int error) {
+  // ESHUTDOWN is a POSIX extension (and has a value beyond the WASI errno
+  // range). A terminal fence is best represented by WASI's valid CANCELED
+  // result. The only other Operation error currently reachable by a public
+  // entrypoint is a cross-instance reentrancy violation.
+  switch (error) {
+    case ESHUTDOWN:
+      return __WASI_ERRNO_CANCELED;
+    case EDEADLK:
+      return __WASI_ERRNO_DEADLK;
+    default:
+      return __WASI_ERRNO_IO;
+  }
+}
+
+#define WASMFS_GUARD_NEGATIVE()                                           \
+  WasmFS::Operation wasmfsOperation(wasmFS);                              \
+  if (!wasmfsOperation) {                                                  \
+    return -wasmfsOperation.getError();                                    \
+  }
+
+#define WASMFS_GUARD_WASI()                                               \
+  WasmFS::Operation wasmfsOperation(wasmFS);                              \
+  if (!wasmfsOperation) {                                                  \
+    return operationErrorToWasiErrno(wasmfsOperation.getError());          \
+  }
+
+// This is deliberately used only by __wasi_fd_write. During terminal
+// fflush(NULL), musl reaches stdout/stderr through that entrypoint. The
+// Operation implementation accepts it only on the draining thread and only
+// while the terminal flush token is held; every other public WasmFS entrypoint
+// remains fail-closed.
+#define WASMFS_GUARD_WASI_STDIO_WRITE()                                    \
+  WasmFS::Operation wasmfsOperation(                                      \
+    wasmFS, WasmFS::Operation::Kind::StdioFlushWrite);                     \
+  if (!wasmfsOperation) {                                                  \
+    return operationErrorToWasiErrno(wasmfsOperation.getError());          \
+  }
+
+#define WASMFS_GUARD_BACKEND()                                            \
+  WasmFS::Operation wasmfsOperation(wasmFS);                              \
+  if (!wasmfsOperation) {                                                  \
+    errno = wasmfsOperation.getError();                                    \
+    return NullBackend;                                                    \
+  }
+
 int __syscall_dup3(int oldfd, int newfd, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   if (flags & ~O_CLOEXEC) {
     return -EINVAL;
   }
@@ -166,6 +216,7 @@ int __syscall_dup3(int oldfd, int newfd, int flags) {
 }
 
 int __syscall_dup(int fd) {
+  WASMFS_GUARD_NEGATIVE();
   auto fileTable = wasmFS.getFileTable().locked();
 
   // Check that an open file exists corresponding to the given fd.
@@ -423,6 +474,7 @@ __wasi_errno_t __wasi_fd_write(__wasi_fd_t fd,
                                const __wasi_ciovec_t* iovs,
                                size_t iovs_len,
                                __wasi_size_t* nwritten) {
+  WASMFS_GUARD_WASI_STDIO_WRITE();
   return writeAtOffset(
     OffsetHandling::OpenFileState, fd, iovs, iovs_len, nwritten);
 }
@@ -431,6 +483,7 @@ __wasi_errno_t __wasi_fd_read(__wasi_fd_t fd,
                               const __wasi_iovec_t* iovs,
                               size_t iovs_len,
                               __wasi_size_t* nread) {
+  WASMFS_GUARD_WASI();
   return readAtOffset(OffsetHandling::OpenFileState, fd, iovs, iovs_len, nread);
 }
 
@@ -439,6 +492,7 @@ __wasi_errno_t __wasi_fd_pwrite(__wasi_fd_t fd,
                                 size_t iovs_len,
                                 __wasi_filesize_t offset,
                                 __wasi_size_t* nwritten) {
+  WASMFS_GUARD_WASI();
   return writeAtOffset(
     OffsetHandling::Argument, fd, iovs, iovs_len, nwritten, offset);
 }
@@ -448,11 +502,13 @@ __wasi_errno_t __wasi_fd_pread(__wasi_fd_t fd,
                                size_t iovs_len,
                                __wasi_filesize_t offset,
                                __wasi_size_t* nread) {
+  WASMFS_GUARD_WASI();
   return readAtOffset(
     OffsetHandling::Argument, fd, iovs, iovs_len, nread, offset);
 }
 
 __wasi_errno_t __wasi_fd_close(__wasi_fd_t fd) {
+  WASMFS_GUARD_WASI();
   std::shared_ptr<DataFile> closee;
   {
     // Do not hold the file table lock while performing the close.
@@ -473,6 +529,7 @@ __wasi_errno_t __wasi_fd_close(__wasi_fd_t fd) {
 }
 
 __wasi_errno_t __wasi_fd_sync(__wasi_fd_t fd) {
+  WASMFS_GUARD_WASI();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return __WASI_ERRNO_BADF;
@@ -497,6 +554,7 @@ __wasi_errno_t __wasi_fd_sync(__wasi_fd_t fd) {
 }
 
 int __syscall_fdatasync(int fd) {
+  WASMFS_GUARD_NEGATIVE();
   // TODO: Optimize this to avoid unnecessarily flushing unnecessary metadata.
   // `__syscall_*` functions use negative errno values, while the WASI entry
   // point returns a positive WASI errno.
@@ -504,6 +562,7 @@ int __syscall_fdatasync(int fd) {
 }
 
 backend_t wasmfs_get_backend_by_fd(int fd) {
+  WASMFS_GUARD_BACKEND();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return NullBackend;
@@ -514,6 +573,7 @@ backend_t wasmfs_get_backend_by_fd(int fd) {
 // This function is exposed to users to allow them to obtain a backend_t for a
 // specified path.
 backend_t wasmfs_get_backend_by_path(const char* path) {
+  WASMFS_GUARD_BACKEND();
   auto parsed = path::parseFile(path);
   if (parsed.getError()) {
     // Could not find the file.
@@ -531,6 +591,7 @@ static timespec ms_to_timespec(double ms) {
 }
 
 int __syscall_newfstatat(int dirfd, intptr_t path, intptr_t buf, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   // Only accept valid flags.
   if (flags & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW)) {
     // TODO: Test this case.
@@ -577,14 +638,17 @@ int __syscall_newfstatat(int dirfd, intptr_t path, intptr_t buf, int flags) {
 }
 
 int __syscall_stat64(intptr_t path, intptr_t buf) {
+  WASMFS_GUARD_NEGATIVE();
   return __syscall_newfstatat(AT_FDCWD, path, buf, 0);
 }
 
 int __syscall_lstat64(intptr_t path, intptr_t buf) {
+  WASMFS_GUARD_NEGATIVE();
   return __syscall_newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
 }
 
 int __syscall_fstat64(int fd, intptr_t buf) {
+  WASMFS_GUARD_NEGATIVE();
   return __syscall_newfstatat(fd, (intptr_t) "", buf, AT_EMPTY_PATH);
 }
 
@@ -830,6 +894,7 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
 // This function is exposed to users and allows users to create a file in a
 // specific backend. An fd to an open file is returned.
 int wasmfs_create_file(char* pathname, mode_t mode, backend_t backend) {
+  WASMFS_GUARD_NEGATIVE();
   static_assert(std::is_same_v<decltype(doOpen(0, 0, 0, 0)), unsigned int>,
                 "unexpected conversion from result of doOpen to int");
   return doOpen(path::parseParent((char*)pathname),
@@ -840,6 +905,7 @@ int wasmfs_create_file(char* pathname, mode_t mode, backend_t backend) {
 
 // TODO: Test this with non-AT_FDCWD values.
 int __syscall_openat(int dirfd, intptr_t path, int flags, ...) {
+  WASMFS_GUARD_NEGATIVE();
   mode_t mode = 0;
   va_list v1;
   va_start(v1, flags);
@@ -856,6 +922,7 @@ int __syscall_openat(int dirfd, intptr_t path, int flags, ...) {
 }
 
 int __syscall_mknodat(int dirfd, intptr_t path, int mode, int dev) {
+  WASMFS_GUARD_NEGATIVE();
   // Validate the requested node type before resolving the path. WasmFS can
   // create regular files, but has no implementations for special nodes.
   switch (mode & S_IFMT) {
@@ -941,6 +1008,7 @@ doMkdir(path::ParsedParent parsed, int mode, backend_t backend = NullBackend) {
 // This function is exposed to users and allows users to specify a particular
 // backend that a directory should be created within.
 int wasmfs_create_directory(char* path, int mode, backend_t backend) {
+  WASMFS_GUARD_NEGATIVE();
   static_assert(std::is_same_v<decltype(doMkdir(0, 0, 0)), int>,
                 "unexpected conversion from result of doMkdir to int");
   return doMkdir(path::parseParent(path), mode, backend);
@@ -948,6 +1016,7 @@ int wasmfs_create_directory(char* path, int mode, backend_t backend) {
 
 // TODO: Test this.
 int __syscall_mkdirat(int dirfd, intptr_t path, int mode) {
+  WASMFS_GUARD_NEGATIVE();
   return doMkdir(path::parseParent((char*)path, dirfd), mode);
 }
 
@@ -1013,6 +1082,7 @@ __wasi_errno_t __wasi_fd_seek(__wasi_fd_t fd,
                               __wasi_filedelta_t offset,
                               __wasi_whence_t whence,
                               __wasi_filesize_t* newoffset) {
+  WASMFS_GUARD_WASI();
   return doFdSeek(
     fd, offset, whence, newoffset, std::numeric_limits<off_t>::max());
 }
@@ -1023,6 +1093,7 @@ __wasi_errno_t __wasmfs_fd_seek_for_js(__wasi_fd_t fd,
                                        __wasi_filedelta_t offset,
                                        __wasi_whence_t whence,
                                        __wasi_filesize_t* newoffset) {
+  WASMFS_GUARD_WASI();
   return doFdSeek(fd, offset, whence, newoffset, JSExactOffsetLimit);
 }
 
@@ -1037,6 +1108,7 @@ static int doChdir(WasmFS::CWDTransition& cwdTransition,
 }
 
 int __syscall_chdir(intptr_t path) {
+  WASMFS_GUARD_NEGATIVE();
   auto cwdTransition = wasmFS.beginCWDTransition();
   auto parsed = path::parseFile((char*)path);
   if (auto err = parsed.getError()) {
@@ -1046,6 +1118,7 @@ int __syscall_chdir(intptr_t path) {
 }
 
 int __syscall_fchdir(int fd) {
+  WASMFS_GUARD_NEGATIVE();
   auto cwdTransition = wasmFS.beginCWDTransition();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
@@ -1060,6 +1133,7 @@ int __syscall_fchdir(int fd) {
 }
 
 int __syscall_getcwd(intptr_t buf, size_t size) {
+  WASMFS_GUARD_NEGATIVE();
   // Check if buf points to a bad address.
   if (!buf && size > 0) {
     return -EFAULT;
@@ -1107,6 +1181,7 @@ int __syscall_getcwd(intptr_t buf, size_t size) {
 }
 
 __wasi_errno_t __wasi_fd_fdstat_get(__wasi_fd_t fd, __wasi_fdstat_t* stat) {
+  WASMFS_GUARD_WASI();
   // TODO: This is only partial implementation of __wasi_fd_fdstat_get. Enough
   // to get __wasi_fd_is_valid working.
   // There are other fields in the stat structure that we should really
@@ -1126,6 +1201,7 @@ __wasi_errno_t __wasi_fd_fdstat_get(__wasi_fd_t fd, __wasi_fdstat_t* stat) {
 
 // TODO: Test this with non-AT_FDCWD values.
 int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   if (flags & ~AT_REMOVEDIR) {
     // TODO: Test this case.
     return -EINVAL;
@@ -1194,12 +1270,14 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
 }
 
 int __syscall_rmdir(intptr_t path) {
+  WASMFS_GUARD_NEGATIVE();
   return __syscall_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
 }
 
 // wasmfs_unmount is similar to __syscall_unlinkat, but assumes AT_REMOVEDIR is
 // true and will only unlink mountpoints (Empty and nonempty).
 int wasmfs_unmount(const char* path) {
+  WASMFS_GUARD_NEGATIVE();
   auto cwdTransition = wasmFS.beginCWDTransition();
   auto parsed = path::parseParent(path, AT_FDCWD);
   if (auto err = parsed.getError()) {
@@ -1250,6 +1328,7 @@ int wasmfs_unmount(const char* path) {
 }
 
 int __syscall_getdents64(int fd, intptr_t dirp, size_t count) {
+  WASMFS_GUARD_NEGATIVE();
   dirent* result = (dirent*)dirp;
 
   // Check if the result buffer is too small.
@@ -1341,6 +1420,7 @@ int __syscall_renameat(int olddirfd,
                        intptr_t oldpath,
                        int newdirfd,
                        intptr_t newpath) {
+  WASMFS_GUARD_NEGATIVE();
   // Hold this before renameMutex and path parsing. A rename can move the CWD
   // into a mount that another thread is checking for unmount.
   auto cwdTransition = wasmFS.beginCWDTransition();
@@ -1451,6 +1531,7 @@ int __syscall_renameat(int olddirfd,
 
 // TODO: Test this with non-AT_FDCWD values.
 int __syscall_symlinkat(intptr_t target, int newdirfd, intptr_t linkpath) {
+  WASMFS_GUARD_NEGATIVE();
   auto parsed = path::parseParent((char*)linkpath, newdirfd);
   if (auto err = parsed.getError()) {
     return err;
@@ -1475,6 +1556,7 @@ int __syscall_readlinkat(int dirfd,
                          intptr_t path,
                          intptr_t buf,
                          size_t bufsize) {
+  WASMFS_GUARD_NEGATIVE();
   // TODO: Handle empty paths.
   auto parsed = path::parseFile((char*)path, dirfd, path::NoFollowLinks);
   if (auto err = parsed.getError()) {
@@ -1502,6 +1584,7 @@ static double timespec_to_ms(timespec ts) {
 
 // TODO: Test this with non-AT_FDCWD values.
 int __syscall_utimensat(int dirFD, intptr_t path_, intptr_t times_, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   const char* path = (const char*)path_;
   const struct timespec* times = (const struct timespec*)times_;
   if (flags & ~AT_SYMLINK_NOFOLLOW) {
@@ -1558,6 +1641,7 @@ int __syscall_utimensat(int dirFD, intptr_t path_, intptr_t times_, int flags) {
 
 // TODO: Test this with non-AT_FDCWD values.
 int __syscall_fchmodat2(int dirfd, intptr_t path, int mode, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   if (flags & ~AT_SYMLINK_NOFOLLOW) {
     // TODO: Test this case.
     return -EINVAL;
@@ -1578,10 +1662,12 @@ int __syscall_fchmodat2(int dirfd, intptr_t path, int mode, int flags) {
 }
 
 int __syscall_chmod(intptr_t path, int mode) {
+  WASMFS_GUARD_NEGATIVE();
   return __syscall_fchmodat2(AT_FDCWD, path, mode, 0);
 }
 
 int __syscall_fchmod(int fd, int mode) {
+  WASMFS_GUARD_NEGATIVE();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
@@ -1598,6 +1684,7 @@ int __syscall_fchmod(int fd, int mode) {
 
 int __syscall_fchownat(
   int dirfd, intptr_t path, int owner, int group, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   // Only accept valid flags.
   if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) {
     // TODO: Test this case.
@@ -1615,11 +1702,13 @@ int __syscall_fchownat(
 }
 
 int __syscall_fchown32(int fd, int owner, int group) {
+  WASMFS_GUARD_NEGATIVE();
   return __syscall_fchownat(fd, (intptr_t) "", owner, group, AT_EMPTY_PATH);
 }
 
 // TODO: Test this with non-AT_FDCWD values.
 int __syscall_faccessat(int dirfd, intptr_t path, int amode, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   // The input must be F_OK (check for existence) or a combination of [RWX]_OK
   // flags.
   if (amode != F_OK && (amode & ~(R_OK | W_OK | X_OK))) {
@@ -1680,6 +1769,7 @@ static int doTruncate(std::shared_ptr<File>& file,
 }
 
 int __syscall_truncate64(intptr_t path, off_t size) {
+  WASMFS_GUARD_NEGATIVE();
   auto parsed = path::parseFile((char*)path);
   if (auto err = parsed.getError()) {
     return err;
@@ -1688,6 +1778,7 @@ int __syscall_truncate64(intptr_t path, off_t size) {
 }
 
 int __syscall_ftruncate64(int fd, off_t size) {
+  WASMFS_GUARD_NEGATIVE();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
@@ -1707,6 +1798,7 @@ static bool isTTY(std::shared_ptr<File>& file) {
 }
 
 int __syscall_ioctl(int fd, int request, ...) {
+  WASMFS_GUARD_NEGATIVE();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
@@ -1736,6 +1828,7 @@ int __syscall_ioctl(int fd, int request, ...) {
 }
 
 int __syscall_pipe2(intptr_t fd, int flags) {
+  WASMFS_GUARD_NEGATIVE();
   auto* fds = (__wasi_fd_t*)fd;
   if (flags && flags != O_CLOEXEC) {
     return -ENOTSUP;
@@ -1788,6 +1881,7 @@ int __syscall_pipe2(intptr_t fd, int flags) {
 
 // int poll(struct pollfd* fds, nfds_t nfds, int timeout);
 int __syscall_poll(intptr_t fds_, int nfds, int timeout) {
+  WASMFS_GUARD_NEGATIVE();
   struct pollfd* fds = (struct pollfd*)fds_;
   auto fileTable = wasmFS.getFileTable().locked();
 
@@ -1839,6 +1933,7 @@ int __syscall_poll(intptr_t fds_, int nfds, int timeout) {
 }
 
 int __syscall_fallocate(int fd, int mode, off_t offset, off_t len) {
+  WASMFS_GUARD_NEGATIVE();
   auto fileTable = wasmFS.getFileTable().locked();
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
@@ -1907,6 +2002,7 @@ int __syscall_fallocate(int fd, int mode, off_t offset, off_t len) {
 }
 
 int __syscall_fcntl64(int fd, int cmd, ...) {
+  WASMFS_GUARD_NEGATIVE();
   auto fileTable = wasmFS.getFileTable().locked();
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
@@ -2011,6 +2107,7 @@ doStatFS(std::shared_ptr<File>& file, size_t size, struct statfs* buf) {
 }
 
 int __syscall_statfs64(intptr_t path, size_t size, intptr_t buf) {
+  WASMFS_GUARD_NEGATIVE();
   auto parsed = path::parseFile((char*)path);
   if (auto err = parsed.getError()) {
     return err;
@@ -2019,6 +2116,7 @@ int __syscall_statfs64(intptr_t path, size_t size, intptr_t buf) {
 }
 
 int __syscall_fstatfs64(int fd, size_t size, intptr_t buf) {
+  WASMFS_GUARD_NEGATIVE();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
@@ -2033,6 +2131,7 @@ int _mmap_js(size_t length,
              off_t offset,
              int* allocated,
              void** addr) {
+  WASMFS_GUARD_NEGATIVE();
   // PROT_EXEC is not supported (although we pretend to support the absence of
   // PROT_READ or PROT_WRITE).
   if ((prot & PROT_EXEC)) {
@@ -2130,6 +2229,7 @@ int _mmap_js(size_t length,
 
 int _msync_js(
   intptr_t addr, size_t length, int prot, int flags, int fd, off_t offset) {
+  WASMFS_GUARD_NEGATIVE();
   // TODO: This is not correct! Mappings should be associated with files, not
   // fds. Only need to sync if shared and writes are allowed.
   int mapType = flags & MAP_TYPE;
@@ -2146,6 +2246,7 @@ int _msync_js(
 
 int _munmap_js(
   intptr_t addr, size_t length, int prot, int flags, int fd, off_t offset) {
+  WASMFS_GUARD_NEGATIVE();
   // TODO: This is not correct! Mappings should be associated with files, not
   // fds.
   // TODO: Syncing should probably be handled in __syscall_munmap instead.
@@ -2227,8 +2328,14 @@ int __syscall_recvmsg(
 }
 
 int __syscall_fadvise64(int fd, off_t offset, off_t length, int advice) {
+  WASMFS_GUARD_NEGATIVE();
   // Advice is currently ignored. TODO some backends might use it
   return 0;
 }
+
+#undef WASMFS_GUARD_BACKEND
+#undef WASMFS_GUARD_WASI_STDIO_WRITE
+#undef WASMFS_GUARD_WASI
+#undef WASMFS_GUARD_NEGATIVE
 
 } // extern "C"

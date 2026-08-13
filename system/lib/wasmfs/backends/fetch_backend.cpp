@@ -5,6 +5,8 @@
 
 // This file defines the fetch backend.
 
+#include <errno.h>
+
 #include "fetch_backend.h"
 #include "backend.h"
 #include "proxied_async_js_impl_backend.h"
@@ -106,6 +108,11 @@ uint32_t FetchBackend::getChunkSize() {
 
 extern "C" {
   backend_t wasmfs_create_fetch_backend(const char* base_url, uint32_t chunkSize) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
   // ProxyWorker cannot safely be synchronously spawned from the main browser
   // thread. See comment in thread_utils.h for more details.
   assert(!emscripten_is_main_browser_thread() &&

@@ -13,6 +13,8 @@
 // See the comment in virtual.h for an explanation of why DataFiles and Symlinks
 // must have no-op wrappers.
 
+#include <errno.h>
+
 #include "backend.h"
 #include "file.h"
 #include "virtual.h"
@@ -241,6 +243,11 @@ extern "C" {
 // C API FOR creating an ignore case backend by supplying a pointer to another
 // backend.
 backend_t wasmfs_create_icase_backend(backend_t backend) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
   return createIgnoreCaseBackend([backend]() { return backend; });
 }
 

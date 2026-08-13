@@ -128,6 +128,13 @@ public:
     [[nodiscard]] std::shared_ptr<DataFile>
     setEntry(__wasi_fd_t fd, std::shared_ptr<OpenFileState> openFile);
     __wasi_fd_t addEntry(std::shared_ptr<OpenFileState> openFileState);
+
+    // Detach every descriptor from the table. A returned DataFile represents
+    // one final DataFile OpenFileState, so duplicated descriptor aliases occur
+    // once and independent opens of the same DataFile occur once per open
+    // state. Directory states are detached but not returned. The caller must
+    // flush/close the returned files after releasing this handle.
+    std::vector<std::shared_ptr<DataFile>> detachAll();
   };
 
   Handle locked() { return Handle(*this); }

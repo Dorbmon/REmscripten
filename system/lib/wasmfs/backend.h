@@ -29,6 +29,19 @@ public:
   // falsely reporting a successful logical mutation.
   virtual bool supportsExplicitMetadataMutation() const { return true; }
 
+  // Called after WasmFS has permanently drained its public descriptor table.
+  // Backends must not begin new filesystem work from this hook. A false
+  // argument means that some earlier cleanup failed; a backend holding a
+  // cooperative lease must retain it in that case. A true argument permits a
+  // backend to release a terminal resource and must return a negative errno if
+  // that release has an ambiguous or failed outcome. The default is a no-op.
+  virtual int terminalDrainFinished(bool success) { return 0; }
+
+  // Lease-owning backends run after ordinary backends. This prevents an
+  // ordinary terminal-resource failure from releasing a cooperative profile
+  // lease. WasmFS enforces one cooperative terminal lease owner per instance.
+  virtual bool releasesTerminalLease() const { return false; }
+
   virtual ~Backend() = default;
 };
 

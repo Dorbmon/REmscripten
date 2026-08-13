@@ -3,6 +3,7 @@
 // University of Illinois/NCSA Open Source License.  Both these licenses can be
 // found in the LICENSE file.
 
+#include <errno.h>
 #include <memory>
 
 #include "backend.h"
@@ -303,6 +304,11 @@ public:
 extern "C" {
 
 backend_t wasmfs_create_node_backend(const char* root) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
   return wasmFS.addBackend(std::make_unique<NodeBackend>(root));
 }
 

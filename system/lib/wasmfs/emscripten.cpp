@@ -12,6 +12,7 @@
 //
 
 #include <emscripten.h>
+#include <errno.h>
 #include <stdio.h>
 
 #include <string>
@@ -58,6 +59,14 @@ extern "C" {
 char* emscripten_get_preloaded_image_data_from_FILE(FILE* file,
                                                     int* w,
                                                     int* h) {
+  // This public helper reads the WasmFS descriptor table directly instead of
+  // routing through a POSIX syscall, so it needs its own terminal admission.
+  wasmfs::WasmFS::Operation operation(wasmfs::wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return nullptr;
+  }
+
   auto fd = fileno(file);
   if (fd < 0) {
     return 0;

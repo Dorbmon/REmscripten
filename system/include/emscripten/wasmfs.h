@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <sys/stat.h>
+#include <emscripten/wasmfs_terminal_drain.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -99,6 +100,8 @@ backend_t wasmfs_create_opfs_backend(void);
 // must opt into this API with the same canonical `profile_name`. A default
 // OPFS backend or another same-storage-bucket writer can ignore the lease, so
 // this API does not establish physical ownership of OPFS data.
+// Only one leased OPFS backend may be created in a WasmFS instance; a second
+// attempt fails with EBUSY before it creates a worker or requests Web Locks.
 //
 // `profile_name` must be a non-empty ASCII identifier of at most 128
 // characters containing only letters, digits, '.', '-', and '_'. The lease is
@@ -109,9 +112,11 @@ backend_t wasmfs_create_opfs_backend(void);
 // unavailable, EBUSY when another module sharing the storage bucket already
 // holds the lease, or EIO for an unexpected Web Locks failure.
 //
-// During orderly whole-WasmFS/module teardown, the lease is released after
-// WasmFS tears down its filesystem state. `wasmfs_unmount` does not release
-// it, because WasmFS retains created backends until teardown. There is
+// During an orderly `wasmfs_terminal_drain`, the lease is synchronously
+// released only after all WasmFS terminal cleanup has succeeded. Ordinary
+// whole-WasmFS/module teardown releases it only when no earlier terminal or
+// ambiguous AccessHandle-close failure has occurred. `wasmfs_unmount` does not
+// release it, because WasmFS retains created backends until teardown. There is
 // intentionally no API to release it while the backend can still service
 // filesystem operations. Abrupt execution-context termination relies on Web
 // Locks' context cleanup and does not imply that open files were flushed.
@@ -131,6 +136,53 @@ backend_t wasmfs_create_icase_backend(backend_t backend);
 // actually flush all buffers and add newlines as necessary to get everything
 // printed out.
 void wasmfs_flush(void);
+
+// Permanently stop public WasmFS filesystem operations and drain the currently
+// open file states. This is an embedding primitive for orderly teardown, not a
+// substitute for application-level quiescence. The embedding must stop
+// higher-level work before calling it: this function waits for already-admitted
+// WasmFS operations and can wait indefinitely for a blocking operation.
+//
+// This function must run away from Emscripten's runtime main thread, normally
+// on the application pthread. In browsers that thread services the JavaScript
+// event loop; in Node it is also the default runtime thread. Once draining
+// begins, direct negative-errno APIs and backend factories fail with ESHUTDOWN.
+// POSIX wrappers that route through WasmFS's WASI fd ABI (such as read, write,
+// and close), and raw WASI fd entrypoints, expose the valid ABI equivalent
+// ECANCELED/CANCELED; other POSIX wrappers such as open or fstat retain their
+// direct ESHUTDOWN error. The void wasmfs_flush() reports rejected admission in
+// errno. The drain then performs the aggregate libc `fflush(NULL)`, atomically
+// detaches every descriptor alias, and attempts both flush() and close() on
+// every detached DataFile state. Directory states are detached but are not
+// flushed or closed. It continues after failures and returns the
+// first negative errno in both its return value and result->error; the counters
+// in `result` record the observable failures. A failure is terminal: the
+// descriptors stay detached, new operations remain rejected, and a later call
+// returns -ESHUTDOWN rather than retrying cleanup.
+//
+// While `fflush(NULL)` is running, the drain admits fd writes on its own thread
+// so ordinary libc streams can flush buffered data. The WasmFS fd ABI cannot
+// distinguish a direct write made by a custom FILE callback from libc's own
+// stream write. Therefore an embedding calling this function must ensure every
+// custom FILE callback makes no WasmFS call, including write(); calls to other
+// public WasmFS APIs are rejected after the terminal transition.
+//
+// This function does not establish database recovery, record-lock, metadata,
+// or application task quiescence guarantees. In particular, it is not a
+// Chromium profile shutdown protocol. A leased OPFS backend synchronously
+// releases its cooperative lease only after all earlier terminal cleanup has
+// succeeded. A failed cleanup, or an ambiguous lease-release result, retains
+// that backend's lease state and prevents a destructor retry; abrupt
+// runtime/context termination can still cause browser Web Locks cleanup. For
+// the supported leased-OPFS configuration, a zero result means its synchronous
+// terminal lease release completed; a nonzero result retains the lease because
+// cleanup or release was ambiguous or failed.
+//
+// Returns -EINVAL for a null result, -EDEADLK when called from an admitted
+// WasmFS operation, -EAGAIN on the Emscripten runtime main thread, -EBUSY when
+// another thread is draining, -ESHUTDOWN after a completed drain, or
+// result->error after this call's cleanup attempt.
+int wasmfs_terminal_drain(wasmfs_terminal_drain_result* _Nonnull result);
 
 // Hooks
 

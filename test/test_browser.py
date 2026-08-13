@@ -5946,6 +5946,229 @@ Module["preRun"] = () => {
     ''')
     self.run_browser('a.html', '/report_result?0', timeout=60)
 
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_terminal_drain(self):
+    # This checks the narrow toolchain primitive only: an explicit terminal
+    # drain releases a leased OPFS backend while its module remains alive, and
+    # either kind of rejected AccessHandle close retains that lease. It does
+    # not claim application, database, or browser-profile quiescence.
+    test = test_file('wasmfs/wasmfs_opfs_terminal_drain.c')
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD',
+                   '-sEXIT_RUNTIME', '-lopfs.js']
+    create_file('terminal-drain-holder-pre.js', r'''
+      // This confirms orderly holder termination only after the parent has
+      // observed its live-holder lease handoff/retention result.
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-terminal-drain',
+          },
+          window.location.origin);
+      };
+    ''')
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_TERMINAL_DRAIN_HOLDER', '--pre-js',
+                     'terminal-drain-holder-pre.js', '-o',
+                     'terminal-drain-normal-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_TERMINAL_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_TERMINAL_DRAIN_CLOSE_DURING_DRAIN',
+                     '-sWASMFS_OPFS_TEST_CLOSE_FAILURE=1', '--pre-js',
+                     'terminal-drain-holder-pre.js', '-o',
+                     'terminal-drain-close-during-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_TERMINAL_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_TERMINAL_DRAIN_CLOSE_BEFORE_DRAIN',
+                     '-sWASMFS_OPFS_TEST_CLOSE_FAILURE=1', '--pre-js',
+                     'terminal-drain-holder-pre.js', '-o',
+                     'terminal-drain-close-before-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-o', 'terminal-drain-contender.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kReady = 0;
+        const kBusy = 1;
+        const kModuleTimeoutMs = 15000;
+        const kLeaseReleaseDeadlineMs = 10000;
+        const kLeaseRetryDelayMs = 100;
+        const pendingModules = new Map();
+        const pendingHolderExits = new Map();
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function drainDetails(message) {
+          return 'drain=' + message.drainResult +
+                 ', terminal=' + message.terminalError +
+                 ', data_file_states=' + message.dataFileStates +
+                 ', libc_flush_failed=' + message.libcFlushFailed +
+                 ', data_flush_failures=' + message.dataFlushFailures +
+                 ', data_close_failures=' + message.dataCloseFailures +
+                 ', backend_terminal_failures=' +
+                 message.backendTerminalFailures;
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for holder exit'));
+            }, kModuleTimeoutMs);
+            pendingHolderExits.set(
+              frame.contentWindow, {resolve, reject, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != 'wasmfs-opfs-terminal-drain') {
+            return;
+          }
+          if (event.data.event == 'holder-exit') {
+            const pending = pendingHolderExits.get(event.source);
+            if (!pending) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pending.timeout);
+            if (event.data.status != 0) {
+              pending.reject(new Error(
+                'holder did not exit cleanly: status=' + event.data.status));
+            } else {
+              pending.resolve();
+            }
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function startHolder(path, scenario) {
+          // After a previous failed holder is disposed, browser-context Web
+          // Locks cleanup is asynchronous. Retry only that cleanup boundary;
+          // within each scenario the live-holder contender result is immediate.
+          const deadline = Date.now() + kLeaseReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            const holder = await startModule(path);
+            if (holder.message.role != kHolder) {
+              holder.frame.remove();
+              throw new Error(scenario + ' holder reported role ' +
+                              holder.message.role);
+            }
+            if (holder.message.result == kReady && holder.message.error == 0) {
+              return holder;
+            }
+            holder.frame.remove();
+            // `EBUSY` is classified in the C fixture. Do not assume the
+            // numeric errno value in the JavaScript controller: Emscripten's
+            // WASI errno ABI intentionally differs from native Linux's.
+            if (holder.message.result != kBusy || holder.message.error == 0) {
+              throw new Error(scenario + ' holder failed: result=' +
+                              holder.message.result + ', errno=' +
+                              holder.message.error + ', ' +
+                              drainDetails(holder.message));
+            }
+            await delay(kLeaseRetryDelayMs);
+          }
+          throw new Error(scenario +
+                          ' holder did not acquire a released profile lease');
+        }
+
+        async function runScenario(name, holderPath, expectBusy) {
+          const holder = await startHolder(holderPath, name);
+          const contender = await startModule('terminal-drain-contender.html');
+          if (contender.message.role != kContender) {
+            contender.frame.remove();
+            holder.frame.remove();
+            throw new Error(name + ' contender reported role ' +
+                            contender.message.role);
+          }
+          if (expectBusy) {
+            if (contender.message.result != kBusy ||
+                contender.message.error == 0) {
+              contender.frame.remove();
+              holder.frame.remove();
+              throw new Error(name +
+                              ' contender acquired despite retained lease: ' +
+                              'result=' + contender.message.result +
+                              ', errno=' + contender.message.error);
+            }
+          } else if (contender.message.result != kReady ||
+                     contender.message.error != 0) {
+            contender.frame.remove();
+            holder.frame.remove();
+            throw new Error(name +
+                            ' contender did not acquire live-holder release: ' +
+                            'result=' + contender.message.result +
+                            ', errno=' + contender.message.error);
+          }
+
+          // The contender result above is observed before the holder's frame
+          // is disposed. This distinguishes explicit terminal release from
+          // browser-context cleanup at iframe removal.
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_opfs_terminal_drain_holder_shutdown();
+          await holderExit;
+          contender.frame.remove();
+          holder.frame.remove();
+        }
+
+        (async () => {
+          await runScenario('normal terminal drain',
+                            'terminal-drain-normal-holder.html', false);
+          await runScenario('close during terminal drain',
+                            'terminal-drain-close-during-holder.html', true);
+          await runScenario('close before terminal drain',
+                            'terminal-drain-close-before-holder.html', true);
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=90)
+
   @only_chromium
   @no_wasm64()
   def test_wasmfs_opfs_move_interrupt(self):

@@ -13366,6 +13366,27 @@ Module.postRun = () => {{
     self.do_run_in_out_file_test(
         'wasmfs/wasmfs_getdents_bounds.cpp', cflags=args)
 
+  @requires_pthreads
+  @parameterized({
+    'success': ([],),
+    'flush_failure': (['-DWASMFS_TERMINAL_DRAIN_FLUSH_FAILURE'],),
+    'cookie_reentry': (['-DWASMFS_TERMINAL_DRAIN_COOKIE_REENTRY'],),
+  })
+  def test_wasmfs_terminal_drain(self, args):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf(
+        'wasmfs/wasmfs_terminal_drain.cpp', 'success',
+        cflags=['-pthread', '-sPROXY_TO_PTHREAD', '-sPTHREAD_POOL_SIZE=3',
+                '-sEXIT_RUNTIME', '-D_GNU_SOURCE'] + args)
+
+  def test_wasmfs_terminal_drain_runtime_main(self):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf(
+        'wasmfs/wasmfs_terminal_drain_runtime_main.c', 'success',
+        cflags=['-sEXIT_RUNTIME'])
+
   @parameterized({
     '': ([],),
     'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',

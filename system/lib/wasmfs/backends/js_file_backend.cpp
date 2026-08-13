@@ -5,6 +5,8 @@
 
 // This file defines the JS file backend.
 
+#include <errno.h>
+
 #include "js_file_backend.h"
 #include "backend.h"
 #include "js_impl_backend.h"
@@ -13,6 +15,11 @@
 namespace wasmfs {
 
 extern "C" backend_t wasmfs_create_js_file_backend() {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
   backend_t backend = wasmFS.addBackend(std::make_unique<JSImplBackend>());
   _wasmfs_create_js_file_backend_js(backend);
   return backend;

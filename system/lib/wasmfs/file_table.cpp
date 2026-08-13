@@ -14,12 +14,15 @@ FileTable::FileTable() {
   entries.emplace_back();
   (void)OpenFileState::create(
     SpecialFiles::getStdin(), O_RDONLY, entries.back());
+  entries.back()->uses = 1;
   entries.emplace_back();
   (void)OpenFileState::create(
     SpecialFiles::getStdout(), O_WRONLY, entries.back());
+  entries.back()->uses = 1;
   entries.emplace_back();
   (void)OpenFileState::create(
     SpecialFiles::getStderr(), O_WRONLY, entries.back());
+  entries.back()->uses = 1;
 }
 
 std::shared_ptr<OpenFileState> FileTable::Handle::getEntry(__wasi_fd_t fd) {
@@ -58,6 +61,16 @@ FileTable::Handle::addEntry(std::shared_ptr<OpenFileState> openFileState) {
     }
   }
   return -EMFILE;
+}
+
+std::vector<std::shared_ptr<DataFile>> FileTable::Handle::detachAll() {
+  std::vector<std::shared_ptr<DataFile>> closees;
+  for (__wasi_fd_t fd = 0; fd < fileTable.entries.size(); ++fd) {
+    if (auto closee = setEntry(fd, nullptr)) {
+      closees.push_back(std::move(closee));
+    }
+  }
+  return closees;
 }
 
 int OpenFileState::create(std::shared_ptr<File> file,

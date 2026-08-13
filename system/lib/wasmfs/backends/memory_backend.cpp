@@ -5,6 +5,8 @@
 
 // This file defines the memory file backend.
 
+#include <errno.h>
+
 #include "memory_backend.h"
 #include "backend.h"
 #include "wasmfs.h"
@@ -112,7 +114,14 @@ backend_t createMemoryBackend() {
 
 extern "C" {
 
-backend_t wasmfs_create_memory_backend() { return createMemoryBackend(); }
+backend_t wasmfs_create_memory_backend() {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
+  return createMemoryBackend();
+}
 
 } // extern "C"
 

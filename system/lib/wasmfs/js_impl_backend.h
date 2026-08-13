@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <errno.h>
+
 #include "backend.h"
 #include "memory_backend.h"
 #include "support.h"
@@ -125,6 +127,11 @@ public:
 extern "C" {
 
 backend_t wasmfs_create_jsimpl_backend(void) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
   return wasmFS.addBackend(std::make_unique<JSImplBackend>());
 }
 
