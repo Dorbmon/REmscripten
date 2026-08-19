@@ -5952,6 +5952,14 @@ This locale is not the C locale.
   def test_no_filesystem_libcxx(self):
     self.do_runf('hello_libcxx.cpp', 'Hello, world!', cflags=['-sFILESYSTEM=0'])
 
+  def test_legacy_fcntl_record_locks(self):
+    self.do_runf('other/test_legacy_fcntl_record_locks.c', 'success',
+                 cflags=['-sWASMFS=0', '-sFORCE_FILESYSTEM'])
+
+  def test_legacy_fcntl_record_locks_no_filesystem(self):
+    self.do_runf('other/test_legacy_fcntl_record_locks.c', 'success',
+                 cflags=['-DNO_FILESYSTEM', '-sWASMFS=0', '-sFILESYSTEM=0'])
+
   # Verifies that filesystem is automatically omitted, and can be
   # manually disabled too, and both improve code size.
   @parameterized({

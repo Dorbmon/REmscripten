@@ -62,23 +62,31 @@ int main() {
   printf("\n");
   errno = 0;
 
-  struct flock lk;
-  lk.l_type = 42;
-  printf("F_GETLK: %d\n", fcntl(f, F_GETLK, &lk));
-  printf("errno: %d\n", errno);
+  struct flock lk = {
+      .l_type = F_WRLCK,
+      .l_whence = SEEK_SET,
+      .l_start = 0,
+      .l_len = 1,
+  };
+  int getlk = fcntl(f, F_GETLK, &lk);
+  int getlk_errno = errno;
+  printf("F_GETLK: %d\n", getlk);
+  printf("errno: %d\n", getlk_errno);
   printf("lk.l_type == F_UNLCK: %d\n", lk.l_type == F_UNLCK);
   printf("\n");
+  assert(getlk == -1);
+  assert(getlk_errno == ENOTSUP);
+  assert(lk.l_type == F_WRLCK);
   errno = 0;
 
-#ifndef WASMFS // TODO: wasmfs support for byte offset locking.
   int err = fcntl(f, F_SETLK, &lk);
-  assert(err == 0);
-  assert(errno == 0);
+  assert(err == -1);
+  assert(errno == ENOTSUP);
 
-  err = fcntl(f, F_SETLK, &lk);
-  assert(err == 0);
-  assert(errno == 0);
-#endif
+  errno = 0;
+  err = fcntl(f, F_SETLKW, &lk);
+  assert(err == -1);
+  assert(errno == ENOTSUP);
 
   printf("F_SETOWN: %d\n", fcntl(f, F_SETOWN, 123));
   printf("errno: %d\n", errno);

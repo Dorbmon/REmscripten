@@ -28,9 +28,9 @@ errno: 0
 F_GETFL/2: 1
 errno: 0
 
-F_GETLK: 0
-errno: 0
-lk.l_type == F_UNLCK: 1
+F_GETLK: -1
+errno: 138
+lk.l_type == F_UNLCK: 0
 
 F_SETOWN: -1
 errno: 28

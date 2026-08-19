@@ -755,12 +755,18 @@ var SyscallsLibrary = {
     return pos;
   },
 #if SYSCALLS_REQUIRE_FILESYSTEM
-  __syscall_fcntl64__deps: ['$syscallGetVarargP', '$syscallGetVarargI'],
+  __syscall_fcntl64__deps: ['$syscallGetVarargI'],
 #endif
   __syscall_fcntl64: (fd, cmd, varargs) => {
 #if SYSCALLS_REQUIRE_FILESYSTEM == 0
+    switch (cmd) {
+      case {{{ cDefs.F_GETLK }}}:
+      case {{{ cDefs.F_SETLK }}}:
+      case {{{ cDefs.F_SETLKW }}}:
+        return -{{{ cDefs.ENOTSUP }}};
+    }
 #if SYSCALL_DEBUG
-    dbg('no-op in fcntl syscall due to SYSCALLS_REQUIRE_FILESYSTEM=0');
+    dbg('fcntl syscall without filesystem support');
 #endif
     return 0;
 #else
@@ -788,20 +794,13 @@ var SyscallsLibrary = {
         stream.flags |= arg;
         return 0;
       }
-      case {{{ cDefs.F_GETLK }}}: {
-        var arg = syscallGetVarargP();
-        var offset = {{{ C_STRUCTS.flock.l_type }}};
-        // We're always unlocked.
-        {{{ makeSetValue('arg', 'offset', cDefs.F_UNLCK, 'i16') }}};
-        return 0;
-      }
+      case {{{ cDefs.F_GETLK }}}:
       case {{{ cDefs.F_SETLK }}}:
       case {{{ cDefs.F_SETLKW }}}:
-        // Pretend that the locking is successful. These are process-level locks,
-        // and Emscripten programs are a single process. If we supported linking a
-        // filesystem between programs, we'd need to do more here.
-        // See https://github.com/emscripten-core/emscripten/issues/23697
-        return 0;
+        // Legacy JS FS has no byte-range record-lock domain. Do not read or
+        // modify the caller's flock while returning an explicit unsupported
+        // error: a fake success would corrupt callers' locking assumptions.
+        return -{{{ cDefs.ENOTSUP }}};
 #if SYSCALL_DEBUG
       case {{{ cDefs.F_GETOWN_EX }}}:
       case {{{ cDefs.F_SETOWN }}}:
