@@ -5949,6 +5949,15 @@ Module["preRun"] = () => {
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')
   @no_wasm64()
+  def test_wasmfs_opfs_unleased_record_locks(self):
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_unleased_record_locks.c',
+      cflags=['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME',
+              '-lopfs.js'])
+
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
   def test_wasmfs_opfs_terminal_drain(self):
     # This checks the narrow toolchain primitive only: an explicit terminal
     # drain releases a leased OPFS backend while its module remains alive, and

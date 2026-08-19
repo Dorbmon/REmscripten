@@ -13520,7 +13520,12 @@ Module.postRun = () => {{
 
   def test_wasmfs_fcntl_locks(self):
     self.set_setting('WASMFS')
-    self.do_runf('wasmfs/wasmfs_fcntl_locks.c', 'success')
+    self.do_runf('wasmfs/wasmfs_fcntl_locks.c', 'success',
+                 cflags=['-sWASMFS_RECORD_LOCK_TEST=1'])
+
+  def test_wasmfs_fcntl_locks_unsupported(self):
+    self.set_setting('WASMFS')
+    self.do_runf('wasmfs/wasmfs_fcntl_locks_unsupported.c', 'success')
 
   @requires_pthreads
   def test_wasmfs_opfs_profile_lease_no_web_locks(self):

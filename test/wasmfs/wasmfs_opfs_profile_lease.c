@@ -22,6 +22,51 @@ enum LeaseResult {
 
 static _Atomic int shutdown_requested;
 
+static int ExerciseProfileRecordLocks(int fd) {
+  struct flock lock = {
+      .l_type = F_WRLCK,
+      .l_whence = SEEK_SET,
+      .l_start = 0,
+      .l_len = 1,
+  };
+  if (fcntl(fd, F_SETLK, &lock) != 0) {
+    return errno ? errno : EIO;
+  }
+
+  lock = (struct flock){
+      .l_type = F_RDLCK,
+      .l_whence = SEEK_SET,
+      .l_start = 1,
+      .l_len = 1,
+  };
+  if (fcntl(fd, F_SETLKW, &lock) != 0) {
+    return errno ? errno : EIO;
+  }
+
+  lock = (struct flock){
+      .l_type = F_WRLCK,
+      .l_whence = SEEK_SET,
+      .l_start = 0,
+      .l_len = 1,
+      .l_pid = -1,
+  };
+  if (fcntl(fd, F_GETLK, &lock) != 0 || lock.l_type != F_UNLCK ||
+      lock.l_pid != -1) {
+    return errno ? errno : EIO;
+  }
+
+  lock = (struct flock){
+      .l_type = F_UNLCK,
+      .l_whence = SEEK_SET,
+      .l_start = 0,
+      .l_len = 0,
+  };
+  if (fcntl(fd, F_SETLK, &lock) != 0) {
+    return errno ? errno : EIO;
+  }
+  return 0;
+}
+
 static int WriteProfileMarker(void) {
   static const char marker[] = "wasmfs profile lease";
   int fd = open("/opfs/profile-lease-data", O_CREAT | O_RDWR, 0600);
@@ -35,6 +80,11 @@ static int WriteProfileMarker(void) {
     }
     (void)close(fd);
     return err;
+  }
+  int lock_error = ExerciseProfileRecordLocks(fd);
+  if (lock_error) {
+    (void)close(fd);
+    return lock_error;
   }
   if (fdatasync(fd) != 0) {
     int err = errno;

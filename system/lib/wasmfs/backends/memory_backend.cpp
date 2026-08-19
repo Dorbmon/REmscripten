@@ -97,6 +97,12 @@ std::string MemoryDirectory::getName(std::shared_ptr<File> file) {
 
 class MemoryBackend : public Backend {
 public:
+#ifdef WASMFS_RECORD_LOCK_TEST
+  // Memory files are private to one WasmFS instance. Keep this test-only so
+  // production callers cannot mistake it for persistent-profile locking.
+  bool supportsRecordLocks() const override { return true; }
+#endif
+
   std::shared_ptr<DataFile> createFile(mode_t mode) override {
     return std::make_shared<MemoryDataFile>(mode, this);
   }

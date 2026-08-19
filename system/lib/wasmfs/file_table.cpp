@@ -44,8 +44,14 @@ FileTable::Handle::setEntry(__wasi_fd_t fd,
     ++openFile->uses;
   }
   std::shared_ptr<DataFile> ret;
-  if (fileTable.entries[fd] && --fileTable.entries[fd]->uses == 0) {
-    ret = fileTable.entries[fd]->locked().getFile()->dynCast<DataFile>();
+  if (auto oldOpenFile = fileTable.entries[fd]) {
+    auto oldFile = oldOpenFile->locked().getFile();
+    // POSIX process-owned locks are released when any descriptor referring to
+    // the file is closed, not only when its final OpenFileState is closed.
+    oldFile->locked().clearRecordLocks();
+    if (--oldOpenFile->uses == 0) {
+      ret = oldFile->dynCast<DataFile>();
+    }
   }
   fileTable.entries[fd] = openFile;
   return ret;

@@ -582,6 +582,13 @@ public:
 
   bool supportsExplicitMetadataMutation() const override { return false; }
 
+  bool supportsRecordLocks() const override {
+    // A default OPFS backend has no cross-instance lock domain. A successful
+    // record lock is safe only after this backend has acquired the cooperative
+    // storage-bucket profile lease.
+    return profileLeaseHeld;
+  }
+
   int terminalDrainFinished(bool success) override {
     // The generic drain has already recorded a descriptor flush/close error.
     // Retain the lease without reporting the same failed close a second time

@@ -29,6 +29,14 @@ public:
   // falsely reporting a successful logical mutation.
   virtual bool supportsExplicitMetadataMutation() const { return true; }
 
+  // Whether this backend provides a storage domain in which WasmFS can safely
+  // implement POSIX process-owned record locks. Returning true is not a
+  // promise that arbitrary external writers participate in locking. A
+  // persistent backend must instead establish an exclusive external owner
+  // before opting in, so a successful fcntl lock never merely masks
+  // cross-instance data races.
+  virtual bool supportsRecordLocks() const { return false; }
+
   // Called after WasmFS has permanently drained its public descriptor table.
   // Backends must not begin new filesystem work from this hook. A false
   // argument means that some earlier cleanup failed; a backend holding a

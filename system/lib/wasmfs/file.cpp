@@ -8,9 +8,72 @@
 #include "file.h"
 #include "wasmfs.h"
 #include "wasmfs_internal.h"
+#include <algorithm>
 #include <emscripten/threading.h>
+#include <fcntl.h>
 
 namespace wasmfs {
+
+void File::Handle::applyRecordLock(short type,
+                                   off_t start,
+                                   std::optional<off_t> end) {
+  RecordLock lock = {type, start, end};
+  auto rangesOverlap = [](const RecordLock& lhs, const RecordLock& rhs) {
+    return (!lhs.end || rhs.start < *lhs.end) &&
+           (!rhs.end || lhs.start < *rhs.end);
+  };
+  auto endsBeforeOrAt = [](const std::optional<off_t>& lhs, off_t rhs) {
+    return lhs && *lhs <= rhs;
+  };
+  auto endsAfter = [](const std::optional<off_t>& lhs,
+                      const std::optional<off_t>& rhs) {
+    if (!lhs) {
+      return rhs.has_value();
+    }
+    return rhs && *lhs > *rhs;
+  };
+
+  auto& locks = file->recordLocks;
+  std::vector<RecordLock> updated;
+  updated.reserve(locks.size() + (lock.type != F_UNLCK));
+
+  for (const auto& current : locks) {
+    if (!rangesOverlap(current, lock)) {
+      updated.push_back(current);
+      continue;
+    }
+
+    // Preserve the current lock's non-overlapping left and right portions.
+    if (current.start < lock.start) {
+      updated.push_back({current.type, current.start, lock.start});
+    }
+    if (lock.end && !endsBeforeOrAt(current.end, *lock.end)) {
+      updated.push_back({current.type, *lock.end, current.end});
+    }
+  }
+
+  if (lock.type != F_UNLCK) {
+    updated.push_back(lock);
+  }
+
+  std::sort(updated.begin(), updated.end(), [](const RecordLock& lhs,
+                                                 const RecordLock& rhs) {
+    return lhs.start < rhs.start;
+  });
+
+  locks.clear();
+  locks.reserve(updated.size());
+  for (const auto& current : updated) {
+    if (!locks.empty() && locks.back().type == current.type &&
+        (!locks.back().end || current.start <= *locks.back().end)) {
+      if (endsAfter(current.end, locks.back().end)) {
+        locks.back().end = current.end;
+      }
+      continue;
+    }
+    locks.push_back(current);
+  }
+}
 
 //
 // DataFile

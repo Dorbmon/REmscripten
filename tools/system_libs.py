@@ -2028,27 +2028,35 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
 
   def __init__(self, **kwargs):
     self.ignore_case = kwargs.pop('ignore_case')
+    self.record_lock_test = kwargs.pop('record_lock_test')
     super().__init__(**kwargs)
 
   def get_cflags(self):
     cflags = super().get_cflags()
     if self.ignore_case:
       cflags += ['-DWASMFS_CASE_INSENSITIVE']
+    if self.record_lock_test:
+      cflags += ['-DWASMFS_RECORD_LOCK_TEST']
     return cflags
 
   def get_base_name(self):
     name = super().get_base_name()
     if self.ignore_case:
       name += '-icase'
+    if self.record_lock_test:
+      name += '-record-lock-test'
     return name
 
   @classmethod
   def vary_on(cls):
-    return super().vary_on() + ['ignore_case']
+    return super().vary_on() + ['ignore_case', 'record_lock_test']
 
   @classmethod
   def get_default_variation(cls, **kwargs):
-    return super().get_default_variation(ignore_case=settings.CASE_INSENSITIVE_FS, **kwargs)
+    return super().get_default_variation(
+        ignore_case=settings.CASE_INSENSITIVE_FS,
+        record_lock_test=settings.WASMFS_RECORD_LOCK_TEST,
+        **kwargs)
 
   def get_files(self):
     backends = files_in_path(

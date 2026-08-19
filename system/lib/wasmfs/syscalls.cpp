@@ -13,8 +13,10 @@
 #include <emscripten/html5.h>
 #include <emscripten/syscalls.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -80,6 +82,158 @@ bool canMutateExplicitMetadata(const std::shared_ptr<wasmfs::File>& file) {
     return backend->supportsExplicitMetadataMutation();
   }
   return true;
+}
+
+// Record locks in POSIX are process-owned. WasmFS has one process-global
+// instance, so a backend may opt in only when it has independently established
+// that no other WasmFS instance can concurrently mutate the same storage.
+// In particular, the ordinary OPFS backend deliberately does not opt in.
+bool canUseRecordLocks(const std::shared_ptr<wasmfs::File>& file) {
+  auto* backend = file->getBackend();
+  return S_ISREG(file->locked().getMode()) && backend &&
+         backend->supportsRecordLocks();
+}
+
+struct RecordLockRange {
+  off_t start;
+  std::optional<off_t> end;
+};
+
+static_assert(std::numeric_limits<off_t>::is_signed,
+              "Record lock offsets must be signed");
+
+bool addWouldOverflow(off_t lhs, off_t rhs) {
+  if (rhs > 0) {
+    return lhs > std::numeric_limits<off_t>::max() - rhs;
+  }
+  if (rhs < 0) {
+    return lhs < std::numeric_limits<off_t>::min() - rhs;
+  }
+  return false;
+}
+
+// Convert the POSIX flock range into a half-open absolute byte range. A zero
+// length locks through end-of-file. Negative l_len values extend backwards
+// from l_start; signed overflow and any resulting negative byte offset are
+// rejected rather than wrapped into a different record range.
+int normalizeRecordLockRange(const struct flock& lock,
+                             off_t position,
+                             wasmfs::File::Handle& lockedFile,
+                             RecordLockRange& range) {
+  off_t base;
+  switch (lock.l_whence) {
+    case SEEK_SET:
+      base = 0;
+      break;
+    case SEEK_CUR:
+      base = position;
+      break;
+    case SEEK_END:
+      base = lockedFile.getSize();
+      if (base < 0) {
+        return base;
+      }
+      break;
+    default:
+      return -EINVAL;
+  }
+
+  if (addWouldOverflow(base, lock.l_start)) {
+    return -EOVERFLOW;
+  }
+  off_t start = base + lock.l_start;
+  if (start < 0) {
+    return -EINVAL;
+  }
+
+  if (lock.l_len == 0) {
+    range = {start, std::nullopt};
+    return 0;
+  }
+
+  if (addWouldOverflow(start, lock.l_len)) {
+    return -EOVERFLOW;
+  }
+  off_t end = start + lock.l_len;
+  if (end < 0) {
+    return -EINVAL;
+  }
+
+  if (end < start) {
+    range = {end, start};
+  } else {
+    range = {start, end};
+  }
+  return 0;
+}
+
+bool isValidRecordLockType(short type, bool query) {
+  if (query) {
+    return type == F_RDLCK || type == F_WRLCK;
+  }
+  return type == F_RDLCK || type == F_WRLCK || type == F_UNLCK;
+}
+
+int checkRecordLockAccess(wasmfs::oflags_t flags, short type) {
+  if (type == F_UNLCK) {
+    return 0;
+  }
+  const auto accessMode = flags & O_ACCMODE;
+  if ((type == F_RDLCK && accessMode == O_WRONLY) ||
+      (type == F_WRLCK && accessMode == O_RDONLY)) {
+    return -EBADF;
+  }
+  return 0;
+}
+
+int handleRecordLock(const std::shared_ptr<wasmfs::OpenFileState>& openFile,
+                     struct flock* lock,
+                     bool query) {
+  if (!lock || !isValidRecordLockType(lock->l_type, query)) {
+    return -EINVAL;
+  }
+
+  std::shared_ptr<wasmfs::File> file;
+  off_t position;
+  wasmfs::oflags_t flags;
+  {
+    auto lockedOpenFile = openFile->locked();
+    file = lockedOpenFile.getFile();
+    position = lockedOpenFile.getPosition();
+    flags = lockedOpenFile.getFlags();
+  }
+
+  // Resolve the descriptor's real File before checking the backend. Pathname
+  // symlinks have already been resolved by open(), and non-regular objects do
+  // not obtain a synthetic lock service.
+  if (!canUseRecordLocks(file)) {
+    return -ENOTSUP;
+  }
+
+  auto lockedFile = file->locked();
+  RecordLockRange range;
+  if (int err = normalizeRecordLockRange(*lock, position, lockedFile, range)) {
+    return err;
+  }
+
+  if (query) {
+    // A valid leased OPFS profile admits exactly one WasmFS process. POSIX
+    // F_GETLK ignores locks owned by that same process, so every supported
+    // query is immediately unlocked. Linux returns F_UNLCK and leaves the
+    // rest of the caller's flock unchanged when there is no conflict.
+    lock->l_type = F_UNLCK;
+    return 0;
+  }
+
+  if (int err = checkRecordLockAccess(flags, lock->l_type)) {
+    return err;
+  }
+
+  // F_SETLKW is immediately satisfiable in this exclusive single-process
+  // domain. It has the same state transition as F_SETLK and never blocks the
+  // browser runtime thread waiting for a lock owner that cannot exist here.
+  lockedFile.applyRecordLock(lock->l_type, range.start, range.end);
+  return 0;
 }
 
 // WASI represents offsets as unsigned values, while WasmFS backends receive a
@@ -2003,6 +2157,35 @@ int __syscall_fallocate(int fd, int mode, off_t offset, off_t len) {
 
 int __syscall_fcntl64(int fd, int cmd, ...) {
   WASMFS_GUARD_NEGATIVE();
+  if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
+    std::shared_ptr<OpenFileState> openFile;
+    {
+      // Record-lock normalization can query an OPFS file's size. Do not hold
+      // the descriptor-table mutex over that proxying operation.
+      auto fileTable = wasmFS.getFileTable().locked();
+      openFile = fileTable.getEntry(fd);
+    }
+    if (!openFile) {
+      return -EBADF;
+    }
+
+    struct flock* lock;
+    va_list v1;
+    va_start(v1, cmd);
+    lock = va_arg(v1, struct flock*);
+    va_end(v1);
+
+    if (cmd == F_GETLK) {
+      // If these constants differ then we'd need a case for both.
+      static_assert(F_GETLK == F_GETLK64);
+      return handleRecordLock(openFile, lock, true);
+    }
+
+    static_assert(F_SETLK == F_SETLK64);
+    static_assert(F_SETLKW == F_SETLKW64);
+    return handleRecordLock(openFile, lock, false);
+  }
+
   auto fileTable = wasmFS.getFileTable().locked();
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
@@ -2060,27 +2243,28 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
       lockedOpenFile.setFlags((oldFlags & ~O_APPEND) | supportedFlags);
       return 0;
     }
-    case F_GETLK: {
-      // If these constants differ then we'd need a case for both.
-      static_assert(F_GETLK == F_GETLK64);
-      // Do not report an unlocked state until byte-range locks exist. Callers
-      // such as SQLite would otherwise interpret this as a real lock service.
-      return -ENOTSUP;
-    }
-    case F_SETLK:
-    case F_SETLKW: {
-      static_assert(F_SETLK == F_SETLK64);
-      static_assert(F_SETLKW == F_SETLKW64);
-      // Record locking has no WasmFS implementation. In particular, returning
-      // success here would corrupt SQLite's concurrency assumptions.
-      return -ENOTSUP;
-    }
     default: {
       // TODO: support any remaining cmds
       return -EINVAL;
     }
   }
 }
+
+#ifdef WASMFS_RECORD_LOCK_TEST
+// This symbol is deliberately absent from production builds and public
+// headers. POSIX F_GETLK hides locks owned by the calling process, so the
+// focused WasmFS test uses this internal counter to verify any-close release
+// semantics for duplicated descriptors.
+extern "C" int wasmfs_record_lock_count_for_testing(int fd) {
+  WASMFS_GUARD_NEGATIVE();
+  auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
+  if (!openFile) {
+    return -EBADF;
+  }
+  auto file = openFile->locked().getFile();
+  return static_cast<int>(file->locked().getRecordLockCount());
+}
+#endif
 
 static int
 doStatFS(std::shared_ptr<File>& file, size_t size, struct statfs* buf) {

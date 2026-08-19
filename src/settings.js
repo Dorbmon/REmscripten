@@ -1827,6 +1827,12 @@ var FETCH_STREAMING = 0;
 // [experimental]
 var WASMFS = false;
 
+// Test-only selector that enables an instance-private in-memory record-lock
+// domain and a private assertion hook. Production record locks are available
+// only to leased OPFS backends; this setting controls no runtime API.
+// [link]
+var WASMFS_RECORD_LOCK_TEST = 0;
+
 // Test-only selector for a controlled interruption of the OPFS move proxy
 // callback.  0 disables the hook, 1 pauses immediately before the browser
 // `FileSystemFileHandle.move()` call, and 2 pauses immediately after that call

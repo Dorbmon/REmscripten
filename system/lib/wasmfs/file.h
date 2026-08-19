@@ -94,6 +94,17 @@ public:
   Handle locked();
 
 protected:
+  // POSIX record locks are owned by a process rather than by an individual
+  // descriptor. A File's mutex protects this state. The end offset is
+  // exclusive; a missing end represents the range through end-of-file.
+  struct RecordLock {
+    short type;
+    off_t start;
+    std::optional<off_t> end;
+  };
+
+  std::vector<RecordLock> recordLocks;
+
   File(FileKind kind, mode_t mode, backend_t backend)
     : kind(kind), mode(mode), backend(backend) {
     atime = mtime = ctime = emscripten_date_now();
@@ -345,6 +356,20 @@ public:
   void setParent(std::shared_ptr<Directory> parent) { file->parent = parent; }
 
   std::shared_ptr<File> unlocked() { return file; }
+
+  // Replaces this process's locks in `lock`'s range while preserving portions
+  // of existing ranges that fall outside it. Callers must have already
+  // normalized and validated the range.
+  void applyRecordLock(short type,
+                       off_t start,
+                       std::optional<off_t> end);
+
+  // POSIX releases every process-owned record lock on a file when any file
+  // descriptor referring to that file is closed, including a duplicated
+  // descriptor.
+  void clearRecordLocks() { file->recordLocks.clear(); }
+
+  size_t getRecordLockCount() const { return file->recordLocks.size(); }
 };
 
 class DataFile::Handle : public File::Handle {
