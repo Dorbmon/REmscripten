@@ -300,9 +300,28 @@ static __wasi_errno_t operationErrorToWasiErrno(int error) {
       return __WASI_ERRNO_CANCELED;
     case EDEADLK:
       return __WASI_ERRNO_DEADLK;
+    case EBUSY:
+      return __WASI_ERRNO_BUSY;
     default:
       return __WASI_ERRNO_IO;
   }
+}
+
+static __wasi_errno_t admissionErrorToWasiErrno(int error) {
+  assert(error < 0);
+  return operationErrorToWasiErrno(-error);
+}
+
+static int admitFile(const std::shared_ptr<File>& file) {
+  assert(file);
+  return wasmFS.admitBackend(file->getBackend());
+}
+
+static int admitOpenFile(const std::shared_ptr<OpenFileState>& openFile) {
+  if (!openFile) {
+    return -EBADF;
+  }
+  return admitFile(openFile->locked().getFile());
 }
 
 #define WASMFS_GUARD_NEGATIVE()                                           \
@@ -352,8 +371,17 @@ int __syscall_dup3(int oldfd, int newfd, int flags) {
     if (!oldOpenFile) {
       return -EBADF;
     }
+    if (int err = admitOpenFile(oldOpenFile)) {
+      return err;
+    }
     if (newfd < 0 || newfd >= WASMFS_FD_MAX) {
       return -EBADF;
+    }
+
+    if (auto replacedOpenFile = fileTable.getEntry(newfd)) {
+      if (int err = admitOpenFile(replacedOpenFile)) {
+        return err;
+      }
     }
 
     // If the file descriptor newfd was previously open, it will just be
@@ -377,6 +405,9 @@ int __syscall_dup(int fd) {
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
     return -EBADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
   }
   return fileTable.addEntry(openFile);
 }
@@ -405,6 +436,9 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return __WASI_ERRNO_BADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return admissionErrorToWasiErrno(err);
   }
 
   if (!isValidOffset(offset)) {
@@ -530,6 +564,9 @@ static __wasi_errno_t readAtOffset(OffsetHandling setOffset,
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return __WASI_ERRNO_BADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return admissionErrorToWasiErrno(err);
   }
 
   if (setOffset == OffsetHandling::Argument && !isValidOffset(offset)) {
@@ -671,6 +708,9 @@ __wasi_errno_t __wasi_fd_close(__wasi_fd_t fd) {
     if (!entry) {
       return __WASI_ERRNO_BADF;
     }
+    if (int err = admitOpenFile(entry)) {
+      return admissionErrorToWasiErrno(err);
+    }
     closee = fileTable.setEntry(fd, nullptr);
   }
   if (closee) {
@@ -687,6 +727,9 @@ __wasi_errno_t __wasi_fd_sync(__wasi_fd_t fd) {
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return __WASI_ERRNO_BADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return admissionErrorToWasiErrno(err);
   }
 
   auto file = openFile->locked().getFile();
@@ -715,10 +758,14 @@ int __syscall_fdatasync(int fd) {
   return -__wasi_fd_sync(fd);
 }
 
-backend_t wasmfs_get_backend_by_fd(int fd) {
+wasmfs::backend_t wasmfs_get_backend_by_fd(int fd) {
   WASMFS_GUARD_BACKEND();
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
+    return NullBackend;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    errno = -err;
     return NullBackend;
   }
   return openFile->locked().getFile()->getBackend();
@@ -726,11 +773,13 @@ backend_t wasmfs_get_backend_by_fd(int fd) {
 
 // This function is exposed to users to allow them to obtain a backend_t for a
 // specified path.
-backend_t wasmfs_get_backend_by_path(const char* path) {
+wasmfs::backend_t wasmfs_get_backend_by_path(const char* path) {
   WASMFS_GUARD_BACKEND();
   auto parsed = path::parseFile(path);
-  if (parsed.getError()) {
-    // Could not find the file.
+  if (auto err = parsed.getError()) {
+    // Preserve a sealed profile's admission failure instead of making it look
+    // like an ordinary absent path.
+    errno = -err;
     return NullBackend;
   }
   return parsed.getFile()->getBackend();
@@ -885,7 +934,7 @@ static int abandonOpenFile(std::shared_ptr<OpenFileState> openFile) {
 static __wasi_fd_t doOpen(path::ParsedParent parsed,
                           int flags,
                           mode_t mode,
-                          backend_t backend = NullBackend,
+                          wasmfs::backend_t backend = NullBackend,
                           OpenReturnMode returnMode = OpenReturnMode::FD) {
   if (auto err = validateOpenFlags(flags)) {
     return err;
@@ -932,6 +981,12 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
       if (!backend) {
         backend = parent->getBackend();
       }
+      // A factory-selected target backend may be distinct from the pathname
+      // parent. Admit it before creation so a sealed leased profile cannot be
+      // remounted through this explicit-backend API.
+      if (int err = wasmFS.admitBackend(backend)) {
+        return err;
+      }
 
       std::shared_ptr<File> created;
       if (backend == parent->getBackend()) {
@@ -964,6 +1019,13 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
       }
       return installOpenFile(std::move(openFile));
     }
+  }
+
+  // Path traversal admitted the parent, but a mount may yield a child from a
+  // different backend. Hold that exact backend for all leaf inspection and
+  // open/truncate work below.
+  if (int err = admitFile(child)) {
+    return err;
   }
 
   if (auto link = child->dynCast<Symlink>()) {
@@ -1047,7 +1109,9 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
 
 // This function is exposed to users and allows users to create a file in a
 // specific backend. An fd to an open file is returned.
-int wasmfs_create_file(char* pathname, mode_t mode, backend_t backend) {
+int wasmfs_create_file(char* pathname,
+                       mode_t mode,
+                       wasmfs::backend_t backend) {
   WASMFS_GUARD_NEGATIVE();
   static_assert(std::is_same_v<decltype(doOpen(0, 0, 0, 0)), unsigned int>,
                 "unexpected conversion from result of doOpen to int");
@@ -1104,7 +1168,9 @@ int __syscall_mknodat(int dirfd, intptr_t path, int mode, int dev) {
 }
 
 static int
-doMkdir(path::ParsedParent parsed, int mode, backend_t backend = NullBackend) {
+doMkdir(path::ParsedParent parsed,
+        int mode,
+        wasmfs::backend_t backend = NullBackend) {
   if (auto err = parsed.getError()) {
     return err;
   }
@@ -1117,7 +1183,10 @@ doMkdir(path::ParsedParent parsed, int mode, backend_t backend = NullBackend) {
   }
 
   // Check if the requested directory already exists.
-  if (lockedParent.getChild(childName)) {
+  if (auto child = lockedParent.getChild(childName)) {
+    if (int err = admitFile(child)) {
+      return err;
+    }
     return -EEXIST;
   }
 
@@ -1135,6 +1204,12 @@ doMkdir(path::ParsedParent parsed, int mode, backend_t backend = NullBackend) {
   // then that backend is used.
   if (!backend) {
     backend = parent->getBackend();
+  }
+  // An explicitly selected backend can differ from the parent mount. Check
+  // it before calling its factory so sealing cannot be bypassed by a new
+  // mountpoint or directory.
+  if (int err = wasmFS.admitBackend(backend)) {
+    return err;
   }
 
   if (backend == parent->getBackend()) {
@@ -1161,7 +1236,9 @@ doMkdir(path::ParsedParent parsed, int mode, backend_t backend = NullBackend) {
 
 // This function is exposed to users and allows users to specify a particular
 // backend that a directory should be created within.
-int wasmfs_create_directory(char* path, int mode, backend_t backend) {
+int wasmfs_create_directory(char* path,
+                            int mode,
+                            wasmfs::backend_t backend) {
   WASMFS_GUARD_NEGATIVE();
   static_assert(std::is_same_v<decltype(doMkdir(0, 0, 0)), int>,
                 "unexpected conversion from result of doMkdir to int");
@@ -1186,6 +1263,9 @@ static __wasi_errno_t doFdSeek(__wasi_fd_t fd,
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return __WASI_ERRNO_BADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return admissionErrorToWasiErrno(err);
   }
   auto lockedOpenFile = openFile->locked();
 
@@ -1283,6 +1363,9 @@ int __syscall_fchdir(int fd) {
     auto lockedOpenFile = openFile->locked();
     file = lockedOpenFile.getFile();
   }
+  if (int err = admitFile(file)) {
+    return err;
+  }
   return doChdir(cwdTransition, file);
 }
 
@@ -1299,10 +1382,19 @@ int __syscall_getcwd(intptr_t buf, size_t size) {
   }
 
   auto curr = wasmFS.getCWD();
+  // Even when CWD is the root, it can be a sealed leased-OPFS directory.
+  // Admit it before the ancestry loop so getcwd() cannot fabricate "/" after
+  // a scoped profile drain.
+  if (int err = admitFile(curr)) {
+    return err;
+  }
 
   std::string result = "";
 
   while (curr != wasmFS.getRootDirectory()) {
+    if (int err = admitFile(curr)) {
+      return err;
+    }
     auto parent = curr->locked().getParent();
     // Check if the parent exists. The parent may not exist if the CWD or one
     // of its ancestors has been unlinked.
@@ -1344,6 +1436,9 @@ __wasi_errno_t __wasi_fd_fdstat_get(__wasi_fd_t fd, __wasi_fdstat_t* stat) {
   if (!openFile) {
     return __WASI_ERRNO_BADF;
   }
+  if (int err = admitOpenFile(openFile)) {
+    return admissionErrorToWasiErrno(err);
+  }
 
   if (openFile->locked().getFile()->is<Directory>()) {
     stat->fs_filetype = __WASI_FILETYPE_DIRECTORY;
@@ -1383,6 +1478,9 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
   auto file = lockedParent.getChild(childName);
   if (!file) {
     return -ENOENT;
+  }
+  if (int err = admitFile(file)) {
+    return err;
   }
   // Disallow removing the root directory, even if it is empty.
   if (file == wasmFS.getRootDirectory()) {
@@ -1451,6 +1549,12 @@ int wasmfs_unmount(const char* path) {
       if (!file) {
         return -ENOENT;
       }
+      // Preserve sealed-backend precedence even when the leaf is not a
+      // directory/mountpoint. Otherwise unmount("/profile/file") could turn
+      // a profile admission failure into an invented ENOTDIR.
+      if (int err = admitFile(file)) {
+        return err;
+      }
       // Disallow removing the root directory, even if it is empty.
       if (file == wasmFS.getRootDirectory()) {
         return -EBUSY;
@@ -1493,6 +1597,9 @@ int __syscall_getdents64(int fd, intptr_t dirp, size_t count) {
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
   }
   auto lockedOpenFile = openFile->locked();
 
@@ -1618,6 +1725,19 @@ int __syscall_renameat(int olddirfd,
   auto oldFile = lockedOldParent.getChild(oldFileName);
   auto newFile = lockedNewParent.getChild(newFileName);
 
+  // Check either discovered leaf before returning a non-profile lookup
+  // result. In particular, rename("missing", "/profile") must not reveal a
+  // sealed mount as an ordinary ENOENT source failure.
+  if (oldFile) {
+    if (int err = admitFile(oldFile)) {
+      return err;
+    }
+  }
+  if (newFile) {
+    if (int err = admitFile(newFile)) {
+      return err;
+    }
+  }
   if (!oldFile) {
     return -ENOENT;
   }
@@ -1696,7 +1816,10 @@ int __syscall_symlinkat(intptr_t target, int newdirfd, intptr_t linkpath) {
   }
   auto lockedParent = parent->locked();
   std::string childName(childNameView);
-  if (lockedParent.getChild(childName)) {
+  if (auto child = lockedParent.getChild(childName)) {
+    if (int err = admitFile(child)) {
+      return err;
+    }
     return -EEXIST;
   }
   if (!lockedParent.insertSymlink(childName, (char*)target)) {
@@ -1826,6 +1949,9 @@ int __syscall_fchmod(int fd, int mode) {
   if (!openFile) {
     return -EBADF;
   }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
+  }
   auto file = openFile->locked().getFile();
   if (!canMutateExplicitMetadata(file)) {
     return -ENOTSUP;
@@ -1937,6 +2063,9 @@ int __syscall_ftruncate64(int fd, off_t size) {
   if (!openFile) {
     return -EBADF;
   }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
+  }
   auto lockedOpenFile = openFile->locked();
   if ((lockedOpenFile.getFlags() & O_ACCMODE) == O_RDONLY) {
     return -EINVAL;
@@ -1956,6 +2085,9 @@ int __syscall_ioctl(int fd, int request, ...) {
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
   }
   if (!isTTY(openFile->locked().getFile())) {
     return -ENOTTY;
@@ -2054,6 +2186,9 @@ int __syscall_poll(intptr_t fds_, int nfds, int timeout) {
     auto mask = POLLNVAL;
     auto openFile = fileTable.getEntry(fd);
     if (openFile) {
+      if (int err = admitOpenFile(openFile)) {
+        return err;
+      }
       mask = 0;
       auto flags = openFile->locked().getFlags();
       auto accessMode = flags & O_ACCMODE;
@@ -2092,6 +2227,9 @@ int __syscall_fallocate(int fd, int mode, off_t offset, off_t len) {
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
     return -EBADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
   }
 
   // Match Linux's validation order: after resolving the descriptor, reject an
@@ -2168,6 +2306,9 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
     if (!openFile) {
       return -EBADF;
     }
+    if (int err = admitOpenFile(openFile)) {
+      return err;
+    }
 
     struct flock* lock;
     va_list v1;
@@ -2190,6 +2331,9 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
     return -EBADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
   }
 
   switch (cmd) {
@@ -2261,6 +2405,9 @@ extern "C" int wasmfs_record_lock_count_for_testing(int fd) {
   if (!openFile) {
     return -EBADF;
   }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
+  }
   auto file = openFile->locked().getFile();
   return static_cast<int>(file->locked().getRecordLockCount());
 }
@@ -2305,6 +2452,9 @@ int __syscall_fstatfs64(int fd, size_t size, intptr_t buf) {
   if (!openFile) {
     return -EBADF;
   }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
+  }
   return doStatFS(openFile->locked().getFile(), size, (struct statfs*)buf);
 }
 
@@ -2340,6 +2490,9 @@ int _mmap_js(size_t length,
   auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
   if (!openFile) {
     return -EBADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
   }
 
   std::shared_ptr<DataFile> file;
@@ -2513,6 +2666,13 @@ int __syscall_recvmsg(
 
 int __syscall_fadvise64(int fd, off_t offset, off_t length, int advice) {
   WASMFS_GUARD_NEGATIVE();
+  auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
+  if (!openFile) {
+    return -EBADF;
+  }
+  if (int err = admitOpenFile(openFile)) {
+    return err;
+  }
   // Advice is currently ignored. TODO some backends might use it
   return 0;
 }

@@ -12,6 +12,10 @@
 #error "WASMFS_OPFS_TEST_CLOSE_FAILURE must be 0 or 1"
 #endif
 
+#if WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE != 0 && WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE != 1
+#error "WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE must be 0 or 1"
+#endif
+
 #if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE != 0 && WASMFS_OPFS_TEST_FILE_HANDLE_CACHE != 1
 #error "WASMFS_OPFS_TEST_FILE_HANDLE_CACHE must be 0 or 1"
 #endif
@@ -228,6 +232,11 @@ addToLibrary({
   _wasmfs_opfs_release_profile_lease__async: 'auto',
   _wasmfs_opfs_release_profile_lease: async (ctx, errPtr) => {
     let err = 0;
+#if WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE
+    // Leave the browser-side request intact to model an unacknowledged
+    // release. The native backend must retain the lease and never retry it.
+    err = -{{{ cDefs.EIO }}};
+#else
     let release = wasmfsOPFSProfileLease.release;
     let request = wasmfsOPFSProfileLease.request;
     if (!release || !request) {
@@ -240,6 +249,7 @@ addToLibrary({
         err = -{{{ cDefs.EIO }}};
       }
     }
+#endif
     {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
     wasmfsOPFSProxyFinish(ctx);
   },

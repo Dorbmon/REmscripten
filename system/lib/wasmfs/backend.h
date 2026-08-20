@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <errno.h>
+
 #include "file.h"
 
 namespace wasmfs {
@@ -36,6 +38,20 @@ public:
   // before opting in, so a successful fcntl lock never merely masks
   // cross-instance data races.
   virtual bool supportsRecordLocks() const { return false; }
+
+  // A leased OPFS backend uses this narrow operation admission protocol while
+  // a profile-specific drain seals it. Other backends remain no-ops so their
+  // normal filesystem traffic is unaffected by the scoped drain.
+  virtual int acquireProfileOperation() { return 0; }
+  virtual void releaseProfileOperation() {}
+
+  // These hooks are intentionally implemented only by the backend returned
+  // from wasmfs_create_opfs_backend_with_profile_lease(). The scoped drain
+  // never treats an arbitrary persistent backend as safe to hand off.
+  virtual bool isLeasedOPFSProfileBackend() const { return false; }
+  virtual int beginOPFSProfileDrain() { return -ENOTSUP; }
+  virtual int finishOPFSProfileDrain(bool success) { return -ENOTSUP; }
+  virtual int getOPFSProfilePriorCloseError() const { return 0; }
 
   // Called after WasmFS has permanently drained its public descriptor table.
   // Backends must not begin new filesystem work from this hook. A false

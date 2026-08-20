@@ -6178,6 +6178,294 @@ Module["preRun"] = () => {
     ''')
     self.run_browser('a.html', '/report_result?0', timeout=90)
 
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_drain(self):
+    # This is deliberately narrower than browser-profile shutdown. It checks
+    # the leased-OPFS backend handoff primitive: target-only sealing/detach,
+    # libc-flush reentry rejection, and a synchronous live-holder lease result.
+    test = test_file('wasmfs/wasmfs_opfs_profile_drain.c')
+    common_args = ['-sWASMFS', '-sFORCE_FILESYSTEM', '-pthread',
+                   '-sPROXY_TO_PTHREAD', '-sPTHREAD_POOL_SIZE=4',
+                   '-sEXIT_RUNTIME', '-lopfs.js']
+    create_file('profile-drain-normal-holder-pre.js', r'''
+      // onExit runs after the native atexit witness. The parent waits for it
+      // before disposing the iframe, so this is not browser-context cleanup.
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-profile-drain',
+          },
+          window.location.origin);
+      };
+      Module['onAbort'] = (reason) => {
+        if (typeof window == 'undefined') {
+          console.error('profile-drain holder abort: ' + reason);
+          return;
+        }
+        window.parent.postMessage(
+          {
+            event: 'holder-abort',
+            reason: String(reason),
+            type: 'wasmfs-opfs-profile-drain',
+          },
+          window.location.origin);
+      };
+    ''')
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_NORMAL',
+                     '-sWASMFS_OPFS_PROFILE_DRAIN_TEST=1', '--pre-js',
+                     'profile-drain-normal-holder-pre.js', '-o',
+                     'profile-drain-normal-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_NORMAL', '-o',
+                     'profile-drain-normal-contender.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_NO_MOUNT', '-o',
+                     'profile-drain-no-mount-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_NO_MOUNT', '-o',
+                     'profile-drain-no-mount-contender.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_CLOSE_FAILURE',
+                     '-sWASMFS_OPFS_TEST_CLOSE_FAILURE=1', '-o',
+                     'profile-drain-close-during-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_CLOSE_FAILURE', '-o',
+                     'profile-drain-close-during-contender.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_CLOSE_BEFORE',
+                     '-sWASMFS_OPFS_TEST_CLOSE_FAILURE=1', '-o',
+                     'profile-drain-close-before-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_CLOSE_BEFORE', '-o',
+                     'profile-drain-close-before-contender.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_RELEASE_FAILURE',
+                     '-sWASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE=1', '-o',
+                     'profile-drain-release-failure-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_RELEASE_FAILURE', '-o',
+                     'profile-drain-release-failure-contender.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_REENTRY', '-o',
+                     'profile-drain-reentry-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_REENTRY', '-o',
+                     'profile-drain-reentry-contender.html'],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kReady = 0;
+        const kBusy = 1;
+        const kModuleTimeoutMs = 20000;
+        const pendingModules = new Map();
+        const pendingHolderExits = new Map();
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              let progress = 'unavailable';
+              try {
+                const getProgress =
+                  frame.contentWindow.Module
+                    ._wasmfs_opfs_profile_drain_holder_progress;
+                if (getProgress) {
+                  progress = getProgress();
+                }
+              } catch {}
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path +
+                               ', progress=' + progress));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for orderly holder exit'));
+            }, kModuleTimeoutMs);
+            pendingHolderExits.set(
+              frame.contentWindow, {frame, resolve, reject, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != 'wasmfs-opfs-profile-drain') {
+            return;
+          }
+          if (event.data.event == 'holder-exit') {
+            const pending = pendingHolderExits.get(event.source);
+            if (!pending) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pending.timeout);
+            if (event.data.status != 0) {
+              pending.reject(new Error(
+                'holder did not exit cleanly: status=' + event.data.status));
+            } else {
+              pending.resolve();
+            }
+            return;
+          }
+          if (event.data.event == 'holder-abort') {
+            const pendingExit = pendingHolderExits.get(event.source);
+            if (pendingExit) {
+              pendingHolderExits.delete(event.source);
+              clearTimeout(pendingExit.timeout);
+              pendingExit.frame.remove();
+              pendingExit.reject(new Error(
+                'holder aborted: ' + event.data.reason));
+              return;
+            }
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          if (event.data.event == 'holder-abort') {
+            pendingModules.delete(event.source);
+            clearTimeout(pending.timeout);
+            pending.frame.remove();
+            pending.reject(new Error('holder aborted: ' + event.data.reason));
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function runScenario(name,
+                                   holderPath,
+                                   contenderPath,
+                                   expectBusy,
+                                   orderlyShutdown) {
+          const holder = await startModule(holderPath);
+          if (holder.message.role != kHolder ||
+              holder.message.result != kReady || holder.message.error != 0) {
+            holder.frame.remove();
+            throw new Error(name + ' holder failed: role=' +
+                            holder.message.role + ', result=' +
+                            holder.message.result + ', errno=' +
+                            holder.message.error);
+          }
+
+          // This fresh module runs while the holder iframe remains alive. A
+          // ready result therefore proves explicit scoped release, while busy
+          // proves an ambiguous close/reentrant cleanup retained the lease.
+          const contender = await startModule(contenderPath);
+          if (contender.message.role != kContender) {
+            contender.frame.remove();
+            holder.frame.remove();
+            throw new Error(name + ' contender reported role ' +
+                            contender.message.role);
+          }
+          if (expectBusy) {
+            if (contender.message.result != kBusy ||
+                contender.message.error == 0) {
+              contender.frame.remove();
+              holder.frame.remove();
+              throw new Error(name +
+                              ' contender acquired despite retained lease: ' +
+                              'result=' + contender.message.result +
+                              ', errno=' + contender.message.error);
+            }
+          } else if (contender.message.result != kReady ||
+                     contender.message.error != 0) {
+            contender.frame.remove();
+            holder.frame.remove();
+            throw new Error(name +
+                            ' contender did not acquire before holder exit: ' +
+                            'result=' + contender.message.result +
+                            ', errno=' + contender.message.error);
+          }
+          if (orderlyShutdown) {
+            const holderExit = waitForHolderExit(holder.frame);
+            holder.frame.contentWindow.Module
+              ._wasmfs_opfs_profile_drain_holder_shutdown();
+            await holderExit;
+          }
+          contender.frame.remove();
+          holder.frame.remove();
+        }
+
+        (async () => {
+          await runScenario('normal scoped drain',
+                            'profile-drain-normal-holder.html',
+                            'profile-drain-normal-contender.html', false, true);
+          await runScenario('no-mount cleanup',
+                            'profile-drain-no-mount-holder.html',
+                            'profile-drain-no-mount-contender.html', false, false);
+          await runScenario('close during scoped drain',
+                            'profile-drain-close-during-holder.html',
+                            'profile-drain-close-during-contender.html', true, false);
+          await runScenario('close before scoped drain',
+                            'profile-drain-close-before-holder.html',
+                            'profile-drain-close-before-contender.html', true, false);
+          await runScenario('lease release acknowledgement failure',
+                            'profile-drain-release-failure-holder.html',
+                            'profile-drain-release-failure-contender.html',
+                            true, false);
+          await runScenario('stdio reentry during scoped drain',
+                            'profile-drain-reentry-holder.html',
+                            'profile-drain-reentry-contender.html', true, false);
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
   @only_chromium
   @no_wasm64()
   def test_wasmfs_opfs_move_interrupt(self):

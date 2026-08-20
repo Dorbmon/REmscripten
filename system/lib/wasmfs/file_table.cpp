@@ -79,6 +79,27 @@ std::vector<std::shared_ptr<DataFile>> FileTable::Handle::detachAll() {
   return closees;
 }
 
+std::vector<std::shared_ptr<DataFile>>
+FileTable::Handle::detachBackend(backend_t backend,
+                                 uint32_t& detachedDescriptors) {
+  std::vector<std::shared_ptr<DataFile>> closees;
+  detachedDescriptors = 0;
+  for (__wasi_fd_t fd = 0; fd < fileTable.entries.size(); ++fd) {
+    auto openFile = getEntry(fd);
+    if (!openFile) {
+      continue;
+    }
+    if (openFile->locked().getFile()->getBackend() != backend) {
+      continue;
+    }
+    ++detachedDescriptors;
+    if (auto closee = setEntry(fd, nullptr)) {
+      closees.push_back(std::move(closee));
+    }
+  }
+  return closees;
+}
+
 int OpenFileState::create(std::shared_ptr<File> file,
                           oflags_t flags,
                           std::shared_ptr<OpenFileState>& out) {

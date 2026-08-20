@@ -373,7 +373,10 @@ int _wasmfs_identify(const char* path) {
   int err = 0;
   err = stat(path, &file);
   if (err < 0) {
-    return ENOENT;
+    // JS callers use ENOENT to decide that it is safe to create the path.
+    // Do not turn a sealed profile backend (or another real stat error) into
+    // that apparent absence.
+    return errno == ENOENT ? ENOENT : (errno ? errno : EIO);
   }
   if (S_ISDIR(file.st_mode)) {
     return EISDIR;

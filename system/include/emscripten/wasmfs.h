@@ -15,7 +15,10 @@
 extern "C" {
 #endif
 
+#ifndef EMSCRIPTEN_WASMFS_BACKEND_T_DEFINED
+#define EMSCRIPTEN_WASMFS_BACKEND_T_DEFINED
 typedef struct Backend* backend_t;
+#endif
 
 // Obtains the backend_t of a specified path.
 backend_t wasmfs_get_backend_by_path(const char* _Nonnull path);
@@ -112,14 +115,14 @@ backend_t wasmfs_create_opfs_backend(void);
 // unavailable, EBUSY when another module sharing the storage bucket already
 // holds the lease, or EIO for an unexpected Web Locks failure.
 //
-// During an orderly `wasmfs_terminal_drain`, the lease is synchronously
-// released only after all WasmFS terminal cleanup has succeeded. Ordinary
-// whole-WasmFS/module teardown releases it only when no earlier terminal or
-// ambiguous AccessHandle-close failure has occurred. `wasmfs_unmount` does not
-// release it, because WasmFS retains created backends until teardown. There is
-// intentionally no API to release it while the backend can still service
-// filesystem operations. Abrupt execution-context termination relies on Web
-// Locks' context cleanup and does not imply that open files were flushed.
+// During an orderly `wasmfs_terminal_drain` or
+// `wasmfs_drain_opfs_profile_backend`, the lease is synchronously released
+// only after all corresponding cleanup has succeeded. `wasmfs_unmount` does
+// not release it, because WasmFS retains created backends until teardown.
+// There is intentionally no API to release it while the backend can still
+// service filesystem operations. Ordinary backend destruction never reports a
+// successful release: abrupt execution-context teardown relies on Web Locks'
+// context cleanup and does not imply that open files were flushed.
 backend_t wasmfs_create_opfs_backend_with_profile_lease(
   const char* profile_name);
 
@@ -127,6 +130,8 @@ backend_t wasmfs_create_opfs_backend_with_profile_lease(
 backend_t wasmfs_create_jsimpl_backend(void);
 
 backend_t wasmfs_create_icase_backend(backend_t backend);
+
+#include <emscripten/wasmfs_opfs_profile_drain.h>
 
 // Similar to fflush(0), but also flushes all internal buffers inside WasmFS.
 // This is necessary because in a Web environment we must buffer at an

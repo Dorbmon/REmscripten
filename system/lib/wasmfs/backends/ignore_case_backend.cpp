@@ -248,6 +248,24 @@ backend_t wasmfs_create_icase_backend(backend_t backend) {
     errno = operation.getError();
     return NullBackend;
   }
+  // Never place a virtual wrapper in front of a leased profile backend. The
+  // scoped drain identifies its exact backend by pointer when filtering fd
+  // entries, so a wrapper would create an admission and detach bypass. Check
+  // ownership before dereferencing the opaque public handle, and admit first
+  // so a sealed profile reports ESHUTDOWN rather than a generic unsupported
+  // factory result.
+  if (!backend || !wasmFS.ownsBackend(backend)) {
+    errno = ENOTSUP;
+    return NullBackend;
+  }
+  if (int err = wasmFS.admitBackend(backend)) {
+    errno = -err;
+    return NullBackend;
+  }
+  if (backend->isLeasedOPFSProfileBackend()) {
+    errno = ENOTSUP;
+    return NullBackend;
+  }
   return createIgnoreCaseBackend([backend]() { return backend; });
 }
 

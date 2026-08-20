@@ -135,6 +135,15 @@ public:
     // state. Directory states are detached but not returned. The caller must
     // flush/close the returned files after releasing this handle.
     std::vector<std::shared_ptr<DataFile>> detachAll();
+
+    // Detach every descriptor whose underlying File belongs to `backend`.
+    // As with detachAll(), aliases are removed one at a time through setEntry
+    // so POSIX process-owned record locks are released by any detached alias.
+    // `detachedDescriptors` counts all removed table slots, including
+    // directory descriptors; the returned vector contains final DataFile
+    // states only and must be flushed/closed after releasing this handle.
+    std::vector<std::shared_ptr<DataFile>>
+    detachBackend(backend_t backend, uint32_t& detachedDescriptors);
   };
 
   Handle locked() { return Handle(*this); }

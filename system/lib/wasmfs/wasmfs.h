@@ -19,9 +19,19 @@
 #include <vector>
 #include <wasi/api.h>
 
+// Keep the internal C++ interface independent of the public opaque
+// `::backend_t` typedef. Several WasmFS implementation files intentionally use
+// `using namespace wasmfs`, where including the public profile-drain header
+// would make that typedef ambiguous with wasmfs::backend_t.
+struct wasmfs_opfs_profile_drain_result;
+
 namespace wasmfs {
 
 class WasmFS {
+public:
+  class Operation;
+
+private:
 
   std::vector<std::unique_ptr<Backend>> backendTable;
   // A single WasmFS instance may own at most one cooperative terminal lease.
@@ -37,10 +47,13 @@ class WasmFS {
   std::condition_variable operationCV;
   size_t activeOperations = 0;
   TerminalState terminalState = TerminalState::Running;
+  bool scopedProfileDrainInProgress = false;
 
   static thread_local WasmFS* activeOperationWasmFS;
   static thread_local size_t activeOperationDepth;
-  static thread_local WasmFS* terminalStdioFlushWasmFS;
+  static thread_local Operation* activeOperationRoot;
+  static thread_local WasmFS* stdioFlushWasmFS;
+  static thread_local backend_t stdioFlushBackend;
 
   std::shared_ptr<Directory> rootDirectory;
   std::shared_ptr<Directory> cwd;
@@ -69,6 +82,9 @@ public:
     bool admitted = false;
     bool tracksDepth = false;
     bool ownsActiveOperation = false;
+    bool stdioFlushBypass = false;
+    Operation* rootOperation = nullptr;
+    std::vector<backend_t> admittedBackends;
     int error = 0;
 
   public:
@@ -81,6 +97,11 @@ public:
 
     explicit operator bool() const { return admitted; }
     int getError() const { return error; }
+
+    // Hold profile-backend admission for the lifetime of the outer public
+    // operation. Nested syscall wrappers share their outer operation's token
+    // set so a scoped profile drain cannot split one logical filesystem call.
+    int admitBackend(backend_t backend);
   };
 
   // Serializes CWD installation with mount detachment. Acquire this before
@@ -117,6 +138,17 @@ public:
   // See wasmfs_terminal_drain().
   int terminalDrain(wasmfs_terminal_drain_result* result);
 
+  // See wasmfs_drain_opfs_profile_backend().
+  int drainOPFSProfileBackend(backend_t backend,
+                              wasmfs_opfs_profile_drain_result* result);
+
+  // Admit a backend reached by an active public WasmFS operation. Path and fd
+  // helpers call this before inspecting backend-owned metadata or forwarding
+  // an operation to it.
+  int admitBackend(backend_t backend);
+
+  bool ownsBackend(backend_t backend);
+
   FileTable& getFileTable() { return fileTable; }
 
   std::shared_ptr<Directory> getRootDirectory() { return rootDirectory; };
@@ -135,6 +167,9 @@ public:
   // exists. A factory must cancel a reservation when its acquisition fails.
   bool reserveTerminalLeaseOwner();
   void cancelTerminalLeaseOwnerReservation();
+
+  int beginScopedOPFSProfileDrain();
+  void endScopedOPFSProfileDrain();
 };
 
 // Global state instance.

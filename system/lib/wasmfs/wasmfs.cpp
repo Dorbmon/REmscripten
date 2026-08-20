@@ -6,6 +6,8 @@
 // This file defines the global state.
 
 #include <emscripten/threading.h>
+#include <emscripten/wasmfs_opfs_profile_drain.h>
+#include <algorithm>
 #include <errno.h>
 #include <new>
 
@@ -45,9 +47,100 @@ __wasmfs_release_operation(wasmfs_operation_handle* handle) {
 
 namespace wasmfs {
 
+#ifdef WASMFS_OPFS_PROFILE_DRAIN_TEST
+namespace {
+
+// These controls are intentionally internal to the test-only libwasmfs
+// variation. They stop a scoped drain immediately after sealing so the test
+// can distinguish ESHUTDOWN before filtered detach from EBADF afterwards.
+std::atomic<int> profileDrainAfterSealTestState = 0;
+// This one stops the next OPFS file write after its outer syscall has acquired
+// the profile backend token but before the OPFS virtual method admits itself.
+// It exercises the pre-seal continuity edge: beginDrain must wait for that
+// token, and the resumed virtual call must not be rejected merely because the
+// state changed to Sealing meanwhile.
+std::atomic<int> profileDrainFileOperationTestState = 0;
+std::atomic<int> profileDrainSealingTestState = 0;
+
+void pauseProfileDrainAfterSealForTesting() {
+  int expected = 1;
+  if (!profileDrainAfterSealTestState.compare_exchange_strong(expected, 2)) {
+    return;
+  }
+  while (profileDrainAfterSealTestState.load() == 2) {
+    emscripten_thread_sleep(1);
+  }
+  assert(profileDrainAfterSealTestState.load() == 3);
+  profileDrainAfterSealTestState.store(0);
+}
+
+void pauseProfileDrainFileOperationForTesting() {
+  int expected = 1;
+  if (!profileDrainFileOperationTestState.compare_exchange_strong(expected,
+                                                                    2)) {
+    return;
+  }
+  while (profileDrainFileOperationTestState.load() == 2) {
+    emscripten_thread_sleep(1);
+  }
+  assert(profileDrainFileOperationTestState.load() == 3);
+  profileDrainFileOperationTestState.store(0);
+}
+
+} // anonymous namespace
+
+extern "C" void wasmfs_opfs_profile_drain_test_arm_after_seal(void) {
+  int expected = 0;
+  assert(profileDrainAfterSealTestState.compare_exchange_strong(expected, 1));
+}
+
+extern "C" int wasmfs_opfs_profile_drain_test_after_seal_state(void) {
+  return profileDrainAfterSealTestState.load();
+}
+
+extern "C" void wasmfs_opfs_profile_drain_test_continue_after_seal(void) {
+  int expected = 2;
+  assert(profileDrainAfterSealTestState.compare_exchange_strong(expected, 3));
+}
+
+extern "C" void wasmfs_opfs_profile_drain_test_arm_file_operation(void) {
+  int expected = 0;
+  assert(profileDrainFileOperationTestState.compare_exchange_strong(expected,
+                                                                      1));
+}
+
+extern "C" int wasmfs_opfs_profile_drain_test_file_operation_state(void) {
+  return profileDrainFileOperationTestState.load();
+}
+
+extern "C" void wasmfs_opfs_profile_drain_test_continue_file_operation(void) {
+  int expected = 2;
+  assert(profileDrainFileOperationTestState.compare_exchange_strong(expected,
+                                                                      3));
+}
+
+extern "C" void wasmfs_opfs_profile_drain_test_maybe_block_file_operation() {
+  pauseProfileDrainFileOperationForTesting();
+}
+
+extern "C" void wasmfs_opfs_profile_drain_test_reset_sealing(void) {
+  profileDrainSealingTestState.store(0);
+}
+
+extern "C" void wasmfs_opfs_profile_drain_test_note_sealing(void) {
+  profileDrainSealingTestState.store(1);
+}
+
+extern "C" int wasmfs_opfs_profile_drain_test_sealing_state(void) {
+  return profileDrainSealingTestState.load();
+}
+#endif
+
 thread_local WasmFS* WasmFS::activeOperationWasmFS = nullptr;
 thread_local size_t WasmFS::activeOperationDepth = 0;
-thread_local WasmFS* WasmFS::terminalStdioFlushWasmFS = nullptr;
+thread_local WasmFS::Operation* WasmFS::activeOperationRoot = nullptr;
+thread_local WasmFS* WasmFS::stdioFlushWasmFS = nullptr;
+thread_local backend_t WasmFS::stdioFlushBackend = NullBackend;
 
 #ifdef WASMFS_CASE_INSENSITIVE
 backend_t createIgnoreCaseBackend(std::function<backend_t()> createBackend);
@@ -69,16 +162,28 @@ __attribute__((init_priority(100))) WasmFS wasmFS;
 
 WasmFS::Operation::Operation(WasmFS& wasmfs, Kind kind) : wasmfs(&wasmfs) {
   // fflush(NULL) reaches the descriptor table through __wasi_fd_write(). It
-  // must be able to finish buffered FILE output after the terminal fence is
-  // closed, but that exception must not become a general same-thread bypass:
-  // in particular, a fopencookie callback cannot create a backend or open
-  // another file while its stream is being flushed. Only the fd-write
-  // entrypoint opts into this uncounted, drain-thread-local admission. A
-  // direct write from a custom callback is not distinguishable at this ABI, so
-  // the public contract requires custom callbacks to make no WasmFS calls.
-  if (kind == Kind::StdioFlushWrite &&
-      terminalStdioFlushWasmFS == &wasmfs) {
+  // must be able to finish buffered FILE output after a drain fence closes,
+  // but that exception must not become a broad same-thread Operation: a
+  // fopencookie callback must not be able to inherit it to open paths or
+  // create backends. The special entrypoint later admits only its existing fd
+  // backend. A direct custom-callback write remains ABI-indistinguishable from
+  // libc's write and is documented as unsupported by the drain contract.
+  if (stdioFlushWasmFS == &wasmfs) {
+    if (kind != Kind::StdioFlushWrite) {
+      error = ESHUTDOWN;
+      return;
+    }
     admitted = true;
+    // A libc callback can itself issue a second direct fd write while the
+    // first special write is live. Share its narrowly scoped token rather
+    // than replacing the root and accidentally clearing it on the inner
+    // return. No General operation may use this route.
+    if (activeOperationRoot) {
+      rootOperation = activeOperationRoot;
+      return;
+    }
+    stdioFlushBypass = true;
+    activeOperationRoot = this;
     return;
   }
 
@@ -89,6 +194,7 @@ WasmFS::Operation::Operation(WasmFS& wasmfs, Kind kind) : wasmfs(&wasmfs) {
     ++activeOperationDepth;
     admitted = true;
     tracksDepth = true;
+    rootOperation = activeOperationRoot;
     return;
   }
 
@@ -107,13 +213,27 @@ WasmFS::Operation::Operation(WasmFS& wasmfs, Kind kind) : wasmfs(&wasmfs) {
   ++wasmfs.activeOperations;
   activeOperationWasmFS = &wasmfs;
   activeOperationDepth = 1;
+  activeOperationRoot = this;
   admitted = true;
   tracksDepth = true;
   ownsActiveOperation = true;
 }
 
 WasmFS::Operation::~Operation() {
-  if (!admitted || !tracksDepth) {
+  if (!admitted) {
+    return;
+  }
+
+  if (stdioFlushBypass) {
+    for (auto backend : admittedBackends) {
+      backend->releaseProfileOperation();
+    }
+    assert(activeOperationRoot == this);
+    activeOperationRoot = nullptr;
+    return;
+  }
+
+  if (!tracksDepth) {
     return;
   }
   assert(activeOperationWasmFS == wasmfs);
@@ -123,6 +243,11 @@ WasmFS::Operation::~Operation() {
   }
 
   assert(ownsActiveOperation);
+  for (auto backend : admittedBackends) {
+    backend->releaseProfileOperation();
+  }
+  assert(activeOperationRoot == this);
+  activeOperationRoot = nullptr;
   activeOperationWasmFS = nullptr;
   std::unique_lock<std::mutex> lock(wasmfs->operationMutex);
   assert(wasmfs->activeOperations > 0);
@@ -130,6 +255,76 @@ WasmFS::Operation::~Operation() {
   if (wasmfs->activeOperations == 0) {
     wasmfs->operationCV.notify_all();
   }
+}
+
+int WasmFS::Operation::admitBackend(backend_t backend) {
+  if (!backend) {
+    return 0;
+  }
+  if (!admitted) {
+    return error ? -error : -EDEADLK;
+  }
+  if (rootOperation) {
+    return rootOperation->admitBackend(backend);
+  }
+
+  // A terminal drain accepts all direct libc fd writes while its global fence
+  // is active. A scoped profile drain accepts that bypass only for its exact
+  // sealed backend; unrelated existing descriptors retain their ordinary
+  // backend admission without turning this into a reentrant outer operation.
+  if (stdioFlushBypass &&
+      (stdioFlushBackend == NullBackend || backend == stdioFlushBackend)) {
+    return 0;
+  }
+
+  if (std::find(admittedBackends.begin(), admittedBackends.end(), backend) !=
+      admittedBackends.end()) {
+    return 0;
+  }
+  if (int err = backend->acquireProfileOperation()) {
+    return err;
+  }
+  admittedBackends.push_back(backend);
+  return 0;
+}
+
+int WasmFS::admitBackend(backend_t backend) {
+  if (!backend) {
+    return 0;
+  }
+  if (!activeOperationRoot) {
+    return -EDEADLK;
+  }
+  return activeOperationRoot->admitBackend(backend);
+}
+
+bool WasmFS::ownsBackend(backend_t backend) {
+  if (!backend) {
+    return false;
+  }
+  const std::lock_guard<std::mutex> lock(mutex);
+  return std::any_of(backendTable.begin(), backendTable.end(), [&](auto& item) {
+    return item.get() == backend;
+  });
+}
+
+int WasmFS::beginScopedOPFSProfileDrain() {
+  std::unique_lock<std::mutex> lock(operationMutex);
+  if (terminalState != TerminalState::Running) {
+    return terminalState == TerminalState::Draining ? -EBUSY : -ESHUTDOWN;
+  }
+  if (scopedProfileDrainInProgress) {
+    return -EBUSY;
+  }
+  scopedProfileDrainInProgress = true;
+  return 0;
+}
+
+void WasmFS::endScopedOPFSProfileDrain() {
+  std::unique_lock<std::mutex> lock(operationMutex);
+  assert(scopedProfileDrainInProgress);
+  scopedProfileDrainInProgress = false;
+  operationCV.notify_all();
 }
 
 backend_t WasmFS::addBackend(std::unique_ptr<Backend> backend) {
@@ -185,6 +380,22 @@ void recordDrainError(wasmfs_terminal_drain_result& result,
                       int error,
                       uint32_t& counter) {
   ++counter;
+  if (result.error == 0) {
+    result.error = normalizeDrainError(error);
+  }
+}
+
+void recordProfileDrainError(wasmfs_opfs_profile_drain_result& result,
+                             int error,
+                             uint32_t& counter) {
+  ++counter;
+  if (result.error == 0) {
+    result.error = normalizeDrainError(error);
+  }
+}
+
+void setProfileDrainError(wasmfs_opfs_profile_drain_result& result,
+                          int error) {
   if (result.error == 0) {
     result.error = normalizeDrainError(error);
   }
@@ -249,6 +460,9 @@ int WasmFS::terminalDrain(wasmfs_terminal_drain_result* result) {
 
   {
     std::unique_lock<std::mutex> lock(operationMutex);
+    if (scopedProfileDrainInProgress) {
+      return -EBUSY;
+    }
     if (terminalState == TerminalState::Draining) {
       return -EBUSY;
     }
@@ -263,16 +477,17 @@ int WasmFS::terminalDrain(wasmfs_terminal_drain_result* result) {
   // direct fd output from libc's flush sequence on this thread. No other
   // public WasmFS operation can enter now, including a backend factory called
   // by a custom fopencookie callback.
-  assert(!terminalStdioFlushWasmFS);
-  terminalStdioFlushWasmFS = this;
+  assert(!stdioFlushWasmFS);
+  assert(stdioFlushBackend == NullBackend);
+  stdioFlushWasmFS = this;
   errno = 0;
   if (fflush(nullptr) == EOF) {
     recordDrainError(*result,
                      errno ? -errno : -EIO,
                      result->libc_flush_failed);
   }
-  assert(terminalStdioFlushWasmFS == this);
-  terminalStdioFlushWasmFS = nullptr;
+  assert(stdioFlushWasmFS == this);
+  stdioFlushWasmFS = nullptr;
 
   std::vector<std::shared_ptr<DataFile>> closees;
   {
@@ -338,9 +553,122 @@ int WasmFS::terminalDrain(wasmfs_terminal_drain_result* result) {
   return result->error;
 }
 
+int WasmFS::drainOPFSProfileBackend(
+  backend_t backend, wasmfs_opfs_profile_drain_result* result) {
+  if (!result) {
+    return -EINVAL;
+  }
+  *result = {};
+
+  auto returnError = [&](int error) {
+    setProfileDrainError(*result, error);
+    return result->error;
+  };
+
+  if (!backend) {
+    return returnError(-EINVAL);
+  }
+  // Do not dereference an arbitrary opaque pointer. A caller may retain only
+  // a backend returned by this WasmFS instance, and an unowned pointer is not
+  // a candidate for the leased-OPFS protocol.
+  if (!ownsBackend(backend) || !backend->isLeasedOPFSProfileBackend()) {
+    return returnError(-ENOTSUP);
+  }
+  if (emscripten_is_main_runtime_thread()) {
+    return returnError(-EAGAIN);
+  }
+  // Waiting for an outer operation that is itself waiting for this call would
+  // deadlock. The special fflush write operation is only ever nested inside a
+  // drain that has already passed this check.
+  if (activeOperationWasmFS || activeOperationRoot) {
+    return returnError(-EDEADLK);
+  }
+
+  if (int error = beginScopedOPFSProfileDrain()) {
+    return returnError(error);
+  }
+
+  int beginError = backend->beginOPFSProfileDrain();
+  if (beginError) {
+    endScopedOPFSProfileDrain();
+    return returnError(beginError);
+  }
+  result->backend_sealed = 1;
+
+#ifdef WASMFS_OPFS_PROFILE_DRAIN_TEST
+  pauseProfileDrainAfterSealForTesting();
+#endif
+
+  // A close that failed before this drain has already removed its descriptor,
+  // so snapshot it before this drain's own close attempts. It blocks release
+  // but is not double-counted if a later close in this drain also fails.
+  if (int error = backend->getOPFSProfilePriorCloseError()) {
+    recordProfileDrainError(*result, error, result->prior_close_failures);
+  }
+
+  // Do not create a normal outer Operation around fflush: a custom stream
+  // callback would inherit it and gain broad reentrant path/factory access.
+  // Only __wasi_fd_write receives the narrow special admission below, and it
+  // may bypass the sealed backend only for an already-open target descriptor.
+  assert(!stdioFlushWasmFS);
+  assert(stdioFlushBackend == NullBackend);
+  stdioFlushWasmFS = this;
+  stdioFlushBackend = backend;
+  errno = 0;
+  if (fflush(nullptr) == EOF) {
+    recordProfileDrainError(*result,
+                            errno ? -errno : -EIO,
+                            result->libc_flush_failed);
+  }
+  assert(stdioFlushWasmFS == this);
+  assert(stdioFlushBackend == backend);
+  stdioFlushBackend = NullBackend;
+  stdioFlushWasmFS = nullptr;
+
+  std::vector<std::shared_ptr<DataFile>> closees;
+  {
+    // Detach aliases while the table is locked, then flush/close after
+    // releasing it because an OPFS close can synchronously proxy to JS.
+    auto fileTable = getFileTable().locked();
+    closees = fileTable.detachBackend(backend, result->detached_descriptors);
+  }
+
+  result->data_file_states = static_cast<uint32_t>(closees.size());
+  for (auto& closee : closees) {
+    auto file = closee->locked();
+    if (int error = file.flush()) {
+      recordProfileDrainError(*result, error, result->data_flush_failures);
+    }
+    if (int error = file.close()) {
+      recordProfileDrainError(*result, error, result->data_close_failures);
+    }
+  }
+
+  // The backend decides whether its synchronous lease release succeeded. It
+  // receives false after any earlier observable failure and permanently keeps
+  // the lease in that case. A failed release is separately observable.
+  if (int error = backend->finishOPFSProfileDrain(result->error == 0)) {
+    recordProfileDrainError(*result, error, result->lease_release_failures);
+  } else if (result->error == 0) {
+    result->lease_released = 1;
+  }
+
+  endScopedOPFSProfileDrain();
+  return result->error;
+}
+
 extern "C" int wasmfs_terminal_drain(
   wasmfs_terminal_drain_result* result) {
   return wasmFS.terminalDrain(result);
+}
+
+extern "C" int wasmfs_drain_opfs_profile_backend(
+  ::backend_t backend, wasmfs_opfs_profile_drain_result* result) {
+  // The public C opaque pointer and WasmFS's C++ backend_t have intentionally
+  // distinct declarations. They are ABI-identical opaque pointers, but keep
+  // the conversion at this C bridge rather than exposing C types internally.
+  return wasmFS.drainOPFSProfileBackend(
+    reinterpret_cast<wasmfs::backend_t>(backend), result);
 }
 
 WasmFS::~WasmFS() {
@@ -408,6 +736,13 @@ std::shared_ptr<Directory> WasmFS::initRootDirectory() {
 // wasmFS$preloadedFiles from JS. This function will be called before any file
 // operation to ensure any preloaded files are eagerly available for use.
 void WasmFS::preloadFiles() {
+  // Preload hooks use the same path helpers as public entrypoints, including
+  // their backend admission checks. Keep the initialization work explicitly
+  // inside one internal operation so it cannot be mistaken for an unadmitted
+  // direct backend access.
+  Operation operation(*this);
+  assert(operation);
+
   // Debug builds only: add check to ensure preloadFiles() is called once.
 #ifndef NDEBUG
   static std::atomic<int> timesCalled;

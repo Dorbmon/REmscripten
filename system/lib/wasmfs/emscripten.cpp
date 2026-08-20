@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <stdio.h>
 
+#include <optional>
 #include <string>
 
 #include "file.h"
@@ -26,15 +27,20 @@ namespace wasmfs {
 // Given an fd, returns the string path that the fd refers to.
 // TODO: full error handling
 // TODO: maybe make this a public API, as it is useful for debugging
-std::string getPath(int fd) {
+std::optional<std::string> getPath(int fd) {
   auto fileTable = wasmfs::wasmFS.getFileTable().locked();
 
   auto openFile = fileTable.getEntry(fd);
   if (!openFile) {
-    return "!";
+    errno = EBADF;
+    return std::nullopt;
   }
 
   auto curr = openFile->locked().getFile();
+  if (int err = wasmfs::wasmFS.admitBackend(curr->getBackend())) {
+    errno = -err;
+    return std::nullopt;
+  }
   std::string result = "";
   while (curr != wasmfs::wasmFS.getRootDirectory()) {
     auto parent = curr->locked().getParent();
@@ -42,6 +48,11 @@ std::string getPath(int fd) {
     // unlinked.
     if (!parent) {
       return "?/" + result;
+    }
+
+    if (int err = wasmfs::wasmFS.admitBackend(parent->getBackend())) {
+      errno = -err;
+      return std::nullopt;
     }
 
     auto parentDir = parent->dynCast<wasmfs::Directory>();
@@ -73,7 +84,10 @@ char* emscripten_get_preloaded_image_data_from_FILE(FILE* file,
   }
 
   auto path = wasmfs::getPath(fd);
-  return emscripten_get_preloaded_image_data(path.c_str(), w, h);
+  if (!path) {
+    return nullptr;
+  }
+  return emscripten_get_preloaded_image_data(path->c_str(), w, h);
 }
 
 } // extern "C"

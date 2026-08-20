@@ -13395,6 +13395,17 @@ Module.postRun = () => {{
         'wasmfs/wasmfs_terminal_drain_runtime_main.c', 'success',
         cflags=['-sEXIT_RUNTIME'])
 
+  @requires_pthreads
+  def test_wasmfs_opfs_profile_drain_unit(self):
+    # This is a nonbrowser FileTable/admission unit. Browser coverage for the
+    # real leased OPFS worker and Web Lock handoff is in test_browser.py.
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf(
+        'wasmfs/wasmfs_opfs_profile_drain_unit.cpp', 'success',
+        cflags=['-pthread', '-sPROXY_TO_PTHREAD', '-sPTHREAD_POOL_SIZE=3',
+                '-sEXIT_RUNTIME', '-D_GNU_SOURCE'])
+
   @parameterized({
     '': ([],),
     'pthreads_release': (['-O3', '-sASSERTIONS=0', '-pthread',

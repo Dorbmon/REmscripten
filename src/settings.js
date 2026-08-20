@@ -1833,6 +1833,12 @@ var WASMFS = false;
 // [link]
 var WASMFS_RECORD_LOCK_TEST = 0;
 
+// Test-only selector for deterministic scoped leased-OPFS drain races. This
+// emits internal C++ synchronization hooks only; it provides no production
+// header, JavaScript, or runtime configuration API.
+// [link]
+var WASMFS_OPFS_PROFILE_DRAIN_TEST = 0;
+
 // Test-only selector for a controlled interruption of the OPFS move proxy
 // callback.  0 disables the hook, 1 pauses immediately before the browser
 // `FileSystemFileHandle.move()` call, and 2 pauses immediately after that call
@@ -1846,6 +1852,12 @@ var WASMFS_OPFS_TEST_MOVE_INTERRUPT = 0;
 // runtime configuration or recovery API.
 // [link]
 var WASMFS_OPFS_TEST_CLOSE_FAILURE = 0;
+
+// Test-only selector that makes a scoped leased-OPFS release acknowledgement
+// fail before the browser Web Lock release request. This controls code emitted
+// at link time only; it intentionally provides no runtime recovery API.
+// [link]
+var WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE = 0;
 
 // Test-only selector that traces OPFS FileSystemFileHandle allocation and
 // release in the dedicated ProxyWorker. This controls code emitted at link

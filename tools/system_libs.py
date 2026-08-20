@@ -2029,6 +2029,7 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
   def __init__(self, **kwargs):
     self.ignore_case = kwargs.pop('ignore_case')
     self.record_lock_test = kwargs.pop('record_lock_test')
+    self.opfs_profile_drain_test = kwargs.pop('opfs_profile_drain_test')
     super().__init__(**kwargs)
 
   def get_cflags(self):
@@ -2037,6 +2038,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       cflags += ['-DWASMFS_CASE_INSENSITIVE']
     if self.record_lock_test:
       cflags += ['-DWASMFS_RECORD_LOCK_TEST']
+    if self.opfs_profile_drain_test:
+      cflags += ['-DWASMFS_OPFS_PROFILE_DRAIN_TEST']
     return cflags
 
   def get_base_name(self):
@@ -2045,17 +2048,21 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       name += '-icase'
     if self.record_lock_test:
       name += '-record-lock-test'
+    if self.opfs_profile_drain_test:
+      name += '-opfs-profile-drain-test'
     return name
 
   @classmethod
   def vary_on(cls):
-    return super().vary_on() + ['ignore_case', 'record_lock_test']
+    return super().vary_on() + [
+      'ignore_case', 'record_lock_test', 'opfs_profile_drain_test']
 
   @classmethod
   def get_default_variation(cls, **kwargs):
     return super().get_default_variation(
         ignore_case=settings.CASE_INSENSITIVE_FS,
         record_lock_test=settings.WASMFS_RECORD_LOCK_TEST,
+        opfs_profile_drain_test=settings.WASMFS_OPFS_PROFILE_DRAIN_TEST,
         **kwargs)
 
   def get_files(self):

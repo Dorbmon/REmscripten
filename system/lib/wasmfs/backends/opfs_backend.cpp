@@ -4,7 +4,9 @@
 // found in the LICENSE file.
 
 #include <emscripten/threading.h>
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <errno.h>
 #include <memory>
 #include <mutex>
@@ -12,6 +14,7 @@
 
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "backend.h"
 #include "file.h"
@@ -26,6 +29,11 @@ namespace {
 
 using ProxyWorker = emscripten::ProxyWorker;
 using ProxyingQueue = emscripten::ProxyingQueue;
+
+#ifdef WASMFS_OPFS_PROFILE_DRAIN_TEST
+extern "C" void wasmfs_opfs_profile_drain_test_maybe_block_file_operation();
+extern "C" void wasmfs_opfs_profile_drain_test_note_sealing();
+#endif
 
 constexpr size_t kMaxProfileLeaseNameLength = 128;
 // HandleAllocator reserves ID 0. The OPFS root is initialized in slot 1 and
@@ -93,6 +101,202 @@ public:
 
   int getFailedAccessCloseError() const { return firstError.load(); }
 };
+
+// The cooperative profile lease is an explicit admission domain, separate
+// from ordinary OPFS. Public WasmFS operations hold an external token from
+// discovery of a leased file/directory until their outer syscall returns. A
+// scoped drain flips Active to Sealing before waiting for those tokens. File
+// wrappers share this state as a second line of defense for direct backend
+// work; only the drain thread may use their internal operations while sealed.
+class ProfileLeaseState {
+public:
+  enum class State { Unleased, Active, Sealing, Released, Failed };
+
+  class InternalOperation {
+    ProfileLeaseState& state;
+    bool tracked = false;
+    int error = 0;
+
+  public:
+    explicit InternalOperation(ProfileLeaseState& state) : state(state) {
+      std::unique_lock<std::mutex> lock(state.mutex);
+      if (state.state == State::Unleased) {
+        return;
+      }
+      if (state.state == State::Active) {
+        ++state.activeOperations;
+        tracked = true;
+        return;
+      }
+      // An outer public operation that acquired an external token before the
+      // state changed to Sealing is already admitted. It must be able to
+      // reach its later virtual-file operation while beginDrain() waits for
+      // that token to be released. New operations have no such TLS ownership
+      // and remain rejected; the drain thread is the other narrow exception.
+      if (state.state == State::Sealing &&
+          (drainState == &state || state.currentThreadOwnsExternalOperation())) {
+        return;
+      }
+      error = -ESHUTDOWN;
+    }
+
+    InternalOperation(const InternalOperation&) = delete;
+    InternalOperation& operator=(const InternalOperation&) = delete;
+
+    ~InternalOperation() {
+      if (tracked) {
+        state.releaseOperation();
+      }
+    }
+
+    explicit operator bool() const { return error == 0; }
+    int getError() const { return error; }
+  };
+
+private:
+  mutable std::mutex mutex;
+  std::condition_variable operationCV;
+  State state = State::Unleased;
+  size_t activeOperations = 0;
+
+  static thread_local ProfileLeaseState* drainState;
+  // One outer WasmFS operation holds at most one deduplicated token for a
+  // backend, but use a vector rather than a boolean to remain correct if an
+  // internal user holds nested tokens on one thread. This TLS ownership is
+  // deliberately not a general reentrancy grant: it only keeps work admitted
+  // before the Sealing transition alive until its outer operation returns.
+  static thread_local std::vector<ProfileLeaseState*> externalStates;
+
+  bool currentThreadOwnsExternalOperation() const {
+    return std::find(externalStates.begin(), externalStates.end(), this) !=
+           externalStates.end();
+  }
+
+  void releaseOperation() {
+    std::unique_lock<std::mutex> lock(mutex);
+    assert(activeOperations > 0);
+    --activeOperations;
+    if (activeOperations == 0) {
+      operationCV.notify_all();
+    }
+  }
+
+public:
+  void acquiredLease() {
+    std::unique_lock<std::mutex> lock(mutex);
+    assert(state == State::Unleased);
+    state = State::Active;
+  }
+
+  int acquireExternalOperation() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (state == State::Unleased) {
+      return 0;
+    }
+    if (state != State::Active) {
+      return -ESHUTDOWN;
+    }
+    ++activeOperations;
+    externalStates.push_back(this);
+    return 0;
+  }
+
+  void releaseExternalOperation() {
+    std::unique_lock<std::mutex> lock(mutex);
+    // Unleased OPFS uses the Backend default no-op admission semantics. The
+    // generic outer WasmFS operation still records the backend pointer, so
+    // its later release must remain a no-op in this state.
+    if (state == State::Unleased) {
+      return;
+    }
+    auto external =
+      std::find(externalStates.begin(), externalStates.end(), this);
+    assert(external != externalStates.end());
+    externalStates.erase(external);
+    assert(activeOperations > 0);
+    --activeOperations;
+    if (activeOperations == 0) {
+      operationCV.notify_all();
+    }
+  }
+
+  bool isLeasedProfileBackend() const {
+    std::unique_lock<std::mutex> lock(mutex);
+    return state != State::Unleased;
+  }
+
+  bool supportsRecordLocks() const {
+    std::unique_lock<std::mutex> lock(mutex);
+    // A fcntl operation which acquired an external token before sealing must
+    // finish under the same continuity rule as its eventual OPFS virtual
+    // call. New fcntl operations cannot reach this check after sealing:
+    // syscall admission rejects them before record-lock inspection.
+    return state == State::Active ||
+           (state == State::Sealing && currentThreadOwnsExternalOperation());
+  }
+
+  bool hasLiveLease() const {
+    std::unique_lock<std::mutex> lock(mutex);
+    return state == State::Active || state == State::Sealing ||
+           state == State::Failed;
+  }
+
+  bool hasFailedDrain() const {
+    std::unique_lock<std::mutex> lock(mutex);
+    return state == State::Failed;
+  }
+
+  int beginDrain() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (state == State::Unleased) {
+      return -ENOTSUP;
+    }
+    if (state == State::Sealing) {
+      return -EBUSY;
+    }
+    if (state == State::Released || state == State::Failed) {
+      return -ESHUTDOWN;
+    }
+    state = State::Sealing;
+#ifdef WASMFS_OPFS_PROFILE_DRAIN_TEST
+    wasmfs_opfs_profile_drain_test_note_sealing();
+#endif
+    operationCV.wait(lock, [&] { return activeOperations == 0; });
+    assert(!drainState);
+    drainState = this;
+    return 0;
+  }
+
+  int finishDrain(bool success, Worker& proxy) {
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      assert(drainState == this);
+      if (state != State::Sealing) {
+        drainState = nullptr;
+        return -ESHUTDOWN;
+      }
+      if (!success) {
+        state = State::Failed;
+        drainState = nullptr;
+        return 0;
+      }
+    }
+
+    int err = 0;
+    proxy([&](auto ctx) {
+      _wasmfs_opfs_release_profile_lease(ctx.ctx, &err);
+    });
+
+    std::unique_lock<std::mutex> lock(mutex);
+    assert(drainState == this);
+    state = err == 0 ? State::Released : State::Failed;
+    drainState = nullptr;
+    return err;
+  }
+};
+
+thread_local ProfileLeaseState* ProfileLeaseState::drainState = nullptr;
+thread_local std::vector<ProfileLeaseState*> ProfileLeaseState::externalStates;
 
 class OpenState {
 public:
@@ -212,6 +416,7 @@ class OPFSFile : public DataFile {
   std::string name;
   OpenState state;
   std::shared_ptr<TerminalCloseState> terminalCloseState;
+  std::shared_ptr<ProfileLeaseState> profileLeaseState;
 
   // The File mutex protects the open state, JS file-handle ID, and locator.
   // Keep the locator locally rather than deriving it from Directory::getName:
@@ -259,9 +464,11 @@ public:
            int parentID,
            std::string name,
            Worker& proxy,
-           std::shared_ptr<TerminalCloseState> terminalCloseState)
+           std::shared_ptr<TerminalCloseState> terminalCloseState,
+           std::shared_ptr<ProfileLeaseState> profileLeaseState)
     : DataFile(mode, backend), proxy(proxy), parentID(parentID),
-      name(std::move(name)), terminalCloseState(std::move(terminalCloseState)) {}
+      name(std::move(name)), terminalCloseState(std::move(terminalCloseState)),
+      profileLeaseState(std::move(profileLeaseState)) {}
 
   ~OPFSFile() override {
     // A rejected AccessHandle close remains intentionally quarantined in the
@@ -276,6 +483,10 @@ public:
 
   int moveTo(int newParentID, const std::string& newName) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     if (state.getKind() == OpenState::FailedAccessClose) {
       return -EIO;
     }
@@ -303,6 +514,10 @@ public:
 
 private:
   off_t getSize() override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     off_t size;
     switch (state.getKind()) {
       case OpenState::None: {
@@ -332,6 +547,10 @@ private:
   }
 
   int setSize(off_t size) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     int err = 0;
     switch (state.getKind()) {
       case OpenState::Access:
@@ -367,6 +586,10 @@ private:
   }
 
   int open(oflags_t flags) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     if (state.getKind() == OpenState::FailedAccessClose) {
       return -EIO;
     }
@@ -380,6 +603,10 @@ private:
   }
 
   int close() override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     int err = state.close(proxy);
     if (err) {
       // __wasi_fd_close has already removed this descriptor's OpenFileState
@@ -396,6 +623,10 @@ private:
   }
 
   ssize_t read(uint8_t* buf, size_t len, off_t offset) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     // TODO: use an i64 here.
     int32_t nread;
     switch (state.getKind()) {
@@ -421,6 +652,13 @@ private:
   }
 
   ssize_t write(const uint8_t* buf, size_t len, off_t offset) override {
+#ifdef WASMFS_OPFS_PROFILE_DRAIN_TEST
+    wasmfs_opfs_profile_drain_test_maybe_block_file_operation();
+#endif
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     if (state.getKind() == OpenState::FailedAccessClose) {
       return -EIO;
     }
@@ -435,6 +673,10 @@ private:
   }
 
   int flush() override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     int err = 0;
     switch (state.getKind()) {
       case OpenState::Access:
@@ -460,14 +702,17 @@ public:
   // The ID of this directory in the JS library.
   int dirID = 0;
   std::shared_ptr<TerminalCloseState> terminalCloseState;
+  std::shared_ptr<ProfileLeaseState> profileLeaseState;
 
   OPFSDirectory(mode_t mode,
                 backend_t backend,
                 int dirID,
                 Worker& proxy,
-                std::shared_ptr<TerminalCloseState> terminalCloseState)
+                std::shared_ptr<TerminalCloseState> terminalCloseState,
+                std::shared_ptr<ProfileLeaseState> profileLeaseState)
     : Directory(mode, backend), proxy(proxy), dirID(dirID),
-      terminalCloseState(std::move(terminalCloseState)) {}
+      terminalCloseState(std::move(terminalCloseState)),
+      profileLeaseState(std::move(profileLeaseState)) {}
 
   ~OPFSDirectory() override {
     // The root handle is shared by all mounts of this backend, so only child
@@ -478,7 +723,19 @@ public:
   }
 
 private:
+  off_t getSize() override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    return Directory::getSize();
+  }
+
   std::shared_ptr<File> getChild(const std::string& name) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return nullptr;
+    }
     int childType = 0, childID = 0;
     proxy([&](auto ctx) {
       _wasmfs_opfs_get_child(
@@ -490,10 +747,21 @@ private:
     }
     if (childType == 1) {
       return std::make_shared<OPFSFile>(
-        0777, getBackend(), dirID, name, proxy, terminalCloseState);
+        0777,
+        getBackend(),
+        dirID,
+        name,
+        proxy,
+        terminalCloseState,
+        profileLeaseState);
     } else if (childType == 2) {
       return std::make_shared<OPFSDirectory>(
-        0777, getBackend(), childID, proxy, terminalCloseState);
+        0777,
+        getBackend(),
+        childID,
+        proxy,
+        terminalCloseState,
+        profileLeaseState);
     } else {
       WASMFS_UNREACHABLE("Unexpected child type");
     }
@@ -501,6 +769,10 @@ private:
 
   std::shared_ptr<DataFile> insertDataFile(const std::string& name,
                                            mode_t mode) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return nullptr;
+    }
     int childID = 0;
     proxy([&](auto ctx) {
       _wasmfs_opfs_insert_file(ctx.ctx, dirID, name.c_str(), &childID);
@@ -510,11 +782,21 @@ private:
       return nullptr;
     }
     return std::make_shared<OPFSFile>(
-      mode, getBackend(), dirID, name, proxy, terminalCloseState);
+      mode,
+      getBackend(),
+      dirID,
+      name,
+      proxy,
+      terminalCloseState,
+      profileLeaseState);
   }
 
   std::shared_ptr<Directory> insertDirectory(const std::string& name,
                                              mode_t mode) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return nullptr;
+    }
     int childID = 0;
     proxy([&](auto ctx) {
       _wasmfs_opfs_insert_directory(ctx.ctx, dirID, name.c_str(), &childID);
@@ -524,7 +806,12 @@ private:
       return nullptr;
     }
     return std::make_shared<OPFSDirectory>(
-      mode, getBackend(), childID, proxy, terminalCloseState);
+      mode,
+      getBackend(),
+      childID,
+      proxy,
+      terminalCloseState,
+      profileLeaseState);
   }
 
   std::shared_ptr<Symlink> insertSymlink(const std::string& name,
@@ -535,6 +822,10 @@ private:
   }
 
   int insertMove(const std::string& name, std::shared_ptr<File> file) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     if (file->is<DataFile>()) {
       auto opfsFile = std::static_pointer_cast<OPFSFile>(file);
       return opfsFile->moveTo(dirID, name);
@@ -547,6 +838,10 @@ private:
   }
 
   int removeChild(const std::string& name) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     int err = 0;
     proxy([&](auto ctx) {
       _wasmfs_opfs_remove_child(ctx.ctx, dirID, name.c_str(), &err);
@@ -555,6 +850,10 @@ private:
   }
 
   ssize_t getNumEntries() override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
     auto entries = getEntries();
     if (int err = entries.getError()) {
       return err;
@@ -563,6 +862,10 @@ private:
   }
 
   Directory::MaybeEntries getEntries() override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return {operation.getError()};
+    }
     std::vector<Directory::Entry> entries;
     int err = 0;
     proxy([&](auto ctx) {
@@ -586,7 +889,31 @@ public:
     // A default OPFS backend has no cross-instance lock domain. A successful
     // record lock is safe only after this backend has acquired the cooperative
     // storage-bucket profile lease.
-    return profileLeaseHeld;
+    return profileLeaseState->supportsRecordLocks();
+  }
+
+  int acquireProfileOperation() override {
+    return profileLeaseState->acquireExternalOperation();
+  }
+
+  void releaseProfileOperation() override {
+    profileLeaseState->releaseExternalOperation();
+  }
+
+  bool isLeasedOPFSProfileBackend() const override {
+    return profileLeaseState->isLeasedProfileBackend();
+  }
+
+  int beginOPFSProfileDrain() override {
+    return profileLeaseState->beginDrain();
+  }
+
+  int finishOPFSProfileDrain(bool success) override {
+    return profileLeaseState->finishDrain(success, proxy);
+  }
+
+  int getOPFSProfilePriorCloseError() const override {
+    return terminalCloseState->getFailedAccessCloseError();
   }
 
   int terminalDrainFinished(bool success) override {
@@ -595,9 +922,25 @@ public:
     // through the backend-finalizer counter. A close that failed before drain
     // begins is different: it is absent from FileTable and must be surfaced by
     // the backend latch below while `success` is still true.
-    if (!success) {
-      terminalDrainFailed = true;
+    if (!profileLeaseState->hasLiveLease()) {
       return 0;
+    }
+
+    int beginError = profileLeaseState->beginDrain();
+    // A scoped profile drain already sealed this backend. It either released
+    // the lease or deliberately retained it in Failed state; global terminal
+    // teardown must never retry that ambiguous release. Do still surface the
+    // failed scoped handoff: returning success here would hide a live profile
+    // lease behind an apparently successful terminal result.
+    if (beginError == -ESHUTDOWN) {
+      return profileLeaseState->hasFailedDrain() ? -ESHUTDOWN : 0;
+    }
+    if (beginError) {
+      return beginError;
+    }
+
+    if (!success) {
+      return profileLeaseState->finishDrain(false, proxy);
     }
 
     if (int error = terminalCloseState->getFailedAccessCloseError()) {
@@ -605,50 +948,24 @@ public:
       // its descriptor has already left FileTable. Surface that terminal
       // resource failure and retain any cooperative lease rather than treating
       // an empty table as a safe browser-side handoff.
-      terminalDrainFailed = true;
+      (void)profileLeaseState->finishDrain(false, proxy);
       return error;
     }
 
-    if (!profileLeaseHeld) {
-      return 0;
-    }
-
-    int err = 0;
-    proxy([&](auto ctx) {
-      _wasmfs_opfs_release_profile_lease(ctx.ctx, &err);
-    });
-    if (err) {
-      // Do not retry an ambiguous Web Locks release from the destructor. The
-      // result-bearing terminal drain reports this error to its caller and
-      // leaves the browser-side lease live until context teardown.
-      terminalDrainFailed = true;
-      return err;
-    }
-
-    // A synchronous successful release is now part of the terminal-drain
-    // result. Do not release it again during object destruction.
-    profileLeaseHeld = false;
-    return 0;
+    return profileLeaseState->finishDrain(true, proxy);
   }
 
-  bool releasesTerminalLease() const override { return profileLeaseHeld; }
+  bool releasesTerminalLease() const override {
+    return profileLeaseState->hasLiveLease();
+  }
 
   ~OPFSBackend() override {
-    // A failed terminal drain has detached every descriptor but leaves a
-    // browser-side close result ambiguous. Do not explicitly release the
-    // cooperative lease in that state. Destruction of the worker context can
-    // still make the browser release Web Locks; that is not a durability
-    // acknowledgement and is documented by wasmfs_terminal_drain().
-    if (!profileLeaseHeld || terminalDrainFailed ||
-        terminalCloseState->getFailedAccessCloseError()) {
-      return;
-    }
-
-    int err = 0;
-    proxy([&](auto ctx) {
-      _wasmfs_opfs_release_profile_lease(ctx.ctx, &err);
-    });
-    assert(err == 0 && "Failed to release OPFS profile lease");
+    // Only an explicit, successful terminal or scoped profile drain may
+    // acknowledge release of a cooperative profile lease. In particular, a
+    // backend destructor does not know whether its file states and libc
+    // streams were durably drained, so it must not turn context teardown into
+    // a false success. Browser Web Locks may still release when the worker
+    // context itself exits; that is not a durability acknowledgement.
   }
 
   int acquireProfileLease(const std::string& profileName) {
@@ -657,7 +974,7 @@ public:
       _wasmfs_opfs_acquire_profile_lease(ctx.ctx, profileName.c_str(), &err);
     });
     if (err == 0) {
-      profileLeaseHeld = true;
+      profileLeaseState->acquiredLease();
     }
     return err;
   }
@@ -670,9 +987,18 @@ public:
   }
 
   std::shared_ptr<Directory> createDirectory(mode_t mode) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return nullptr;
+    }
     proxy([](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); });
     return std::make_shared<OPFSDirectory>(
-      mode, this, kOPFSRootDirectoryID, proxy, terminalCloseState);
+      mode,
+      this,
+      kOPFSRootDirectoryID,
+      proxy,
+      terminalCloseState,
+      profileLeaseState);
   }
 
   std::shared_ptr<Symlink> createSymlink(std::string target) override {
@@ -683,8 +1009,8 @@ public:
 private:
   std::shared_ptr<TerminalCloseState> terminalCloseState =
     std::make_shared<TerminalCloseState>();
-  bool profileLeaseHeld = false;
-  bool terminalDrainFailed = false;
+  std::shared_ptr<ProfileLeaseState> profileLeaseState =
+    std::make_shared<ProfileLeaseState>();
 };
 
 } // anonymous namespace

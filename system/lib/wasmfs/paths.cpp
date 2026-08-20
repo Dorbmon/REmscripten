@@ -22,13 +22,21 @@ ParsedFile doParseFile(std::string_view path,
 
 ParsedFile getBaseDir(__wasi_fd_t basefd) {
   if (basefd == AT_FDCWD) {
-    return {wasmFS.getCWD()};
+    auto cwd = wasmFS.getCWD();
+    if (int err = wasmFS.admitBackend(cwd->getBackend())) {
+      return err;
+    }
+    return {std::move(cwd)};
   }
   auto openFile = wasmFS.getFileTable().locked().getEntry(basefd);
   if (!openFile) {
     return -EBADF;
   }
-  if (auto baseDir = openFile->locked().getFile()->dynCast<Directory>()) {
+  auto file = openFile->locked().getFile();
+  if (int err = wasmFS.admitBackend(file->getBackend())) {
+    return err;
+  }
+  if (auto baseDir = file->dynCast<Directory>()) {
     return {baseDir};
   }
   return -ENOTDIR;
@@ -38,9 +46,15 @@ ParsedFile getChild(std::shared_ptr<Directory> dir,
                     std::string_view name,
                     LinkBehavior links,
                     size_t& recursions) {
+  if (int err = wasmFS.admitBackend(dir->getBackend())) {
+    return err;
+  }
   auto child = dir->locked().getChild(std::string(name));
   if (!child) {
     return -ENOENT;
+  }
+  if (int err = wasmFS.admitBackend(child->getBackend())) {
+    return err;
   }
   if (links != NoFollowLinks) {
     while (auto link = child->dynCast<Symlink>()) {
@@ -72,6 +86,9 @@ ParsedParent doParseParent(std::string_view path,
   // Handle absolute paths.
   if (path.front() == '/') {
     curr = wasmFS.getRootDirectory();
+    if (int err = wasmFS.admitBackend(curr->getBackend())) {
+      return err;
+    }
     path.remove_prefix(1);
   }
 
@@ -96,6 +113,9 @@ ParsedParent doParseParent(std::string_view path,
     // If this is the leaf segment, return.
     size_t segment_end = path.find_first_of('/');
     if (segment_end == std::string_view::npos) {
+      if (int err = wasmFS.admitBackend(curr->getBackend())) {
+        return err;
+      }
       return {std::make_pair(std::move(curr), path)};
     }
 
@@ -129,23 +149,44 @@ ParsedFile doParseFile(std::string_view path,
 } // anonymous namespace
 
 ParsedParent parseParent(std::string_view path, __wasi_fd_t basefd) {
-  auto base = getBaseDir(basefd);
-  if (auto err = base.getError()) {
-    return err;
+  std::shared_ptr<Directory> baseDir;
+  // POSIX absolute paths ignore dirfd/CWD. This matters after a scoped
+  // profile drain seals the current directory: `/tmp` must remain reachable
+  // even though a relative profile path is rejected.
+  if (!path.empty() && path.front() == '/') {
+    baseDir = wasmFS.getRootDirectory();
+    if (int err = wasmFS.admitBackend(baseDir->getBackend())) {
+      return err;
+    }
+  } else {
+    auto base = getBaseDir(basefd);
+    if (auto err = base.getError()) {
+      return err;
+    }
+    baseDir = base.getFile()->cast<Directory>();
   }
   size_t recursions = 0;
-  auto baseDir = base.getFile()->cast<Directory>();
   return doParseParent(path, baseDir, recursions);
 }
 
 ParsedFile
 parseFile(std::string_view path, __wasi_fd_t basefd, LinkBehavior links) {
-  auto base = getBaseDir(basefd);
-  if (auto err = base.getError()) {
-    return err;
+  std::shared_ptr<Directory> baseDir;
+  // See parseParent(): an absolute pathname must not consult a sealed CWD or
+  // otherwise invalid dirfd before switching to the root directory.
+  if (!path.empty() && path.front() == '/') {
+    baseDir = wasmFS.getRootDirectory();
+    if (int err = wasmFS.admitBackend(baseDir->getBackend())) {
+      return err;
+    }
+  } else {
+    auto base = getBaseDir(basefd);
+    if (auto err = base.getError()) {
+      return err;
+    }
+    baseDir = base.getFile()->cast<Directory>();
   }
   size_t recursions = 0;
-  auto baseDir = base.getFile()->cast<Directory>();
   return doParseFile(path, baseDir, links, recursions);
 }
 
@@ -153,19 +194,30 @@ ParsedFile getFileAt(__wasi_fd_t fd, std::string_view path, int flags) {
   if ((flags & AT_EMPTY_PATH) && path.size() == 0) {
     // Don't parse a path, just use `dirfd` directly.
     if (fd == AT_FDCWD) {
-      return {wasmFS.getCWD()};
+      auto cwd = wasmFS.getCWD();
+      if (int err = wasmFS.admitBackend(cwd->getBackend())) {
+        return err;
+      }
+      return {std::move(cwd)};
     }
     auto openFile = wasmFS.getFileTable().locked().getEntry(fd);
     if (!openFile) {
       return {-EBADF};
     }
-    return {openFile->locked().getFile()};
+    auto file = openFile->locked().getFile();
+    if (int err = wasmFS.admitBackend(file->getBackend())) {
+      return err;
+    }
+    return {std::move(file)};
   }
   auto links = (flags & AT_SYMLINK_NOFOLLOW) ? NoFollowLinks : FollowLinks;
   return path::parseFile(path, fd, links);
 }
 
 ParsedFile getFileFrom(std::shared_ptr<Directory> base, std::string_view path) {
+  if (int err = wasmFS.admitBackend(base->getBackend())) {
+    return err;
+  }
   size_t recursions = 0;
   return doParseFile(path, base, FollowLinks, recursions);
 }

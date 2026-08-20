@@ -408,6 +408,12 @@ addToLibrary({
       if (result == {{{ cDefs.ENOENT }}}) {
         return null;
       }
+      if (result != {{{ cDefs.EISDIR }}} && result != {{{ cDefs.EEXIST }}}) {
+        // `_wasmfs_identify` reports a positive errno.  In particular, a
+        // sealed leased-OPFS backend must not appear as a synthetic file or
+        // directory to the legacy JS FS API.
+        throw new FS.ErrnoError(result);
+      }
       return {
         isFolder: result == {{{ cDefs.EISDIR }}},
         isDevice: false, // TODO: wasmfs support for devices
