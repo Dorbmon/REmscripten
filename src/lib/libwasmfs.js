@@ -811,16 +811,77 @@ addToLibrary({
   _wasmfs_copy_preloaded_file_data: (index, buffer) =>
     HEAPU8.set(wasmFSPreloadedFiles[index].fileData, buffer),
 
-  _wasmfs_thread_utils_heartbeat__deps: ['emscripten_proxy_execute_queue'],
+  // Each dedicated ProxyWorker owns its interval in its own JavaScript realm.
+  // Keep the interval keyed by the native queue so a scoped OPFS retirement
+  // can stop and acknowledge it before that Worker is quarantined.
+  $wasmfsThreadUtilsHeartbeats: 'new Map()',
+#if WASMFS_OPFS_PROFILE_DRAIN_TEST
+  // Focused browser-regression witness only. The channel lets the harness
+  // distinguish an acknowledged heartbeat stop from merely successful native
+  // pthread join, and catches a stale interval after pool churn.
+  $wasmfsThreadUtilsProfileDrainRetirementTraceState: {channel: undefined},
+  $wasmfsThreadUtilsProfileDrainRetirementTrace__deps: [
+    '$wasmfsThreadUtilsProfileDrainRetirementTraceState',
+  ],
+  $wasmfsThreadUtilsProfileDrainRetirementTrace: (phase, queue) => {
+    if (typeof BroadcastChannel == 'undefined') {
+      return;
+    }
+    if (!wasmfsThreadUtilsProfileDrainRetirementTraceState.channel) {
+      wasmfsThreadUtilsProfileDrainRetirementTraceState.channel =
+        new BroadcastChannel('wasmfs-opfs-profile-drain-retirement');
+    }
+    wasmfsThreadUtilsProfileDrainRetirementTraceState.channel.postMessage({
+      phase,
+      queue,
+      type: 'wasmfs-opfs-profile-drain-retirement',
+    });
+  },
+#endif
+  _wasmfs_thread_utils_heartbeat__deps: [
+    '$wasmfsThreadUtilsHeartbeats',
+    'emscripten_proxy_execute_queue',
+#if WASMFS_OPFS_PROFILE_DRAIN_TEST
+    '$wasmfsThreadUtilsProfileDrainRetirementTrace',
+#endif
+  ],
   _wasmfs_thread_utils_heartbeat: (queue) => {
-    var intervalID =
-      setInterval(() => {
-        if (ABORT) {
-          clearInterval(intervalID);
-        } else {
-          _emscripten_proxy_execute_queue(queue);
-        }
-      }, 50);
+    if (wasmfsThreadUtilsHeartbeats.has(queue)) {
+      return;
+    }
+    var intervalID = setInterval(() => {
+      if (ABORT || wasmfsThreadUtilsHeartbeats.get(queue) != intervalID) {
+        clearInterval(intervalID);
+        wasmfsThreadUtilsHeartbeats.delete(queue);
+      } else {
+#if WASMFS_OPFS_PROFILE_DRAIN_TEST
+        wasmfsThreadUtilsProfileDrainRetirementTrace('heartbeat-tick', queue);
+#endif
+        _emscripten_proxy_execute_queue(queue);
+      }
+    }, 50);
+    wasmfsThreadUtilsHeartbeats.set(queue, intervalID);
+  },
+
+  $wasmfsThreadUtilsStopHeartbeat__deps: [
+    '$wasmfsThreadUtilsHeartbeats',
+#if WASMFS_OPFS_PROFILE_DRAIN_TEST
+    '$wasmfsThreadUtilsProfileDrainRetirementTrace',
+#endif
+  ],
+  $wasmfsThreadUtilsStopHeartbeat: (queue) => {
+    var intervalID = wasmfsThreadUtilsHeartbeats.get(queue);
+    if (intervalID !== undefined) {
+      clearInterval(intervalID);
+      wasmfsThreadUtilsHeartbeats.delete(queue);
+#if WASMFS_OPFS_PROFILE_DRAIN_TEST
+      wasmfsThreadUtilsProfileDrainRetirementTrace('heartbeat-stopped', queue);
+#endif
+    }
+    // Stopping is idempotent. A retired ProxyWorker never starts another
+    // heartbeat, and treating an already-stopped interval as success makes
+    // its terminal cleanup one-shot as well.
+    return 0;
   },
 
   _wasmfs_stdin_get_char__deps: ['$FS_stdin_getChar'],

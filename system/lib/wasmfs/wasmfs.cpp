@@ -447,7 +447,12 @@ int WasmFS::terminalDrain(wasmfs_terminal_drain_result* result) {
   // that way: in browsers it services the JavaScript event loop and, in Node,
   // it is likewise the default runtime thread. Run application teardown on a
   // pthread instead.
-  if (emscripten_is_main_runtime_thread()) {
+  // With PROXY_TO_PTHREAD the runtime main is an application Worker, not the
+  // browser's JavaScript main thread. Both are invalid here: this path can
+  // synchronously proxy and a leased OPFS finalizer may cancel/join its
+  // dedicated Worker.
+  if (emscripten_is_main_runtime_thread() ||
+      emscripten_is_main_browser_thread()) {
     return -EAGAIN;
   }
 
@@ -574,7 +579,11 @@ int WasmFS::drainOPFSProfileBackend(
   if (!ownsBackend(backend) || !backend->isLeasedOPFSProfileBackend()) {
     return returnError(-ENOTSUP);
   }
-  if (emscripten_is_main_runtime_thread()) {
+  // `PROXY_TO_PTHREAD` makes runtime-main and browser-main distinct. Scoped
+  // retirement synchronously cancels/joins the dedicated OPFS Worker, so the
+  // public ABI must reject either main context before it seals a backend.
+  if (emscripten_is_main_runtime_thread() ||
+      emscripten_is_main_browser_thread()) {
     return returnError(-EAGAIN);
   }
   // Waiting for an outer operation that is itself waiting for this call would
@@ -644,13 +653,48 @@ int WasmFS::drainOPFSProfileBackend(
     }
   }
 
-  // The backend decides whether its synchronous lease release succeeded. It
-  // receives false after any earlier observable failure and permanently keeps
-  // the lease in that case. A failed release is separately observable.
-  if (int error = backend->finishOPFSProfileDrain(result->error == 0)) {
-    recordProfileDrainError(*result, error, result->lease_release_failures);
-  } else if (result->error == 0) {
+  // Fence/preflight browser-owned OPFS state before releasing Web Locks. A
+  // preflight failure is an ordinary failed drain: the backend retains its
+  // lease rather than clearing handles or reporting a handoff that did not
+  // happen.
+  bool cleanupSucceeded = result->error == 0;
+  {
+    if (int error = backend->prepareOPFSProfileRetirement(cleanupSucceeded)) {
+      recordProfileDrainError(*result, error, result->backend_retire_failures);
+    }
+  }
+
+  // The backend executes release, OPFS-context reset, and heartbeat stop in
+  // one dedicated-worker transaction. `leaseReleased` is separate because a
+  // later cleanup error can occur only after Web Locks has already
+  // acknowledged release. Native worker retirement still runs in that case
+  // so a non-success result never defers a join to browser-main destruction.
+  bool leaseReleased = false;
+  int finishError = backend->finishOPFSProfileDrain(
+    result->error == 0, &leaseReleased);
+  if (!leaseReleased) {
+    // A leased backend must never turn an absent acknowledgement into a
+    // zero-result handoff merely because an implementation forgot to surface
+    // its own error. Keep this defense at the generic ABI boundary rather
+    // than relying on one JavaScript callback's current error mapping.
+    if (finishError == 0 && result->error == 0) {
+      finishError = -EIO;
+    }
+    if (finishError) {
+      recordProfileDrainError(
+        *result, finishError, result->lease_release_failures);
+    }
+  } else {
     result->lease_released = 1;
+    if (finishError) {
+      recordProfileDrainError(
+        *result, finishError, result->backend_retire_failures);
+    }
+    if (int error = backend->retireOPFSProfileBackend(finishError == 0)) {
+      recordProfileDrainError(*result, error, result->backend_retire_failures);
+    } else if (finishError == 0) {
+      result->backend_retired = 1;
+    }
   }
 
   endScopedOPFSProfileDrain();

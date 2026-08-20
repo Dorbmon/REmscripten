@@ -50,7 +50,27 @@ public:
   // never treats an arbitrary persistent backend as safe to hand off.
   virtual bool isLeasedOPFSProfileBackend() const { return false; }
   virtual int beginOPFSProfileDrain() { return -ENOTSUP; }
-  virtual int finishOPFSProfileDrain(bool success) { return -ENOTSUP; }
+  // Preflight the browser-owned resources that must be quiescent before a
+  // successful leased profile handoff releases its Web Lock. A failure leaves
+  // the lease owned and lets the caller report a normal drain failure.
+  virtual int prepareOPFSProfileRetirement(bool check_resources) {
+    return -ENOTSUP;
+  }
+  // `lease_released` distinguishes a Web Locks acknowledgement from a later
+  // worker-context retirement error in the same scoped transaction.
+  virtual int finishOPFSProfileDrain(bool success, bool* lease_released) {
+    if (lease_released) {
+      *lease_released = false;
+    }
+    return -ENOTSUP;
+  }
+  // Retire the dedicated OPFS worker after finishOPFSProfileDrain(true) has
+  // acknowledged release. This is intentionally separate from lease release:
+  // a post-release failure must remain observable rather than being confused
+  // with a retained lease or silently reported as a safe handoff.
+  virtual int retireOPFSProfileBackend(bool transaction_succeeded) {
+    return -ENOTSUP;
+  }
   virtual int getOPFSProfilePriorCloseError() const { return 0; }
 
   // Called after WasmFS has permanently drained its public descriptor table.

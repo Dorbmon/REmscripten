@@ -16,6 +16,10 @@
 #error "WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE must be 0 or 1"
 #endif
 
+#if WASMFS_OPFS_TEST_RETIRE_FAILURE != 0 && WASMFS_OPFS_TEST_RETIRE_FAILURE != 1
+#error "WASMFS_OPFS_TEST_RETIRE_FAILURE must be 0 or 1"
+#endif
+
 #if WASMFS_OPFS_TEST_FILE_HANDLE_CACHE != 0 && WASMFS_OPFS_TEST_FILE_HANDLE_CACHE != 1
 #error "WASMFS_OPFS_TEST_FILE_HANDLE_CACHE must be 0 or 1"
 #endif
@@ -46,6 +50,12 @@ addToLibrary({
   $wasmfsOPFSProfileLease: {
     release: undefined,
     request: undefined,
+  },
+  $wasmfsOPFSHasLiveHandles: (allocator) =>
+    allocator.allocated.some((handle, index) => index && handle !== undefined),
+  $wasmfsOPFSResetHandles: (allocator) => {
+    allocator.allocated = [undefined];
+    allocator.freelist = [];
   },
 
 #if WASMFS_OPFS_TEST_MOVE_INTERRUPT
@@ -253,6 +263,94 @@ addToLibrary({
     {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
     wasmfsOPFSProxyFinish(ctx);
   },
+
+  // Preflight must run before the scoped drain releases the Web Lock. An
+  // AccessHandle or Blob here means native descriptor close did not establish
+  // a safe handoff, so preserve the live lease rather than clearing browser
+  // state and fabricating success.
+  _wasmfs_opfs_prepare_profile_retirement__deps: [
+    '$wasmfsOPFSProfileLease',
+    '$wasmfsOPFSAccessHandles',
+    '$wasmfsOPFSBlobs',
+    '$wasmfsOPFSHasLiveHandles',
+    '$wasmfsOPFSProxyFinish',
+  ],
+  _wasmfs_opfs_prepare_profile_retirement__async: 'auto',
+  _wasmfs_opfs_prepare_profile_retirement: async (ctx, errPtr) => {
+    let err = 0;
+    if (!wasmfsOPFSProfileLease.release || !wasmfsOPFSProfileLease.request ||
+        wasmfsOPFSHasLiveHandles(wasmfsOPFSAccessHandles) ||
+        wasmfsOPFSHasLiveHandles(wasmfsOPFSBlobs)) {
+      err = -{{{ cDefs.EIO }}};
+    }
+    {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
+    wasmfsOPFSProxyFinish(ctx);
+  },
+
+  // This is the irrevocable scoped-retirement transaction. It runs entirely
+  // on the dedicated OPFS worker: release the Web Lock, then in the same
+  // callback clear every worker-local allocator/lease reference and stop the
+  // queue heartbeat before native code is allowed to cancel or destroy the
+  // ProxyWorker. A release rejection leaves all state and the heartbeat live.
+  _wasmfs_opfs_release_profile_lease_and_retire_context__deps: [
+    '$wasmfsOPFSProfileLease',
+    '$wasmfsOPFSDirectoryHandles',
+    '$wasmfsOPFSFileHandles',
+    '$wasmfsOPFSAccessHandles',
+    '$wasmfsOPFSBlobs',
+    '$wasmfsOPFSHasLiveHandles',
+    '$wasmfsOPFSResetHandles',
+    '$wasmfsThreadUtilsStopHeartbeat',
+    '$wasmfsOPFSProxyFinish',
+  ],
+  _wasmfs_opfs_release_profile_lease_and_retire_context__async: 'auto',
+  _wasmfs_opfs_release_profile_lease_and_retire_context:
+    async (ctx, queue, leaseReleasedPtr, errPtr) => {
+      let err = 0;
+      let leaseReleased = 0;
+#if WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE
+      err = -{{{ cDefs.EIO }}};
+#else
+      let release = wasmfsOPFSProfileLease.release;
+      let request = wasmfsOPFSProfileLease.request;
+      if (!release || !request) {
+        err = -{{{ cDefs.EIO }}};
+      } else {
+        release();
+        try {
+          await request;
+          leaseReleased = 1;
+        } catch {
+          err = -{{{ cDefs.EIO }}};
+        }
+      }
+#endif
+      if (leaseReleased) {
+        // No native operation can enter after the destructor gate closes. The
+        // preflight above made live access/blob slots impossible; retain an
+        // error witness if that invariant was somehow violated, but still
+        // clear this terminal worker realm before native cancellation.
+        if (wasmfsOPFSHasLiveHandles(wasmfsOPFSAccessHandles) ||
+            wasmfsOPFSHasLiveHandles(wasmfsOPFSBlobs)) {
+          err = err || -{{{ cDefs.EIO }}};
+        }
+        wasmfsOPFSResetHandles(wasmfsOPFSDirectoryHandles);
+        wasmfsOPFSResetHandles(wasmfsOPFSFileHandles);
+        wasmfsOPFSResetHandles(wasmfsOPFSAccessHandles);
+        wasmfsOPFSResetHandles(wasmfsOPFSBlobs);
+        wasmfsOPFSProfileLease.release = undefined;
+        wasmfsOPFSProfileLease.request = undefined;
+        err = err || wasmfsThreadUtilsStopHeartbeat(queue);
+#if WASMFS_OPFS_TEST_RETIRE_FAILURE
+        // Inject after all browser-affine cleanup has occurred. Native code
+        // must still join/quarantine the worker but report no safe handoff.
+        err = err || -{{{ cDefs.EIO }}};
+#endif
+      }
+      {{{ makeSetValue('leaseReleasedPtr', 0, 'leaseReleased', 'i32') }}};
+      {{{ makeSetValue('errPtr', 0, 'err', 'i32') }}};
+      wasmfsOPFSProxyFinish(ctx);
+    },
 
   _wasmfs_opfs_init_root_directory__deps: ['$wasmfsOPFSDirectoryHandles', '$wasmfsOPFSProxyFinish'],
   _wasmfs_opfs_init_root_directory__async: 'auto',

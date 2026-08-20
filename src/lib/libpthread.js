@@ -22,6 +22,9 @@
 #if EVAL_CTORS
 #error "EVAL_CTORS is not compatible with pthreads yet (passive segments)"
 #endif
+#if WASMFS_OPFS_TEST_RETIRE_FENCE_FAILURE != 0 && WASMFS_OPFS_TEST_RETIRE_FENCE_FAILURE != 1
+#error "WASMFS_OPFS_TEST_RETIRE_FENCE_FAILURE must be 0 or 1"
+#endif
 #if EXPORT_ES6 && (MIN_FIREFOX_VERSION < 114 || MIN_CHROME_VERSION < 80 || MIN_SAFARI_VERSION < 150000)
 #error "internal error, feature_matrix should not allow this"
 #endif
@@ -104,6 +107,12 @@ var LibraryPThread = {
     // the reverse mapping, each worker has a `pthread_ptr` when its running a
     // pthread.
     pthreads: {},
+    // A subsystem may permanently retire one worker-local JavaScript realm.
+    // Keep its ticket on the browser main thread so native code can wait for
+    // cleanupThread to prove that the Worker was terminated rather than added
+    // to unusedWorkers.  The ticket deliberately outlives the pthread data:
+    // cleanupThread frees that data before a native owner may be destroyed.
+    retirementTickets: new Map(),
 #if ASSERTIONS
     nextWorkerID: 1,
 #endif
@@ -198,15 +207,51 @@ var LibraryPThread = {
       // modifying). To achieve that, defer the free() until the very end, when
       // we are all done.
       var pthread_ptr = worker.pthread_ptr;
+      var retireWorker = worker.retireOnExit;
+      var retirementTicket = worker.retirementTicket;
       delete PThread.pthreads[pthread_ptr];
-      // Note: worker is intentionally not terminated so the pool can
-      // dynamically grow.
-      PThread.unusedWorkers.push(worker);
       PThread.runningWorkers.splice(PThread.runningWorkers.indexOf(worker), 1);
       // Not a running Worker anymore
-      // Detach the worker from the pthread object, and return it to the
-      // worker pool as an unused worker.
+      // Detach the worker from the pthread object before either returning it
+      // to the pool or permanently retiring its JavaScript realm.
       worker.pthread_ptr = 0;
+
+      if (retireWorker) {
+        // A subsystem has synchronously reset worker-local state that cannot
+        // safely survive a new pthread. Do not let this Worker reach the
+        // reusable pool even transiently. terminateWorker() is necessarily
+        // asynchronous on the web, but the Worker is already unreachable from
+        // PThread.getNewWorker() and its message handler is fenced.
+        worker.retireOnExit = false;
+        worker.retirementTicket = 0;
+        terminateWorker(worker);
+        if (retirementTicket) {
+          var retirement = PThread.retirementTickets.get(retirementTicket);
+          if (retirement) {
+            // This is the native retirement acknowledgement. It is written
+            // only after the Worker has been removed from the running map,
+            // kept out of unusedWorkers, and terminate() has been requested.
+            retirement.cleanupAcknowledged = true;
+#if WASMFS_OPFS_PROFILE_DRAIN_TEST
+            if (typeof BroadcastChannel != 'undefined') {
+              let channel = new BroadcastChannel(
+                'wasmfs-opfs-profile-drain-retirement');
+              channel.postMessage({
+                inUnusedWorkers: PThread.unusedWorkers.includes(worker),
+                phase: 'worker-not-pooled',
+                ticket: retirementTicket,
+                type: 'wasmfs-opfs-profile-drain-retirement',
+              });
+              channel.close();
+            }
+#endif
+          }
+        }
+      } else {
+        // Note: ordinary workers are intentionally not terminated so the pool
+        // can dynamically grow.
+        PThread.unusedWorkers.push(worker);
+      }
 
 #if ENVIRONMENT_MAY_BE_NODE && PROXY_TO_PTHREAD
       if (ENVIRONMENT_IS_NODE) {
@@ -578,6 +623,39 @@ var LibraryPThread = {
 #endif
     if (!ENVIRONMENT_IS_PTHREAD) cleanupThread(thread);
     else postMessage({ cmd: 'cleanupThread', thread });
+  },
+
+  _emscripten_thread_retire_worker__proxy: 'sync',
+  _emscripten_thread_retire_worker: (thread, ticket) => {
+    // This runs on the browser's JS main thread when called from a pthread.
+    // The caller establishes this fence before it releases a profile lease.
+    // Thus even a later teardown failure cannot recycle stateful OPFS globals
+    // into PThread.unusedWorkers.
+#if WASMFS_OPFS_TEST_RETIRE_FENCE_FAILURE
+    // Test only: leave the Worker completely untouched so native code must
+    // take its sealed, terminal abandon path instead of relying on a ticket.
+    return -{{{ cDefs.EIO }}};
+#else
+    var worker = PThread.pthreads[thread];
+    if (!worker || worker.pthread_ptr !== thread || !ticket) {
+      return -{{{ cDefs.EINVAL }}};
+    }
+    if (worker.retireOnExit && worker.retirementTicket != ticket) {
+      return -{{{ cDefs.EBUSY }}};
+    }
+    worker.retireOnExit = true;
+    worker.retirementTicket = ticket;
+    PThread.retirementTickets.set(ticket, {
+      cleanupAcknowledged: false,
+    });
+    return 0;
+#endif
+  },
+
+  _emscripten_thread_retire_worker_status__proxy: 'sync',
+  _emscripten_thread_retire_worker_status: (ticket) => {
+    var retirement = PThread.retirementTickets.get(ticket);
+    return retirement?.cleanupAcknowledged ? 1 : 0;
   },
 
   _emscripten_thread_set_strongref: (thread) => {

@@ -1839,6 +1839,19 @@ var WASMFS_RECORD_LOCK_TEST = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_DRAIN_TEST = 0;
 
+// Internal focused-test hook. It reports a post-release retirement failure
+// only after the OPFS worker has reset its state and stopped its heartbeat.
+// Production builds leave this disabled.
+// [link]
+var WASMFS_OPFS_TEST_RETIRE_FAILURE = 0;
+
+// Internal focused-test hook. It makes the browser-main no-pool fence reject
+// before it observes or changes a dedicated Worker. This exercises the
+// fail-closed abandoned-worker path without a browser-main pthread join.
+// Production builds leave this disabled.
+// [link]
+var WASMFS_OPFS_TEST_RETIRE_FENCE_FAILURE = 0;
+
 // Test-only selector for a controlled interruption of the OPFS move proxy
 // callback.  0 disables the hook, 1 pauses immediately before the browser
 // `FileSystemFileHandle.move()` call, and 2 pauses immediately after that call

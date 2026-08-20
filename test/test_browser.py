@@ -5964,8 +5964,10 @@ Module["preRun"] = () => {
     # either kind of rejected AccessHandle close retains that lease. It does
     # not claim application, database, or browser-profile quiescence.
     test = test_file('wasmfs/wasmfs_opfs_terminal_drain.c')
-    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD',
-                   '-sEXIT_RUNTIME', '-lopfs.js']
+    common_args = ['-sWASMFS', '-sFORCE_FILESYSTEM', '-pthread',
+                   '-sPROXY_TO_PTHREAD',
+                   '-sEXIT_RUNTIME', '-sALLOW_BLOCKING_ON_MAIN_THREAD=0',
+                   '-lopfs.js']
     create_file('terminal-drain-holder-pre.js', r'''
       // This confirms orderly holder termination only after the parent has
       // observed its live-holder lease handoff/retention result.
@@ -5978,10 +5980,20 @@ Module["preRun"] = () => {
           },
           window.location.origin);
       };
+      Module['onAbort'] = (reason) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-abort',
+            reason: String(reason),
+            type: 'wasmfs-opfs-terminal-drain',
+          },
+          window.location.origin);
+      };
     ''')
     self.compile_btest(
       test,
-      common_args + ['-DWASMFS_OPFS_TERMINAL_DRAIN_HOLDER', '--pre-js',
+      common_args + ['-DWASMFS_OPFS_TERMINAL_DRAIN_HOLDER',
+                     '-sWASMFS_OPFS_PROFILE_DRAIN_TEST=1', '--pre-js',
                      'terminal-drain-holder-pre.js', '-o',
                      'terminal-drain-normal-holder.html'],
       reporting=Reporting.NONE)
@@ -6003,6 +6015,14 @@ Module["preRun"] = () => {
       reporting=Reporting.NONE)
     self.compile_btest(
       test,
+      common_args + ['-DWASMFS_OPFS_TERMINAL_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_TERMINAL_DRAIN_RETIRE_FAILURE',
+                     '-sWASMFS_OPFS_TEST_RETIRE_FAILURE=1', '--pre-js',
+                     'terminal-drain-holder-pre.js', '-o',
+                     'terminal-drain-retire-failure-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
       common_args + ['-o', 'terminal-drain-contender.html'],
       reporting=Reporting.NONE)
     self.add_browser_reporting()
@@ -6021,6 +6041,53 @@ Module["preRun"] = () => {
         const kLeaseRetryDelayMs = 100;
         const pendingModules = new Map();
         const pendingHolderExits = new Map();
+        const retirementTrace = new BroadcastChannel(
+          'wasmfs-opfs-profile-drain-retirement');
+        let heartbeatStopped = false;
+        let workerNotPooled = false;
+        let retirementTraceError = null;
+
+        retirementTrace.onmessage = (event) => {
+          const trace = event.data;
+          if (trace?.type != 'wasmfs-opfs-profile-drain-retirement') {
+            return;
+          }
+          if (trace.phase == 'heartbeat-stopped') {
+            heartbeatStopped = true;
+          } else if (trace.phase == 'worker-not-pooled') {
+            if (trace.inUnusedWorkers) {
+              retirementTraceError =
+                'retired terminal OPFS worker appeared in PThread.unusedWorkers';
+            }
+            workerNotPooled = true;
+          } else if (trace.phase == 'heartbeat-tick' && heartbeatStopped) {
+            retirementTraceError =
+              'retired terminal OPFS worker emitted a stale heartbeat tick';
+          }
+        };
+
+        async function waitForRetirementWitness() {
+          const deadline = performance.now() + kModuleTimeoutMs;
+          while (!retirementTraceError &&
+                 (!heartbeatStopped || !workerNotPooled) &&
+                 performance.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          if (retirementTraceError) {
+            throw new Error(retirementTraceError);
+          }
+          if (!heartbeatStopped || !workerNotPooled) {
+            throw new Error('timed out waiting for terminal OPFS retirement ' +
+                            'heartbeat/no-pool witnesses');
+          }
+          // The normal C fixture already created/joined a replacement pthread
+          // before reporting ready. Keep its holder alive while a stale timer
+          // would have an opportunity to fire after that deterministic churn.
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          if (retirementTraceError) {
+            throw new Error(retirementTraceError);
+          }
+        }
 
         function delay(ms) {
           return new Promise((resolve) => setTimeout(resolve, ms));
@@ -6083,8 +6150,25 @@ Module["preRun"] = () => {
             }
             return;
           }
+          if (event.data.event == 'holder-abort') {
+            const pendingExit = pendingHolderExits.get(event.source);
+            if (pendingExit) {
+              pendingHolderExits.delete(event.source);
+              clearTimeout(pendingExit.timeout);
+              pendingExit.reject(new Error(
+                'holder aborted: ' + event.data.reason));
+              return;
+            }
+          }
           const pending = pendingModules.get(event.source);
           if (!pending) {
+            return;
+          }
+          if (event.data.event == 'holder-abort') {
+            pendingModules.delete(event.source);
+            clearTimeout(pending.timeout);
+            pending.frame.remove();
+            pending.reject(new Error('holder aborted: ' + event.data.reason));
             return;
           }
           pendingModules.delete(event.source);
@@ -6123,8 +6207,17 @@ Module["preRun"] = () => {
                           ' holder did not acquire a released profile lease');
         }
 
-        async function runScenario(name, holderPath, expectBusy) {
+        async function runScenario(name,
+                                   holderPath,
+                                   expectBusy,
+                                   expectRetiredWorker = false) {
           const holder = await startHolder(holderPath, name);
+          if (holder.frame.contentWindow.Module
+                ._wasmfs_opfs_terminal_drain_browser_main_attempt() != 0) {
+            holder.frame.remove();
+            throw new Error(name +
+                            ' terminal drain did not reject browser-main call');
+          }
           const contender = await startModule('terminal-drain-contender.html');
           if (contender.message.role != kContender) {
             contender.frame.remove();
@@ -6148,8 +6241,12 @@ Module["preRun"] = () => {
             holder.frame.remove();
             throw new Error(name +
                             ' contender did not acquire live-holder release: ' +
-                            'result=' + contender.message.result +
-                            ', errno=' + contender.message.error);
+                              'result=' + contender.message.result +
+                              ', errno=' + contender.message.error);
+          }
+
+          if (expectRetiredWorker) {
+            await waitForRetirementWitness();
           }
 
           // The contender result above is observed before the holder's frame
@@ -6163,15 +6260,56 @@ Module["preRun"] = () => {
           holder.frame.remove();
         }
 
+        async function runPostReleaseRetirementFailure() {
+          const holder = await startHolder(
+            'terminal-drain-retire-failure-holder.html',
+            'post-release terminal retirement failure');
+          if (holder.message.drainResult == 0 ||
+              holder.message.terminalError == 0 ||
+              holder.message.backendTerminalFailures != 1) {
+            holder.frame.remove();
+            throw new Error('post-release terminal failure was reported as a ' +
+                            'safe handoff: ' + drainDetails(holder.message));
+          }
+          if (holder.frame.contentWindow.Module
+                ._wasmfs_opfs_terminal_drain_browser_main_attempt() != 0) {
+            holder.frame.remove();
+            throw new Error('post-release terminal drain did not reject ' +
+                            'browser-main call');
+          }
+
+          // The injected error follows the one-way Web Locks acknowledgement,
+          // so a fresh contender must acquire while the failed holder remains
+          // live. This proves consumers cannot infer success from release.
+          const contender = await startModule('terminal-drain-contender.html');
+          if (contender.message.role != kContender ||
+              contender.message.result != kReady ||
+              contender.message.error != 0) {
+            contender.frame.remove();
+            holder.frame.remove();
+            throw new Error('post-release terminal failure contender did not ' +
+                            'acquire released lock');
+          }
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_opfs_terminal_drain_holder_shutdown();
+          await holderExit;
+          contender.frame.remove();
+          holder.frame.remove();
+        }
+
         (async () => {
           await runScenario('normal terminal drain',
-                            'terminal-drain-normal-holder.html', false);
+                            'terminal-drain-normal-holder.html', false, true);
           await runScenario('close during terminal drain',
                             'terminal-drain-close-during-holder.html', true);
           await runScenario('close before terminal drain',
                             'terminal-drain-close-before-holder.html', true);
+          await runPostReleaseRetirementFailure();
+          retirementTrace.close();
           reportResultToServer('0');
         })().catch((error) => {
+          retirementTrace.close();
           reportResultToServer('failure: ' + error.message);
         });
       </script>
@@ -6184,14 +6322,17 @@ Module["preRun"] = () => {
   def test_wasmfs_opfs_profile_drain(self):
     # This is deliberately narrower than browser-profile shutdown. It checks
     # the leased-OPFS backend handoff primitive: target-only sealing/detach,
-    # libc-flush reentry rejection, and a synchronous live-holder lease result.
+    # libc-flush reentry rejection, a worker-retirement acknowledgement, and
+    # an EXIT_RUNTIME global-destruction tail that must not block browser main.
     test = test_file('wasmfs/wasmfs_opfs_profile_drain.c')
     common_args = ['-sWASMFS', '-sFORCE_FILESYSTEM', '-pthread',
                    '-sPROXY_TO_PTHREAD', '-sPTHREAD_POOL_SIZE=4',
-                   '-sEXIT_RUNTIME', '-lopfs.js']
+                   '-sEXIT_RUNTIME', '-sALLOW_BLOCKING_ON_MAIN_THREAD=0',
+                   '-lopfs.js']
     create_file('profile-drain-normal-holder-pre.js', r'''
       // onExit runs after the native atexit witness. The parent waits for it
-      // before disposing the iframe, so this is not browser-context cleanup.
+      // before disposing the iframe, so this checks native global WasmFS
+      // destruction rather than browser-context cleanup.
       Module['onExit'] = (status) => {
         window.parent.postMessage(
           {
@@ -6286,6 +6427,39 @@ Module["preRun"] = () => {
       common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_REENTRY', '-o',
                      'profile-drain-reentry-contender.html'],
       reporting=Reporting.NONE)
+    # The injected error occurs only after the one worker-side transaction has
+    # acknowledged Web Locks release, reset OPFS state, and stopped heartbeat.
+    # The holder must report non-success yet still reach normal EXIT_RUNTIME
+    # onExit without a browser-main blocking abort.
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE',
+                     '-sWASMFS_OPFS_TEST_RETIRE_FAILURE=1', '--pre-js',
+                     'profile-drain-normal-holder-pre.js', '-o',
+                     'profile-drain-retire-failure-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE', '-o',
+                     'profile-drain-retire-failure-contender.html'],
+      reporting=Reporting.NONE)
+    # This hook rejects the browser-main no-pool fence before it touches the
+    # dedicated worker. The holder must retain its lock but still reach an
+    # orderly EXIT_RUNTIME tail without a browser-main join.
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_HOLDER',
+                     '-DWASMFS_OPFS_PROFILE_DRAIN_FENCE_FAILURE',
+                     '-sWASMFS_OPFS_TEST_RETIRE_FENCE_FAILURE=1', '--pre-js',
+                     'profile-drain-normal-holder-pre.js', '-o',
+                     'profile-drain-fence-failure-holder.html'],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + ['-DWASMFS_OPFS_PROFILE_DRAIN_FENCE_FAILURE', '-o',
+                     'profile-drain-fence-failure-contender.html'],
+      reporting=Reporting.NONE)
     self.add_browser_reporting()
     create_file('a.html', r'''
       <!doctype html>
@@ -6297,9 +6471,57 @@ Module["preRun"] = () => {
         const kContender = 1;
         const kReady = 0;
         const kBusy = 1;
+        const kFailure = 2;
         const kModuleTimeoutMs = 20000;
         const pendingModules = new Map();
         const pendingHolderExits = new Map();
+        const retirementTrace = new BroadcastChannel(
+          'wasmfs-opfs-profile-drain-retirement');
+        let heartbeatStopped = false;
+        let workerNotPooled = false;
+        let retirementTraceError = null;
+
+        retirementTrace.onmessage = (event) => {
+          const trace = event.data;
+          if (trace?.type != 'wasmfs-opfs-profile-drain-retirement') {
+            return;
+          }
+          if (trace.phase == 'heartbeat-stopped') {
+            heartbeatStopped = true;
+          } else if (trace.phase == 'worker-not-pooled') {
+            if (trace.inUnusedWorkers) {
+              retirementTraceError =
+                'retired OPFS worker appeared in PThread.unusedWorkers';
+            }
+            workerNotPooled = true;
+          } else if (trace.phase == 'heartbeat-tick' && heartbeatStopped) {
+            retirementTraceError =
+              'retired OPFS worker emitted a stale heartbeat tick';
+          }
+        };
+
+        async function waitForRetirementWitness() {
+          const deadline = performance.now() + kModuleTimeoutMs;
+          while (!retirementTraceError &&
+                 (!heartbeatStopped || !workerNotPooled) &&
+                 performance.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          if (retirementTraceError) {
+            throw new Error(retirementTraceError);
+          }
+          if (!heartbeatStopped || !workerNotPooled) {
+            throw new Error('timed out waiting for OPFS worker retirement ' +
+                            'heartbeat/no-pool witnesses');
+          }
+          // The normal holder creates/joins a replacement pthread before it
+          // reports ready. Leave time for a stale interval to surface after
+          // that deterministic churn before accepting the global-exit tail.
+          await new Promise((resolve) => setTimeout(resolve, 150));
+          if (retirementTraceError) {
+            throw new Error(retirementTraceError);
+          }
+        }
 
         function startModule(path) {
           const frame = document.createElement('iframe');
@@ -6388,7 +6610,8 @@ Module["preRun"] = () => {
                                    holderPath,
                                    contenderPath,
                                    expectBusy,
-                                   orderlyShutdown) {
+                                   orderlyShutdown,
+                                   keepFrames = false) {
           const holder = await startModule(holderPath);
           if (holder.message.role != kHolder ||
               holder.message.result != kReady || holder.message.error != 0) {
@@ -6434,14 +6657,67 @@ Module["preRun"] = () => {
               ._wasmfs_opfs_profile_drain_holder_shutdown();
             await holderExit;
           }
+          if (keepFrames) {
+            return {holder, contender};
+          }
+          contender.frame.remove();
+          holder.frame.remove();
+        }
+
+        async function runPostReleaseRetirementFailure() {
+          const holder = await startModule(
+            'profile-drain-retire-failure-holder.html');
+          if (holder.message.role != kHolder ||
+              holder.message.result != kFailure || holder.message.error == 0) {
+            holder.frame.remove();
+            throw new Error('post-release retirement failure holder did not ' +
+                            'report its structured non-success');
+          }
+
+          // The injected failure is after the Web Lock acknowledgement. A
+          // fresh contender therefore still acquires while the failed holder
+          // stays live, proving callers must use backend_retired rather than
+          // treating lease_released alone as a safe result.
+          const contender = await startModule(
+            'profile-drain-retire-failure-contender.html');
+          if (contender.message.role != kContender ||
+              contender.message.result != kReady ||
+              contender.message.error != 0) {
+            contender.frame.remove();
+            holder.frame.remove();
+            throw new Error('post-release retirement failure contender did ' +
+                            'not reacquire the released lock');
+          }
+
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_opfs_profile_drain_holder_shutdown();
+          await holderExit;
           contender.frame.remove();
           holder.frame.remove();
         }
 
         (async () => {
-          await runScenario('normal scoped drain',
-                            'profile-drain-normal-holder.html',
-                            'profile-drain-normal-contender.html', false, true);
+          // Keep the normal holder alive through the no-pool/quiet-period
+          // witness. Removing its iframe first would terminate a stale worker
+          // and make the 150ms heartbeat check meaningless.
+          const normal = await runScenario(
+            'normal scoped drain', 'profile-drain-normal-holder.html',
+            'profile-drain-normal-contender.html', false, false, true);
+          try {
+            if (normal.holder.frame.contentWindow.Module
+                  ._wasmfs_opfs_profile_drain_browser_main_attempt() != 0) {
+              throw new Error('scoped drain did not reject browser-main call');
+            }
+            await waitForRetirementWitness();
+          } finally {
+            const holderExit = waitForHolderExit(normal.holder.frame);
+            normal.holder.frame.contentWindow.Module
+              ._wasmfs_opfs_profile_drain_holder_shutdown();
+            await holderExit;
+            normal.contender.frame.remove();
+            normal.holder.frame.remove();
+          }
           await runScenario('no-mount cleanup',
                             'profile-drain-no-mount-holder.html',
                             'profile-drain-no-mount-contender.html', false, false);
@@ -6458,8 +6734,15 @@ Module["preRun"] = () => {
           await runScenario('stdio reentry during scoped drain',
                             'profile-drain-reentry-holder.html',
                             'profile-drain-reentry-contender.html', true, false);
+          await runScenario('browser-main fence failure',
+                            'profile-drain-fence-failure-holder.html',
+                            'profile-drain-fence-failure-contender.html',
+                            true, true);
+          await runPostReleaseRetirementFailure();
+          retirementTrace.close();
           reportResultToServer('0');
         })().catch((error) => {
+          retirementTrace.close();
           reportResultToServer('failure: ' + error.message);
         });
       </script>

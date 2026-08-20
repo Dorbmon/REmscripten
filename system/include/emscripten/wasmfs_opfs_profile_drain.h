@@ -27,8 +27,21 @@ typedef struct Backend* backend_t;
 //
 // `backend_sealed` is set once the exact leased OPFS backend entered its
 // one-way sealed state. `lease_released` is set only after the OPFS worker
-// synchronously acknowledged Web Locks release. A sealed backend remains
-// unavailable after either success or failure; a failure retains its lease.
+// synchronously acknowledged Web Locks release. `backend_retired` is set only
+// after that release and the dedicated OPFS worker has cleared its OPFS state,
+// stopped its heartbeat, and been joined and quarantined from the pthread
+// worker pool on the calling application pthread. A sealed backend remains
+// unavailable after either success or failure.
+//
+// A failure without `lease_released` has no acknowledged safe release and must
+// not be retried. In the exceptional case where a worker transaction is
+// interrupted, physical Web Locks release can be indeterminate despite the
+// absent acknowledgement. A failure after a successful Web Locks
+// acknowledgement cannot reacquire that released lease, so it returns a
+// nonzero error with `lease_released` set and `backend_retired` clear.
+// Embedders that need the complete safe handoff must require a zero result and
+// `backend_retired` rather than treating the narrower lease acknowledgement as
+// success.
 typedef struct wasmfs_opfs_profile_drain_result {
   int error;
   uint32_t detached_descriptors;
@@ -38,8 +51,10 @@ typedef struct wasmfs_opfs_profile_drain_result {
   uint32_t data_close_failures;
   uint32_t prior_close_failures;
   uint32_t lease_release_failures;
+  uint32_t backend_retire_failures;
   uint8_t backend_sealed;
   uint8_t lease_released;
+  uint8_t backend_retired;
 } wasmfs_opfs_profile_drain_result;
 
 // Atomically seal, flush, close, and release one backend created by
@@ -49,9 +64,14 @@ typedef struct wasmfs_opfs_profile_drain_result {
 //
 // The backend must be the exact live leased-OPFS backend returned by that
 // factory. Default OPFS and every other backend return -ENOTSUP. The call must
-// run away from Emscripten's runtime main thread and outside a public WasmFS
-// operation. Once it has sealed the backend, all public accesses to it remain
-// rejected even if cleanup fails; any failure retains the cooperative lease.
+// run on an application pthread, away from both Emscripten's runtime main
+// thread and the browser main thread, and outside a public WasmFS operation.
+// Once it has sealed the backend, all public accesses to it remain rejected
+// even if cleanup fails. A zero result is a complete lease release and worker
+// retirement; see the result flags for the exceptional post-release
+// retirement-failure case. An active leased backend must use this primitive or
+// wasmfs_terminal_drain before normal EXIT_RUNTIME; raw runtime/context teardown
+// is not an orderly leased-profile handoff.
 //
 // The embedder must quiesce profile application work before calling this
 // function. fflush(NULL) flushes buffers that existed at entry, but WasmFS

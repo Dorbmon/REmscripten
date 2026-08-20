@@ -21,6 +21,20 @@ void _wasmfs_opfs_acquire_profile_lease(em_proxying_ctx* ctx,
 
 void _wasmfs_opfs_release_profile_lease(em_proxying_ctx* ctx, int* err);
 
+// Check that descriptor teardown left no browser-owned access/blob state
+// before a scoped profile handoff may release its Web Lock.
+void _wasmfs_opfs_prepare_profile_retirement(em_proxying_ctx* ctx, int* err);
+
+// One dedicated-worker transaction for the irrevocable scoped handoff. It
+// writes whether Web Locks release was acknowledged separately from any later
+// worker-context cleanup error, then clears OPFS allocators/lease state and
+// stops the heartbeat before native cancellation may occur.
+void _wasmfs_opfs_release_profile_lease_and_retire_context(
+  em_proxying_ctx* ctx,
+  em_proxying_queue* queue,
+  int* lease_released,
+  int* err);
+
 // Look up the child under `parent` with `name`. Write 1 to `child_type` if it's
 // a regular file or 2 if it's a directory. For a regular file, write zero to
 // `child_id`: its OPFSFile wrapper acquires a FileSystemFileHandle lazily. For

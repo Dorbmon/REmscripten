@@ -6,8 +6,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <emscripten/emscripten.h>
@@ -128,6 +130,17 @@ void wasmfs_opfs_terminal_drain_holder_shutdown(void) {
   atomic_store(&shutdown_requested, 1);
 }
 
+// Invoked directly by the holder iframe's browser JS main thread after the
+// application pthread has completed terminal drain. It specifically checks
+// the PROXY_TO_PTHREAD case where runtime-main and browser-main differ.
+EMSCRIPTEN_KEEPALIVE
+int wasmfs_opfs_terminal_drain_browser_main_attempt(void) {
+  wasmfs_terminal_drain_result result = {0};
+  // terminalDrain validates its calling context before it begins a result-
+  // bearing cleanup attempt, so its zeroed output is intentionally unchanged.
+  return wasmfs_terminal_drain(&result) == -EAGAIN ? 0 : 1;
+}
+
 static void ShutdownWhenRequested(void) {
   if (atomic_exchange(&shutdown_requested, 0)) {
     // The controller calls this only after it has tested a fresh iframe while
@@ -156,7 +169,19 @@ static int OpenWritableFile(void) {
 
 static int CheckDrainResult(int drainResult,
                             const wasmfs_terminal_drain_result* result) {
-#if defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_DURING_DRAIN)
+#if defined(WASMFS_OPFS_TERMINAL_DRAIN_RETIRE_FAILURE)
+  // The injected error is deliberately after Web Locks release, allocator
+  // reset, and heartbeat stop. terminalDrain must preserve it as a structured
+  // non-success while native retirement still makes EXIT_RUNTIME safe.
+  return drainResult == -EIO && result->error == -EIO &&
+         result->data_file_states == 3 &&
+         result->libc_flush_failed == 0 &&
+         result->data_flush_failures == 0 &&
+         result->data_close_failures == 0 &&
+         result->backend_terminal_failures == 1
+           ? 0
+           : EIO;
+#elif defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_DURING_DRAIN)
   // The injected close occurs while terminalDrain owns the descriptor table.
   // It must both report the data close failure and retain the still-live lease.
   return drainResult == -EIO && result->error == -EIO &&
@@ -192,11 +217,48 @@ static int CheckDrainResult(int drainResult,
 #endif
 }
 
+#if !defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_DURING_DRAIN) && \
+  !defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_BEFORE_DRAIN)
+static void* ChurnPthreadAfterTerminalRetirement(void* arg) {
+  (void)arg;
+  // Terminal drain has already retired the dedicated OPFS worker. This
+  // ordinary pthread must therefore exercise only the remaining pool, not a
+  // worker whose OPFS globals/heartbeat were cleared.
+  return NULL;
+}
+
+static int CreateCachedNestedDirectory(void) {
+  if (mkdir("/opfs/nested", 0700) != 0) {
+    if (errno != EEXIST) {
+      return ErrorOrEIO();
+    }
+  }
+  int fd = open("/opfs/nested/cached", O_CREAT | O_TRUNC | O_RDWR, 0600);
+  if (fd < 0 || write(fd, "n", 1) != 1 || close(fd) != 0) {
+    return ErrorOrEIO();
+  }
+  int directory = open("/opfs/nested", O_RDONLY | O_DIRECTORY);
+  if (directory < 0 || close(directory) != 0) {
+    return ErrorOrEIO();
+  }
+  // No descriptor survives, but the mounted OPFS tree retains these wrapper
+  // objects until global WasmFS destruction after EXIT_RUNTIME.
+  return 0;
+}
+#endif
+
 static int RunHolder(void) {
   int error = MountLeasedOPFS();
   if (error != 0) {
     return error;
   }
+
+#if !defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_DURING_DRAIN) && \
+  !defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_BEFORE_DRAIN)
+  if ((error = CreateCachedNestedDirectory()) != 0) {
+    return error;
+  }
+#endif
 
 #if defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_DURING_DRAIN) || \
   defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_BEFORE_DRAIN)
@@ -216,7 +278,19 @@ static int RunHolder(void) {
 #endif
 
   holder_drain_result = wasmfs_terminal_drain(&holder_drain_details);
-  return CheckDrainResult(holder_drain_result, &holder_drain_details);
+  error = CheckDrainResult(holder_drain_result, &holder_drain_details);
+#if !defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_DURING_DRAIN) && \
+  !defined(WASMFS_OPFS_TERMINAL_DRAIN_CLOSE_BEFORE_DRAIN)
+  if (error == 0) {
+    pthread_t churn;
+    if (pthread_create(&churn, NULL, ChurnPthreadAfterTerminalRetirement,
+                       NULL) != 0 ||
+        pthread_join(churn, NULL) != 0) {
+      return EIO;
+    }
+  }
+#endif
+  return error;
 }
 
 #else

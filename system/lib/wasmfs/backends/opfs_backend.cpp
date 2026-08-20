@@ -67,11 +67,17 @@ public:
 #ifdef __EMSCRIPTEN_PTHREADS__
   ProxyWorker proxy;
 
-  template<typename T> void operator()(T func) { proxy(func); }
+  template<typename T> bool operator()(T func) { return proxy(func); }
+
+  em_proxying_queue* getQueue() const { return proxy.getQueue(); }
+  int fenceForRetirement() { return proxy.fenceForRetirement(); }
+  void markHeartbeatStopped() { proxy.markHeartbeatStopped(); }
+  int retire() { return proxy.retire(); }
+  void abandonScopedProfileWorker() { proxy.abandonScopedProfileWorker(); }
 #else
   // When used with JSPI on the main thread the various wasmfs_opfs_* functions
   // can be directly executed since they are all async.
-  template<typename T> void operator()(T func) {
+  template<typename T> bool operator()(T func) {
     if constexpr (std::is_invocable_v<T&, ProxyingQueue::ProxyingCtx>) {
       // TODO: Find a way to remove this, since it's unused.
       ProxyingQueue::ProxyingCtx p;
@@ -79,7 +85,14 @@ public:
     } else {
       func();
     }
+    return true;
   }
+
+  em_proxying_queue* getQueue() const { return nullptr; }
+  int fenceForRetirement() { return -ENOTSUP; }
+  void markHeartbeatStopped() {}
+  int retire() { return -ENOTSUP; }
+  void abandonScopedProfileWorker() {}
 #endif
 };
 
@@ -110,7 +123,15 @@ public:
 // work; only the drain thread may use their internal operations while sealed.
 class ProfileLeaseState {
 public:
-  enum class State { Unleased, Active, Sealing, Released, Failed };
+  enum class State {
+    Unleased,
+    Active,
+    Sealing,
+    Released,
+    Retiring,
+    Retired,
+    Failed,
+  };
 
   class InternalOperation {
     ProfileLeaseState& state;
@@ -153,11 +174,59 @@ public:
     int getError() const { return error; }
   };
 
+  // Cached OPFS File/Directory wrappers can be dropped independently of an
+  // outer WasmFS syscall. Their destructors normally proxy a handle free to
+  // the dedicated Worker, so give those proxies a separate admission guard.
+  // Scoped retirement closes this gate while Sealing and waits for every
+  // already-admitted destructor proxy before it resets the worker-local JS
+  // allocators. Later destructors then become intentional no-ops over the
+  // sealed backend tombstone.
+  class DestructorProxyOperation {
+    ProfileLeaseState& state;
+    bool admitted = false;
+
+  public:
+    explicit DestructorProxyOperation(ProfileLeaseState& state) : state(state) {
+      std::unique_lock<std::mutex> lock(state.mutex);
+      if (state.destructorProxyingClosed) {
+        return;
+      }
+      ++state.destructorProxyOperations;
+      admitted = true;
+    }
+
+    DestructorProxyOperation(const DestructorProxyOperation&) = delete;
+    DestructorProxyOperation& operator=(const DestructorProxyOperation&) =
+      delete;
+
+    ~DestructorProxyOperation() {
+      if (!admitted) {
+        return;
+      }
+      std::unique_lock<std::mutex> lock(state.mutex);
+      assert(state.destructorProxyOperations > 0);
+      --state.destructorProxyOperations;
+      if (state.destructorProxyOperations == 0) {
+        state.destructorProxyCV.notify_all();
+      }
+    }
+
+    explicit operator bool() const { return admitted; }
+  };
+
+  struct ScopedFinishResult {
+    int error = 0;
+    bool leaseReleased = false;
+  };
+
 private:
   mutable std::mutex mutex;
   std::condition_variable operationCV;
+  std::condition_variable destructorProxyCV;
   State state = State::Unleased;
   size_t activeOperations = 0;
+  size_t destructorProxyOperations = 0;
+  bool destructorProxyingClosed = false;
 
   static thread_local ProfileLeaseState* drainState;
   // One outer WasmFS operation holds at most one deduplicated token for a
@@ -241,9 +310,33 @@ public:
            state == State::Failed;
   }
 
-  bool hasFailedDrain() const {
+  // A failed scoped transaction either still owns the lease (Failed) or has
+  // released it but did not complete worker retirement (Retiring). Neither
+  // state is a successful terminal handoff, and a later terminal drain must
+  // report it rather than silently retrying or returning success.
+  bool hasIncompleteScopedDrain() const {
     std::unique_lock<std::mutex> lock(mutex);
-    return state == State::Failed;
+    return state == State::Failed || state == State::Retiring;
+  }
+
+  // Retiring has no live Web Lock, but it still needs the lease-owner finalizer
+  // slot so terminal drain can surface its prior incomplete handoff.
+  bool needsTerminalLeaseFinalizer() const {
+    std::unique_lock<std::mutex> lock(mutex);
+    return state == State::Active || state == State::Sealing ||
+           state == State::Failed || state == State::Retiring;
+  }
+
+  void closeDestructorProxying() {
+    std::unique_lock<std::mutex> lock(mutex);
+    destructorProxyingClosed = true;
+    destructorProxyCV.wait(
+      lock, [&] { return destructorProxyOperations == 0; });
+  }
+
+  bool isDestructorProxyingClosed() {
+    std::unique_lock<std::mutex> lock(mutex);
+    return destructorProxyingClosed;
   }
 
   int beginDrain() {
@@ -254,7 +347,8 @@ public:
     if (state == State::Sealing) {
       return -EBUSY;
     }
-    if (state == State::Released || state == State::Failed) {
+    if (state == State::Released || state == State::Retiring ||
+        state == State::Retired || state == State::Failed) {
       return -ESHUTDOWN;
     }
     state = State::Sealing;
@@ -292,6 +386,59 @@ public:
     state = err == 0 ? State::Released : State::Failed;
     drainState = nullptr;
     return err;
+  }
+
+  ScopedFinishResult finishScopedDrain(Worker& proxy) {
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      assert(drainState == this);
+      if (state != State::Sealing) {
+        drainState = nullptr;
+        return {-ESHUTDOWN, false};
+      }
+    }
+
+    int error = 0;
+    int released = 0;
+    bool proxied = proxy([&](auto ctx) {
+      _wasmfs_opfs_release_profile_lease_and_retire_context(
+        ctx.ctx, proxy.getQueue(), &released, &error);
+    });
+    if (!proxied) {
+      error = -EIO;
+      // A JS callback can write the release witness and then be interrupted
+      // before it resets allocators/stops the heartbeat/finishes its proxying
+      // context. Only proxy completion acknowledges the whole transaction.
+      // Do not free the queue or claim a release in that ambiguous state.
+      released = 0;
+    }
+
+    std::unique_lock<std::mutex> lock(mutex);
+    assert(drainState == this);
+    // The JS transaction reports release separately because it can encounter
+    // a cleanup error only after Web Locks has acknowledged handoff.
+    state = released ? State::Released : State::Failed;
+    drainState = nullptr;
+    return {error, released != 0};
+  }
+
+  int beginRetirement() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (state != State::Released) {
+      return -ESHUTDOWN;
+    }
+    assert(destructorProxyingClosed);
+    assert(destructorProxyOperations == 0);
+    state = State::Retiring;
+    return 0;
+  }
+
+  void finishRetirement(bool success) {
+    std::unique_lock<std::mutex> lock(mutex);
+    assert(state == State::Retiring);
+    if (success) {
+      state = State::Retired;
+    }
   }
 };
 
@@ -476,7 +623,9 @@ public:
     // still be destroyed without pretending the close succeeded.
     assert(state.getKind() == OpenState::None ||
            state.getKind() == OpenState::FailedAccessClose);
-    if (fileID >= 0) {
+    ProfileLeaseState::DestructorProxyOperation destructorOperation(
+      *profileLeaseState);
+    if (destructorOperation && fileID >= 0) {
       proxy([&]() { _wasmfs_opfs_free_file(fileID); });
     }
   }
@@ -717,7 +866,9 @@ public:
   ~OPFSDirectory() override {
     // The root handle is shared by all mounts of this backend, so only child
     // directory handles are owned by their C++ wrappers. Slot 0 is reserved.
-    if (dirID != 0 && dirID != kOPFSRootDirectoryID) {
+    ProfileLeaseState::DestructorProxyOperation destructorOperation(
+      *profileLeaseState);
+    if (destructorOperation && dirID != 0 && dirID != kOPFSRootDirectoryID) {
       proxy([&]() { _wasmfs_opfs_free_directory(dirID); });
     }
   }
@@ -908,8 +1059,69 @@ public:
     return profileLeaseState->beginDrain();
   }
 
-  int finishOPFSProfileDrain(bool success) override {
-    return profileLeaseState->finishDrain(success, proxy);
+  int prepareOPFSProfileRetirement(bool checkResources) override {
+    // This runs only after WasmFS has recorded the one-way sealed result bit.
+    // Close/wait the destructor proxy gate before the worker fence.  A fence
+    // failure leaves this backend sealed, so cached File/Directory destructors
+    // must already be unable to enqueue into a Worker that can later be
+    // abandoned rather than joined.
+    profileLeaseState->closeDestructorProxying();
+
+    // Fence before any later scoped cleanup can fail.  The gate above remains
+    // closed on every failure path; JS allocators are not reset until the
+    // release-and-retire transaction below acknowledges success.
+    if (int error = proxy.fenceForRetirement()) {
+      return error;
+    }
+    if (!checkResources) {
+      return 0;
+    }
+    int error = 0;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_prepare_profile_retirement(ctx.ctx, &error);
+        })) {
+      return -EIO;
+    }
+    return error;
+  }
+
+  int finishOPFSProfileDrain(bool success, bool* leaseReleased) override {
+    assert(leaseReleased);
+    *leaseReleased = false;
+    if (!success) {
+      int error = profileLeaseState->finishDrain(false, proxy);
+      // prepareOPFSProfileRetirement() closes this gate before attempting the
+      // browser-main fence. The failure fallback below retains a live queue,
+      // but no cached OPFS File/Directory destructor may enqueue into it.
+      assert(profileLeaseState->isDestructorProxyingClosed());
+      proxy.abandonScopedProfileWorker();
+      return error;
+    }
+
+    auto result = profileLeaseState->finishScopedDrain(proxy);
+    *leaseReleased = result.leaseReleased;
+    if (!result.leaseReleased) {
+      // The transaction did not acknowledge a safe Web Locks release. Keep
+      // its worker/heartbeat as a fail-closed tombstone (an interrupted
+      // callback can leave physical release indeterminate). This detaches on
+      // the application pthread and deliberately retains queue storage.
+      assert(profileLeaseState->isDestructorProxyingClosed());
+      proxy.abandonScopedProfileWorker();
+    } else {
+      // The transaction only reports release after it also reset OPFS state
+      // and cleared its worker-local heartbeat.
+      proxy.markHeartbeatStopped();
+    }
+    return result.error;
+  }
+
+  int retireOPFSProfileBackend(bool transactionSucceeded) override {
+    if (int error = profileLeaseState->beginRetirement()) {
+      return error;
+    }
+    int error = proxy.retire();
+    profileLeaseState->finishRetirement(error == 0 && transactionSucceeded);
+    return error;
   }
 
   int getOPFSProfilePriorCloseError() const override {
@@ -922,41 +1134,73 @@ public:
     // through the backend-finalizer counter. A close that failed before drain
     // begins is different: it is absent from FileTable and must be surfaced by
     // the backend latch below while `success` is still true.
+    if (profileLeaseState->hasIncompleteScopedDrain()) {
+      // Do not retry either an ambiguous retained lease or an already
+      // released-but-incompletely-retired worker. Both are terminal failures
+      // of the earlier scoped handoff and must remain visible to the caller.
+      return -ESHUTDOWN;
+    }
     if (!profileLeaseState->hasLiveLease()) {
       return 0;
     }
 
     int beginError = profileLeaseState->beginDrain();
-    // A scoped profile drain already sealed this backend. It either released
-    // the lease or deliberately retained it in Failed state; global terminal
-    // teardown must never retry that ambiguous release. Do still surface the
-    // failed scoped handoff: returning success here would hide a live profile
-    // lease behind an apparently successful terminal result.
+    // A scoped profile drain already sealed this backend. Its Failed state has
+    // no acknowledged safe release (and an interrupted callback can be
+    // physically indeterminate); Retiring has an acknowledged release but an
+    // incomplete worker handoff. Global terminal teardown must never retry
+    // either state or report it as a success.
     if (beginError == -ESHUTDOWN) {
-      return profileLeaseState->hasFailedDrain() ? -ESHUTDOWN : 0;
+      return profileLeaseState->hasIncompleteScopedDrain() ? -ESHUTDOWN : 0;
     }
     if (beginError) {
       return beginError;
     }
 
-    if (!success) {
-      return profileLeaseState->finishDrain(false, proxy);
-    }
-
-    if (int error = terminalCloseState->getFailedAccessCloseError()) {
+    int firstError = 0;
+    bool cleanupSucceeded = success;
+    if (cleanupSucceeded &&
+        (firstError = terminalCloseState->getFailedAccessCloseError())) {
       // An ordinary close can fail before terminalDrain begins, after which
       // its descriptor has already left FileTable. Surface that terminal
       // resource failure and retain any cooperative lease rather than treating
       // an empty table as a safe browser-side handoff.
-      (void)profileLeaseState->finishDrain(false, proxy);
-      return error;
+      cleanupSucceeded = false;
     }
 
-    return profileLeaseState->finishDrain(true, proxy);
+    // Terminal profile release has the same Worker lifetime requirement as a
+    // scoped release: global WasmFS destruction can run on browser main after
+    // EXIT_RUNTIME, so it must never be left to join this Worker. Use the
+    // exact preflight, one-worker release/reset/heartbeat-stop transaction,
+    // and application-pthread retirement sequence used by the scoped API.
+    if (int error = prepareOPFSProfileRetirement(cleanupSucceeded)) {
+      firstError = firstError ? firstError : error;
+      cleanupSucceeded = false;
+    }
+
+    bool leaseReleased = false;
+    if (int error = finishOPFSProfileDrain(cleanupSucceeded, &leaseReleased)) {
+      firstError = firstError ? firstError : error;
+    }
+    if (!leaseReleased) {
+      // Do not let an implementation omission turn a completed terminal
+      // cleanup into a false success without an acknowledged lease handoff.
+      // If another terminal finalizer already failed, this backend has not
+      // acknowledged a new release; do not manufacture a second error.
+      return firstError ? firstError : cleanupSucceeded ? -EIO : 0;
+    }
+
+    // A cleanup error after release still needs native Worker retirement to
+    // make the eventual global destructor browser-main-safe. Passing false
+    // preserves Retiring and a non-success terminal result.
+    if (int error = retireOPFSProfileBackend(firstError == 0)) {
+      firstError = firstError ? firstError : error;
+    }
+    return firstError;
   }
 
   bool releasesTerminalLease() const override {
-    return profileLeaseState->hasLiveLease();
+    return profileLeaseState->needsTerminalLeaseFinalizer();
   }
 
   ~OPFSBackend() override {

@@ -52,13 +52,23 @@ static const char kMountPath[] = "/profile-drain-release-failure";
 #elif defined(WASMFS_OPFS_PROFILE_DRAIN_REENTRY)
 static const char kProfileName[] = "wasmfs-opfs-profile-drain-reentry";
 static const char kMountPath[] = "/profile-drain-reentry";
+#elif defined(WASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE)
+static const char kProfileName[] =
+  "wasmfs-opfs-profile-drain-retire-failure";
+static const char kMountPath[] = "/profile-drain-retire-failure";
+#elif defined(WASMFS_OPFS_PROFILE_DRAIN_FENCE_FAILURE)
+static const char kProfileName[] =
+  "wasmfs-opfs-profile-drain-fence-failure";
+static const char kMountPath[] = "/profile-drain-fence-failure";
 #else
 #error "select one scoped profile drain scenario"
 #endif
 
 static int ErrorOrEIO(void) { return errno ? errno : EIO; }
 
-#if defined(WASMFS_OPFS_PROFILE_DRAIN_NORMAL) && \
+#if (defined(WASMFS_OPFS_PROFILE_DRAIN_NORMAL) || \
+     defined(WASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE) || \
+     defined(WASMFS_OPFS_PROFILE_DRAIN_FENCE_FAILURE)) && \
   defined(WASMFS_OPFS_PROFILE_DRAIN_HOLDER)
 static _Atomic int normal_holder_shutdown_requested;
 static _Atomic int normal_holder_progress;
@@ -74,6 +84,7 @@ int wasmfs_opfs_profile_drain_holder_progress(void) {
 // This runs after the scoped drain and after the parent has tested a fresh
 // contender while this holder remains live. It is a native atexit witness that
 // unrelated WasmFS paths stay usable through the ordinary runtime exit tail.
+#if defined(WASMFS_OPFS_PROFILE_DRAIN_NORMAL)
 static void NormalHolderAtexit(void) {
   int fd = open("/tmp/scoped-profile-drain-atexit",
                 O_CREAT | O_TRUNC | O_WRONLY,
@@ -82,6 +93,7 @@ static void NormalHolderAtexit(void) {
     abort();
   }
 }
+#endif
 
 EMSCRIPTEN_KEEPALIVE
 void wasmfs_opfs_profile_drain_holder_shutdown(void) {
@@ -157,6 +169,21 @@ struct TerminalDrainThread {
   wasmfs_terminal_drain_result details;
 };
 
+static void* ChurnPthreadAfterRetirement(void* arg) {
+  (void)arg;
+  // This runs only after backend_retired proves the former dedicated OPFS
+  // Worker is fenced out of PThread.unusedWorkers. Creating and joining a new
+  // pthread exercises normal pool reuse while the sealed OPFS mount and its
+  // cached wrappers remain live until global WasmFS destruction.
+  int fd = open("/tmp/scoped-profile-drain-pthread-churn",
+                O_CREAT | O_TRUNC | O_WRONLY,
+                0600);
+  assert(fd >= 0);
+  assert(write(fd, "c", 1) == 1);
+  assert(close(fd) == 0);
+  return NULL;
+}
+
 static void* WriteWhileSealing(void* arg) {
   struct WriteThread* state = arg;
   // A positioned write does not disturb the still-buffered marker stream.
@@ -177,6 +204,23 @@ static void* AttemptTerminalDrain(void* arg) {
   return NULL;
 }
 
+#ifdef WASMFS_OPFS_PROFILE_DRAIN_HOLDER
+// This export is invoked by the iframe's browser JS main thread after the
+// worker-side scoped drain result. Under PROXY_TO_PTHREAD runtime-main is a
+// different Worker, so this specifically verifies the public ABI rejects the
+// browser main before it can cancel/join a dedicated OPFS worker.
+static backend_t browser_main_attempt_backend;
+EMSCRIPTEN_KEEPALIVE
+int wasmfs_opfs_profile_drain_browser_main_attempt(void) {
+  wasmfs_opfs_profile_drain_result result = {0};
+  return wasmfs_drain_opfs_profile_backend(browser_main_attempt_backend,
+                                           &result) == -EAGAIN &&
+                 result.error == -EAGAIN
+           ? 0
+           : 1;
+}
+#endif
+
 static void WaitForTestState(int (*get_state)(void), int expected) {
   for (int i = 0; i < 10000; ++i) {
     if (get_state() == expected) {
@@ -189,6 +233,7 @@ static void WaitForTestState(int (*get_state)(void), int expected) {
 
 static int RunNormalHolder(backend_t backend) {
 #ifdef WASMFS_OPFS_PROFILE_DRAIN_HOLDER
+  browser_main_attempt_backend = backend;
   assert(atexit(NormalHolderAtexit) == 0);
   atomic_store(&normal_holder_progress, 1);
 #endif
@@ -196,6 +241,23 @@ static int RunNormalHolder(backend_t backend) {
 #ifdef WASMFS_OPFS_PROFILE_DRAIN_HOLDER
   atomic_store(&normal_holder_progress, 2);
 #endif
+
+  // Keep nested File/Directory wrappers cached in the mounted OPFS tree even
+  // after their descriptors close. Their eventual global destruction is the
+  // regression case: after scoped retirement they must not proxy a free_* to
+  // a dead Worker or cause a browser-main pthread join.
+  static const char kNestedPath[] = "/profile-drain-normal/nested";
+  static const char kCachedPath[] = "/profile-drain-normal/nested/cached";
+  if (mkdir(kNestedPath, 0700) != 0) {
+    assert(errno == EEXIST);
+  }
+  int cached = open(kCachedPath, O_CREAT | O_TRUNC | O_RDWR, 0600);
+  assert(cached >= 0);
+  assert(write(cached, "n", 1) == 1);
+  assert(close(cached) == 0);
+  int cached_directory = open(kNestedPath, O_RDONLY | O_DIRECTORY);
+  assert(cached_directory >= 0);
+  assert(close(cached_directory) == 0);
 
   int data = open(kMarkerPath, O_CREAT | O_TRUNC | O_RDWR, 0600);
   assert(data >= 0);
@@ -327,8 +389,10 @@ static int RunNormalHolder(backend_t backend) {
   assert(drain.details.data_close_failures == 0);
   assert(drain.details.prior_close_failures == 0);
   assert(drain.details.lease_release_failures == 0);
+  assert(drain.details.backend_retire_failures == 0);
   assert(drain.details.backend_sealed == 1);
   assert(drain.details.lease_released == 1);
+  assert(drain.details.backend_retired == 1);
 #ifdef WASMFS_OPFS_PROFILE_DRAIN_HOLDER
   atomic_store(&normal_holder_progress, 6);
 #endif
@@ -358,10 +422,19 @@ static int RunNormalHolder(backend_t backend) {
   errno = 0;
   assert(open(kMarkerPath, O_RDONLY) == -1);
   assert(errno == ESHUTDOWN);
+  errno = 0;
+  assert(open(kCachedPath, O_RDONLY) == -1);
+  assert(errno == ESHUTDOWN);
+
+  pthread_t churn_thread;
+  assert(pthread_create(
+           &churn_thread, NULL, ChurnPthreadAfterRetirement, NULL) == 0);
+  assert(pthread_join(churn_thread, NULL) == 0);
 
   wasmfs_opfs_profile_drain_result again = {0};
   assert(wasmfs_drain_opfs_profile_backend(backend, &again) == -ESHUTDOWN);
   assert(again.error == -ESHUTDOWN);
+  assert(again.backend_retired == 0);
   return 0;
 }
 
@@ -398,8 +471,10 @@ static int RunNoMountHolder(backend_t backend) {
   assert(drain.error == 0);
   assert(drain.detached_descriptors == 0);
   assert(drain.data_file_states == 0);
+  assert(drain.backend_retire_failures == 0);
   assert(drain.backend_sealed == 1);
   assert(drain.lease_released == 1);
+  assert(drain.backend_retired == 1);
   return 0;
 }
 
@@ -427,8 +502,10 @@ static int RunCloseFailureHolder(backend_t backend) {
   assert(drain.data_close_failures == 1);
   assert(drain.prior_close_failures == 0);
   assert(drain.lease_release_failures == 0);
+  assert(drain.backend_retire_failures == 0);
   assert(drain.backend_sealed == 1);
   assert(drain.lease_released == 0);
+  assert(drain.backend_retired == 0);
   struct stat buffer;
   errno = 0;
   ExpectErrno(fstat(fd, &buffer), EBADF);
@@ -461,8 +538,10 @@ static int RunCloseBeforeHolder(backend_t backend) {
   assert(drain.data_close_failures == 0);
   assert(drain.prior_close_failures == 1);
   assert(drain.lease_release_failures == 0);
+  assert(drain.backend_retire_failures == 0);
   assert(drain.backend_sealed == 1);
   assert(drain.lease_released == 0);
+  assert(drain.backend_retired == 0);
 
   // A later global terminal drain must report the previously failed scoped
   // handoff rather than claiming success while this holder still retains its
@@ -489,12 +568,102 @@ static int RunReleaseFailureHolder(backend_t backend) {
   assert(drain.data_close_failures == 0);
   assert(drain.prior_close_failures == 0);
   assert(drain.lease_release_failures == 1);
+  assert(drain.backend_retire_failures == 0);
   assert(drain.backend_sealed == 1);
   assert(drain.lease_released == 0);
+  assert(drain.backend_retired == 0);
 
   wasmfs_opfs_profile_drain_result again = {0};
   assert(wasmfs_drain_opfs_profile_backend(backend, &again) == -ESHUTDOWN);
   assert(again.error == -ESHUTDOWN);
+  return 0;
+}
+
+#elif defined(WASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE)
+
+static int RunRetireFailureHolder(backend_t backend) {
+  assert(wasmfs_create_directory(kMountPath, 0700, backend) == 0);
+  static const char kNestedPath[] =
+    "/profile-drain-retire-failure/nested";
+  static const char kCachedPath[] =
+    "/profile-drain-retire-failure/nested/cached";
+  if (mkdir(kNestedPath, 0700) != 0) {
+    assert(errno == EEXIST);
+  }
+  int cached = open(kCachedPath, O_CREAT | O_TRUNC | O_RDWR, 0600);
+  assert(cached >= 0);
+  assert(write(cached, "r", 1) == 1);
+  assert(close(cached) == 0);
+  int cached_directory = open(kNestedPath, O_RDONLY | O_DIRECTORY);
+  assert(cached_directory >= 0);
+  assert(close(cached_directory) == 0);
+
+  wasmfs_opfs_profile_drain_result drain = {0};
+  assert(wasmfs_drain_opfs_profile_backend(backend, &drain) == -EIO);
+  assert(drain.error == -EIO);
+  assert(drain.lease_release_failures == 0);
+  assert(drain.backend_retire_failures == 1);
+  assert(drain.backend_sealed == 1);
+  // The test hook reports only after the worker-side transaction has released
+  // Web Locks, reset allocators, and stopped the heartbeat. Native retirement
+  // still runs, but the structured result must never call this a success.
+  assert(drain.lease_released == 1);
+  assert(drain.backend_retired == 0);
+  errno = 0;
+  assert(open(kCachedPath, O_RDONLY) == -1);
+  assert(errno == ESHUTDOWN);
+
+  // A later terminal drain must not hide this released-but-not-retired state
+  // behind a false success or retry the one-way transaction.
+  wasmfs_terminal_drain_result terminal = {0};
+  assert(wasmfs_terminal_drain(&terminal) == -ESHUTDOWN);
+  assert(terminal.error == -ESHUTDOWN);
+  assert(terminal.backend_terminal_failures == 1);
+  return EIO;
+}
+
+static int RunRetireFailureContender(backend_t backend) {
+  assert(wasmfs_create_directory(kMountPath, 0700, backend) == 0);
+  return 0;
+}
+
+#elif defined(WASMFS_OPFS_PROFILE_DRAIN_FENCE_FAILURE)
+
+static int RunFenceFailureHolder(backend_t backend) {
+  assert(wasmfs_create_directory(kMountPath, 0700, backend) == 0);
+  static const char kNestedPath[] = "/profile-drain-fence-failure/nested";
+  static const char kCachedPath[] =
+    "/profile-drain-fence-failure/nested/cached";
+  if (mkdir(kNestedPath, 0700) != 0) {
+    assert(errno == EEXIST);
+  }
+  int cached = open(kCachedPath, O_CREAT | O_TRUNC | O_RDWR, 0600);
+  assert(cached >= 0);
+  assert(write(cached, "f", 1) == 1);
+  assert(close(cached) == 0);
+  int cached_directory = open(kNestedPath, O_RDONLY | O_DIRECTORY);
+  assert(cached_directory >= 0);
+  assert(close(cached_directory) == 0);
+
+  wasmfs_opfs_profile_drain_result drain = {0};
+  assert(wasmfs_drain_opfs_profile_backend(backend, &drain) == -EIO);
+  assert(drain.error == -EIO);
+  assert(drain.lease_release_failures == 0);
+  assert(drain.backend_retire_failures == 1);
+  assert(drain.backend_sealed == 1);
+  assert(drain.lease_released == 0);
+  assert(drain.backend_retired == 0);
+  errno = 0;
+  assert(open(kCachedPath, O_RDONLY) == -1);
+  assert(errno == ESHUTDOWN);
+
+  // The deliberate browser-main fence failure leaves an uncancelled terminal
+  // holder. A later terminal drain must report it instead of retrying release
+  // or manufacturing a successful result.
+  wasmfs_terminal_drain_result terminal = {0};
+  assert(wasmfs_terminal_drain(&terminal) == -ESHUTDOWN);
+  assert(terminal.error == -ESHUTDOWN);
+  assert(terminal.backend_terminal_failures == 1);
   return 0;
 }
 
@@ -533,8 +702,10 @@ static int RunReentryHolder(backend_t backend) {
   assert(drain.error == -ESHUTDOWN);
   assert(drain.libc_flush_failed == 1);
   assert(drain.data_file_states == 0);
+  assert(drain.backend_retire_failures == 0);
   assert(drain.backend_sealed == 1);
   assert(drain.lease_released == 0);
+  assert(drain.backend_retired == 0);
   assert(state.calls == 1);
   assert(state.error == ESHUTDOWN);
   (void)fclose(cookie);
@@ -558,6 +729,10 @@ static int RunHolder(void) {
   return RunCloseBeforeHolder(backend);
 #elif defined(WASMFS_OPFS_PROFILE_DRAIN_RELEASE_FAILURE)
   return RunReleaseFailureHolder(backend);
+#elif defined(WASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE)
+  return RunRetireFailureHolder(backend);
+#elif defined(WASMFS_OPFS_PROFILE_DRAIN_FENCE_FAILURE)
+  return RunFenceFailureHolder(backend);
 #else
   return RunReentryHolder(backend);
 #endif
@@ -572,6 +747,8 @@ static int RunContender(void) {
   return RunNormalContender(backend);
 #elif defined(WASMFS_OPFS_PROFILE_DRAIN_NO_MOUNT)
   return RunNoMountContender(backend);
+#elif defined(WASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE)
+  return RunRetireFailureContender(backend);
 #else
   // A close or reentrant-stream failure must retain the Web Lock while this
   // holder remains live. Reaching this line would be a false success.
@@ -593,7 +770,9 @@ int main(void) {
                error == 0 ? kReady : error == EBUSY ? kBusy : kFailure,
                error);
 #endif
-#if defined(WASMFS_OPFS_PROFILE_DRAIN_NORMAL) && \
+#if (defined(WASMFS_OPFS_PROFILE_DRAIN_NORMAL) || \
+     defined(WASMFS_OPFS_PROFILE_DRAIN_RETIRE_FAILURE) || \
+     defined(WASMFS_OPFS_PROFILE_DRAIN_FENCE_FAILURE)) && \
   defined(WASMFS_OPFS_PROFILE_DRAIN_HOLDER)
   emscripten_set_main_loop(ExitNormalHolderWhenRequested, 0, false);
 #else

@@ -115,14 +115,15 @@ backend_t wasmfs_create_opfs_backend(void);
 // unavailable, EBUSY when another module sharing the storage bucket already
 // holds the lease, or EIO for an unexpected Web Locks failure.
 //
-// During an orderly `wasmfs_terminal_drain` or
-// `wasmfs_drain_opfs_profile_backend`, the lease is synchronously released
-// only after all corresponding cleanup has succeeded. `wasmfs_unmount` does
-// not release it, because WasmFS retains created backends until teardown.
-// There is intentionally no API to release it while the backend can still
-// service filesystem operations. Ordinary backend destruction never reports a
-// successful release: abrupt execution-context teardown relies on Web Locks'
-// context cleanup and does not imply that open files were flushed.
+// An active leased backend must complete the result-bearing
+// `wasmfs_terminal_drain` or `wasmfs_drain_opfs_profile_backend` on an
+// application pthread before normal EXIT_RUNTIME. `wasmfs_unmount` does not
+// release it, because WasmFS retains created backends until teardown. There is
+// intentionally no API to release it while the backend can still service
+// filesystem operations. Raw EXIT_RUNTIME without one of those explicit
+// drains is not a supported orderly leased-profile lifecycle: browser-context
+// Web Locks cleanup may occur, but establishes neither durability nor worker
+// retirement evidence.
 backend_t wasmfs_create_opfs_backend_with_profile_lease(
   const char* profile_name);
 
@@ -176,16 +177,18 @@ void wasmfs_flush(void);
 // or application task quiescence guarantees. In particular, it is not a
 // Chromium profile shutdown protocol. A leased OPFS backend synchronously
 // releases its cooperative lease only after all earlier terminal cleanup has
-// succeeded. A failed cleanup, or an ambiguous lease-release result, retains
-// that backend's lease state and prevents a destructor retry; abrupt
-// runtime/context termination can still cause browser Web Locks cleanup. For
-// the supported leased-OPFS configuration, a zero result means its synchronous
-// terminal lease release completed; a nonzero result retains the lease because
-// cleanup or release was ambiguous or failed.
+// succeeded. A failed cleanup, or an ambiguous lease-release result, prevents
+// a destructor retry; abrupt runtime/context termination can still cause
+// browser Web Locks cleanup. For the supported leased-OPFS configuration, a
+// zero result means synchronous terminal lease release and worker retirement
+// completed. A nonzero result is not a successful handoff: it can retain the
+// lease, or it can follow an acknowledged lease release whose worker
+// retirement did not complete.
 //
 // Returns -EINVAL for a null result, -EDEADLK when called from an admitted
-// WasmFS operation, -EAGAIN on the Emscripten runtime main thread, -EBUSY when
-// another thread is draining, -ESHUTDOWN after a completed drain, or
+// WasmFS operation, -EAGAIN on either the Emscripten runtime main thread or
+// browser main thread, -EBUSY when another thread is draining, -ESHUTDOWN
+// after a completed drain, or
 // result->error after this call's cleanup attempt.
 int wasmfs_terminal_drain(wasmfs_terminal_drain_result* _Nonnull result);
 
