@@ -115,9 +115,18 @@ void Directory::Handle::cacheChild(const std::string& name,
 }
 
 std::shared_ptr<File> Directory::Handle::getChild(const std::string& name) {
+  auto child = getChildWithError(name);
+  if (child.getError()) {
+    return nullptr;
+  }
+  return child.getFile();
+}
+
+Directory::MaybeFile
+Directory::Handle::getChildWithError(const std::string& name) {
   // Unlinked directories must be empty, without even "." or ".."
   if (!getParent()) {
-    return nullptr;
+    return std::shared_ptr<File>();
   }
   if (name == ".") {
     return file;
@@ -132,11 +141,15 @@ std::shared_ptr<File> Directory::Handle::getChild(const std::string& name) {
   }
   // Otherwise check whether the backend contains an underlying file we don't
   // know about.
-  auto child = getDir()->getChild(name);
-  if (!child) {
-    return nullptr;
+  auto child = getDir()->getChildWithError(name);
+  if (child.getError()) {
+    return child;
   }
-  cacheChild(name, child, DCacheKind::Normal);
+  auto file = child.getFile();
+  if (!file) {
+    return child;
+  }
+  cacheChild(name, file, DCacheKind::Normal);
   return child;
 }
 

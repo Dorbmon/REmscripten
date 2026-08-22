@@ -49,15 +49,19 @@ ParsedFile getChild(std::shared_ptr<Directory> dir,
   if (int err = wasmFS.admitBackend(dir->getBackend())) {
     return err;
   }
-  auto child = dir->locked().getChild(std::string(name));
-  if (!child) {
+  auto child = dir->locked().getChildWithError(std::string(name));
+  if (int err = child.getError()) {
+    return err;
+  }
+  auto file = child.getFile();
+  if (!file) {
     return -ENOENT;
   }
-  if (int err = wasmFS.admitBackend(child->getBackend())) {
+  if (int err = wasmFS.admitBackend(file->getBackend())) {
     return err;
   }
   if (links != NoFollowLinks) {
-    while (auto link = child->dynCast<Symlink>()) {
+    while (auto link = file->dynCast<Symlink>()) {
       if (++recursions > MAX_RECURSIONS) {
         return -ELOOP;
       }
@@ -69,10 +73,10 @@ ParsedFile getChild(std::shared_ptr<Directory> dir,
       if (auto err = parsed.getError()) {
         return err;
       }
-      child = parsed.getFile();
+      file = parsed.getFile();
     }
   }
-  return child;
+  return file;
 }
 
 ParsedParent doParseParent(std::string_view path,

@@ -2030,6 +2030,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     self.ignore_case = kwargs.pop('ignore_case')
     self.record_lock_test = kwargs.pop('record_lock_test')
     self.opfs_profile_drain_test = kwargs.pop('opfs_profile_drain_test')
+    self.opfs_get_child_proxy_failure_test = kwargs.pop(
+        'opfs_get_child_proxy_failure_test')
     super().__init__(**kwargs)
 
   def get_cflags(self):
@@ -2040,6 +2042,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       cflags += ['-DWASMFS_RECORD_LOCK_TEST']
     if self.opfs_profile_drain_test:
       cflags += ['-DWASMFS_OPFS_PROFILE_DRAIN_TEST']
+    if self.opfs_get_child_proxy_failure_test:
+      cflags += ['-DWASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE']
     return cflags
 
   def get_base_name(self):
@@ -2050,12 +2054,15 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       name += '-record-lock-test'
     if self.opfs_profile_drain_test:
       name += '-opfs-profile-drain-test'
+    if self.opfs_get_child_proxy_failure_test:
+      name += '-opfs-get-child-proxy-failure-test'
     return name
 
   @classmethod
   def vary_on(cls):
     return super().vary_on() + [
-      'ignore_case', 'record_lock_test', 'opfs_profile_drain_test']
+      'ignore_case', 'record_lock_test', 'opfs_profile_drain_test',
+      'opfs_get_child_proxy_failure_test']
 
   @classmethod
   def get_default_variation(cls, **kwargs):
@@ -2063,6 +2070,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
         ignore_case=settings.CASE_INSENSITIVE_FS,
         record_lock_test=settings.WASMFS_RECORD_LOCK_TEST,
         opfs_profile_drain_test=settings.WASMFS_OPFS_PROFILE_DRAIN_TEST,
+        opfs_get_child_proxy_failure_test=(
+            settings.WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE),
         **kwargs)
 
   def get_files(self):

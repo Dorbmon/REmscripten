@@ -1878,6 +1878,26 @@ var WASMFS_OPFS_TEST_LEASE_RELEASE_FAILURE = 0;
 // [link]
 var WASMFS_OPFS_TEST_FILE_HANDLE_CACHE = 0;
 
+// Test-only selector that makes one named OPFS directory lookup throw before
+// it reaches the browser API. This verifies that the lookup path returns EIO
+// rather than inventing ENOENT or trapping. Production builds leave it
+// disabled and expose no runtime configuration API.
+// [link]
+var WASMFS_OPFS_TEST_GET_CHILD_ERROR = 0;
+
+// Test-only selector that makes one exact OPFS directory lookup behave as if
+// its ProxyWorker had stopped before running the callback. This exercises the
+// C++ fail-closed proxy-return path; production builds leave it disabled.
+// [link]
+var WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE = 0;
+
+// Test-only selector that returns malformed OPFS child ABI values for exact
+// names. This verifies that C++ rejects malformed bridge output as EIO rather
+// than constructing an invalid File or Directory. Production builds leave it
+// disabled.
+// [link]
+var WASMFS_OPFS_TEST_GET_CHILD_MALFORMED_RESULT = 0;
+
 // Test-only selector that injects QuotaExceededError immediately before a
 // direct OPFS SyncAccessHandle write. This controls code emitted at link time
 // only; it does not emulate physical quota exhaustion.

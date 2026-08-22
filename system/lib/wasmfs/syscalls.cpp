@@ -953,7 +953,11 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
   std::shared_ptr<File> child;
   {
     auto lockedParent = parent->locked();
-    child = lockedParent.getChild(std::string(childName));
+    auto lookup = lockedParent.getChildWithError(std::string(childName));
+    if (int err = lookup.getError()) {
+      return err;
+    }
+    child = lookup.getFile();
     // The requested node was not found.
     if (!child) {
       // If curr is the last element and the create flag is specified
@@ -1183,7 +1187,11 @@ doMkdir(path::ParsedParent parsed,
   }
 
   // Check if the requested directory already exists.
-  if (auto child = lockedParent.getChild(childName)) {
+  auto lookup = lockedParent.getChildWithError(childName);
+  if (int err = lookup.getError()) {
+    return err;
+  }
+  if (auto child = lookup.getFile()) {
     if (int err = admitFile(child)) {
       return err;
     }
@@ -1475,7 +1483,11 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
   auto& [parent, childNameView] = parsed.getParentChild();
   std::string childName(childNameView);
   auto lockedParent = parent->locked();
-  auto file = lockedParent.getChild(childName);
+  auto lookup = lockedParent.getChildWithError(childName);
+  if (int err = lookup.getError()) {
+    return err;
+  }
+  auto file = lookup.getFile();
   if (!file) {
     return -ENOENT;
   }
@@ -1545,7 +1557,11 @@ int wasmfs_unmount(const char* path) {
     std::shared_ptr<Directory> mount;
     {
       auto lockedParent = parent->locked();
-      auto file = lockedParent.getChild(childName);
+      auto lookup = lockedParent.getChildWithError(childName);
+      if (int err = lookup.getError()) {
+        return err;
+      }
+      auto file = lookup.getFile();
       if (!file) {
         return -ENOENT;
       }
@@ -1577,7 +1593,11 @@ int wasmfs_unmount(const char* path) {
     }
 
     auto lockedParent = parent->locked();
-    if (lockedParent.getChild(childName) != mount) {
+    auto lookup = lockedParent.getChildWithError(childName);
+    if (int err = lookup.getError()) {
+      return err;
+    }
+    if (lookup.getFile() != mount) {
       continue;
     }
     // Input is valid, perform the unlink.
@@ -1721,9 +1741,18 @@ int __syscall_renameat(int olddirfd,
   auto lockedOldParent = oldParent->locked();
   auto lockedNewParent = newParent->locked();
 
-  // Get the source and destination files.
-  auto oldFile = lockedOldParent.getChild(oldFileName);
-  auto newFile = lockedNewParent.getChild(newFileName);
+  // Get the source and destination files. Preserve source lookup failure
+  // precedence so an I/O error never becomes a missing source or destination.
+  auto oldLookup = lockedOldParent.getChildWithError(oldFileName);
+  if (int err = oldLookup.getError()) {
+    return err;
+  }
+  auto newLookup = lockedNewParent.getChildWithError(newFileName);
+  if (int err = newLookup.getError()) {
+    return err;
+  }
+  auto oldFile = oldLookup.getFile();
+  auto newFile = newLookup.getFile();
 
   // Check either discovered leaf before returning a non-profile lookup
   // result. In particular, rename("missing", "/profile") must not reveal a
@@ -1816,7 +1845,11 @@ int __syscall_symlinkat(intptr_t target, int newdirfd, intptr_t linkpath) {
   }
   auto lockedParent = parent->locked();
   std::string childName(childNameView);
-  if (auto child = lockedParent.getChild(childName)) {
+  auto lookup = lockedParent.getChildWithError(childName);
+  if (int err = lookup.getError()) {
+    return err;
+  }
+  if (auto child = lookup.getFile()) {
     if (int err = admitFile(child)) {
       return err;
     }

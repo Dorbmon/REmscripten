@@ -38,8 +38,8 @@ void _wasmfs_opfs_release_profile_lease_and_retire_context(
 // Look up the child under `parent` with `name`. Write 1 to `child_type` if it's
 // a regular file or 2 if it's a directory. For a regular file, write zero to
 // `child_id`: its OPFSFile wrapper acquires a FileSystemFileHandle lazily. For
-// a directory, write its directory ID. Write a negative error to `child_id` if
-// the child does not exist or cannot be opened.
+// a directory, write its directory ID. Write -ENOENT to `child_id` only for a
+// confirmed missing child and another negative errno for every lookup failure.
 void _wasmfs_opfs_get_child(em_proxying_ctx* ctx,
                             int parent,
                             const char* name,

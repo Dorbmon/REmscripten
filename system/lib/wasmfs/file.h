@@ -183,6 +183,28 @@ public:
     ino_t ino;
   };
 
+  // A directory lookup either returns a (possibly null) File or the negative
+  // errno from the backend. A null File represents a confirmed missing child.
+  // Keep lookup errors distinct from that missing result: callers that create
+  // or mutate a path must never turn an I/O failure into an invented ENOENT.
+  struct MaybeFile : std::variant<std::shared_ptr<File>, int> {
+    using std::variant<std::shared_ptr<File>, int>::variant;
+
+    int getError() const {
+      if (const int* err = std::get_if<int>(this)) {
+        assert(*err < 0);
+        return *err;
+      }
+      return 0;
+    }
+
+    std::shared_ptr<File> getFile() const {
+      const auto* file = std::get_if<std::shared_ptr<File>>(this);
+      assert(file);
+      return *file;
+    }
+  };
+
   struct MaybeEntries : std::variant<std::vector<Entry>, int> {
     int getError() {
       if (int* err = std::get_if<int>(this)) {
@@ -218,6 +240,14 @@ protected:
   // Return the `File` object corresponding to the file with the given name or
   // null if there is none.
   virtual std::shared_ptr<File> getChild(const std::string& name) = 0;
+
+  // Error-aware counterpart to getChild(). Existing backends can retain their
+  // pointer-only implementation; a null result remains a confirmed missing
+  // child. Backends with meaningful lookup errors override this method so
+  // those errors can reach syscall decisions without becoming "missing".
+  virtual MaybeFile getChildWithError(const std::string& name) {
+    return getChild(name);
+  }
 
   // Inserts a file with the given name, kind, and mode. Returns a `File` object
   // corresponding to the newly created file or nullptr if the new file could
@@ -412,8 +442,13 @@ public:
     : File::Handle(directory, std::defer_lock) {}
 
   // Retrieve the child if it is in the dcache and otherwise forward the request
-  // to the backend, caching any `File` object it returns.
+  // to the backend, caching any `File` object it returns. This legacy wrapper
+  // intentionally collapses backend lookup errors for callers that do not yet
+  // need to distinguish them.
   std::shared_ptr<File> getChild(const std::string& name);
+
+  // Error-aware form of getChild(). It caches only successful File results.
+  MaybeFile getChildWithError(const std::string& name);
 
   // Add a child to this directory's entry cache without actually inserting it
   // in the underlying backend. Assumes a child with this name does not already

@@ -49,6 +49,7 @@ public:
     : VirtualDirectory(real, backend) {}
 
   std::shared_ptr<File> getChild(const std::string& name) override;
+  Directory::MaybeFile getChildWithError(const std::string& name) override;
   std::shared_ptr<DataFile> insertDataFile(const std::string& name,
                                            mode_t mode) override;
   std::shared_ptr<Directory> insertDirectory(const std::string& name,
@@ -92,17 +93,30 @@ std::shared_ptr<File> virtualize(std::shared_ptr<File> file,
 }
 
 std::shared_ptr<File> IgnoreCaseDirectory::getChild(const std::string& name) {
+  auto child = getChildWithError(name);
+  if (child.getError()) {
+    return nullptr;
+  }
+  return child.getFile();
+}
+
+Directory::MaybeFile
+IgnoreCaseDirectory::getChildWithError(const std::string& name) {
   auto normalized = normalize(name);
   if (auto it = children.find(normalized); it != children.end()) {
     return it->second.child;
   }
-  auto child = real->locked().getChild(normalized);
-  if (!child) {
-    return nullptr;
+  auto child = real->locked().getChildWithError(normalized);
+  if (child.getError()) {
+    return child;
   }
-  child = virtualize(child, getBackend());
-  children[normalized] = {name, child};
-  return child;
+  auto realChild = child.getFile();
+  if (!realChild) {
+    return child;
+  }
+  auto virtualChild = virtualize(realChild, getBackend());
+  children[normalized] = {name, virtualChild};
+  return virtualChild;
 }
 
 std::shared_ptr<DataFile>

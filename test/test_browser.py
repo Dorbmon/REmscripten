@@ -7395,6 +7395,16 @@ Module["preRun"] = () => {
     args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '--post-js', postjs]
     self.btest(test, cflags=args, expected='0')
 
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  def test_wasmfs_opfs_get_child_error(self):
+    self.btest_exit(
+      'wasmfs/wasmfs_opfs_get_child_error.c',
+      cflags=['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME',
+              '-sWASMFS_OPFS_TEST_GET_CHILD_ERROR=1',
+              '-sWASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE=1',
+              '-sWASMFS_OPFS_TEST_GET_CHILD_MALFORMED_RESULT=1'])
+
   def test_wasmfs_multi_environment(self):
     # Test that WasmFS's Node backend can be enabled conditionally, allowing
     # the same binaries to run on both web and Node.js environments.

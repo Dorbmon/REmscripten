@@ -40,6 +40,11 @@ constexpr size_t kMaxProfileLeaseNameLength = 128;
 // remains there for the lifetime of its backend's ProxyWorker.
 constexpr int kOPFSRootDirectoryID = 1;
 
+#ifdef WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE
+constexpr char kOPFSGetChildProxyFailureTestName[] =
+  "__wasmfs_opfs_test_get_child_proxy_failure__";
+#endif
+
 bool IsValidProfileLeaseName(const char* name) {
   if (!name) {
     return false;
@@ -883,20 +888,44 @@ private:
   }
 
   std::shared_ptr<File> getChild(const std::string& name) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
-    if (!operation) {
+    auto child = getChildWithError(name);
+    if (child.getError()) {
       return nullptr;
     }
-    int childType = 0, childID = 0;
-    proxy([&](auto ctx) {
-      _wasmfs_opfs_get_child(
-        ctx.ctx, dirID, name.c_str(), &childType, &childID);
-    });
-    if (childID < 0) {
-      // TODO: More fine-grained error reporting.
-      return NULL;
+    return child.getFile();
+  }
+
+  Directory::MaybeFile getChildWithError(const std::string& name) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
     }
-    if (childType == 1) {
+    // A cancelled proxy must not leave the default output values looking like
+    // a successful lookup. The JS side uses a negative child ID for every
+    // completed lookup failure; reserve the same fail-closed sentinel here
+    // until the proxy confirms that it ran.
+    int childType = 0;
+    int childID = -EIO;
+    bool proxyCompleted = false;
+#ifdef WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE
+    if (name != kOPFSGetChildProxyFailureTestName)
+#endif
+    {
+      proxyCompleted = proxy([&](auto ctx) {
+        _wasmfs_opfs_get_child(
+          ctx.ctx, dirID, name.c_str(), &childType, &childID);
+      });
+    }
+    if (!proxyCompleted) {
+      return -EIO;
+    }
+    if (childID < 0) {
+      if (childID == -ENOENT) {
+        return std::shared_ptr<File>();
+      }
+      return childID;
+    }
+    if (childType == 1 && childID == 0) {
       return std::make_shared<OPFSFile>(
         0777,
         getBackend(),
@@ -905,7 +934,8 @@ private:
         proxy,
         terminalCloseState,
         profileLeaseState);
-    } else if (childType == 2) {
+    }
+    if (childType == 2 && childID > kOPFSRootDirectoryID) {
       return std::make_shared<OPFSDirectory>(
         0777,
         getBackend(),
@@ -913,9 +943,11 @@ private:
         proxy,
         terminalCloseState,
         profileLeaseState);
-    } else {
-      WASMFS_UNREACHABLE("Unexpected child type");
     }
+    // Neither a malformed JS result nor a cancelled/failed proxy is a missing
+    // child. Propagate EIO to the syscall layer instead of trapping or
+    // fabricating ENOENT.
+    return -EIO;
   }
 
   std::shared_ptr<DataFile> insertDataFile(const std::string& name,

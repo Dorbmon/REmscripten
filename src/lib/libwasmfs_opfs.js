@@ -24,6 +24,14 @@
 #error "WASMFS_OPFS_TEST_FILE_HANDLE_CACHE must be 0 or 1"
 #endif
 
+#if WASMFS_OPFS_TEST_GET_CHILD_ERROR != 0 && WASMFS_OPFS_TEST_GET_CHILD_ERROR != 1
+#error "WASMFS_OPFS_TEST_GET_CHILD_ERROR must be 0 or 1"
+#endif
+
+#if WASMFS_OPFS_TEST_GET_CHILD_MALFORMED_RESULT != 0 && WASMFS_OPFS_TEST_GET_CHILD_MALFORMED_RESULT != 1
+#error "WASMFS_OPFS_TEST_GET_CHILD_MALFORMED_RESULT must be 0 or 1"
+#endif
+
 #if WASMFS_OPFS_TEST_QUOTA_WRITE != 0 && WASMFS_OPFS_TEST_QUOTA_WRITE != 1
 #error "WASMFS_OPFS_TEST_QUOTA_WRITE must be 0 or 1"
 #endif
@@ -421,16 +429,50 @@ addToLibrary({
                                  '$wasmfsOPFSGetOrCreateDir', '$wasmfsOPFSProxyFinish'],
   _wasmfs_opfs_get_child__async: 'auto',
   _wasmfs_opfs_get_child: async (ctx, parent, namePtr, childTypePtr, childIDPtr) => {
-    let name = UTF8ToString(namePtr);
-    let childType = 1;
-    let childID = await wasmfsOPFSGetOrCreateFile(parent, name, false);
-    if (childID == -{{{ cDefs.EISDIR }}}) {
-      childType = 2;
-      childID = await wasmfsOPFSGetOrCreateDir(parent, name, false);
+    // Keep lookup failure distinct from a missing child. C++ initializes the
+    // outputs to the same EIO sentinel in case proxying is cancelled before
+    // this callback runs.
+    let childType = 0;
+    let childID = -{{{ cDefs.EIO }}};
+    try {
+      let name = UTF8ToString(namePtr);
+#if WASMFS_OPFS_TEST_GET_CHILD_ERROR
+      if (name === '__wasmfs_opfs_test_get_child_eio__') {
+        throw new Error('wasmfs OPFS test lookup failure');
+      }
+#endif
+#if WASMFS_OPFS_TEST_GET_CHILD_MALFORMED_RESULT
+      if (name === '__wasmfs_opfs_test_get_child_malformed_file__') {
+        childType = 1;
+        childID = 1;
+        return;
+      }
+      if (name === '__wasmfs_opfs_test_get_child_malformed_directory__') {
+        childType = 2;
+        childID = 1;
+        return;
+      }
+#endif
+      childType = 1;
+      childID = await wasmfsOPFSGetOrCreateFile(parent, name, false);
+      if (childID == -{{{ cDefs.EISDIR }}}) {
+        childType = 2;
+        childID = await wasmfsOPFSGetOrCreateDir(parent, name, false);
+      }
+      // The get-or-create helpers retain EEXIST as their internal NotFound
+      // sentinel. Translate it only at this lookup ABI boundary so callers can
+      // distinguish confirmed ENOENT from all other backend failures.
+      if (childID == -{{{ cDefs.EEXIST }}}) {
+        childID = -{{{ cDefs.ENOENT }}};
+      }
+    } catch {
+      childType = 0;
+      childID = -{{{ cDefs.EIO }}};
+    } finally {
+      {{{ makeSetValue('childTypePtr', 0, 'childType', 'i32') }}};
+      {{{ makeSetValue('childIDPtr', 0, 'childID', 'i32') }}};
+      wasmfsOPFSProxyFinish(ctx);
     }
-    {{{ makeSetValue('childTypePtr', 0, 'childType', 'i32') }}};
-    {{{ makeSetValue('childIDPtr', 0, 'childID', 'i32') }}};
-    wasmfsOPFSProxyFinish(ctx);
   },
 
   _wasmfs_opfs_get_entries__deps: [

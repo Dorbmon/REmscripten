@@ -824,7 +824,13 @@ void WasmFS::preloadFiles() {
     _wasmfs_get_preloaded_child_path(i, childName);
 
     auto lockedParentDir = parentDir->locked();
-    if (lockedParentDir.getChild(childName)) {
+    auto child = lockedParentDir.getChildWithError(childName);
+    if (child.getError()) {
+      emscripten_err(
+        "Fatal error during directory lookup in file preloading.");
+      abort();
+    }
+    if (child.getFile()) {
       // The child already exists, so we don't need to do anything here.
       continue;
     }

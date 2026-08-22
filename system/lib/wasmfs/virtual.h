@@ -62,6 +62,9 @@ protected:
   virtual std::shared_ptr<File> getChild(const std::string& name) override {
     return real->locked().getChild(name);
   }
+  virtual MaybeFile getChildWithError(const std::string& name) override {
+    return real->locked().getChildWithError(name);
+  }
   virtual std::shared_ptr<DataFile> insertDataFile(const std::string& name,
                                                    mode_t mode) override {
     return real->locked().insertDataFile(name, mode);
