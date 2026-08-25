@@ -6316,6 +6316,221 @@ Module["preRun"] = () => {
     ''')
     self.run_browser('a.html', '/report_result?0', timeout=90)
 
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_namespace_recovery(self):
+    # This is deliberately only a controlled selector-publication interruption
+    # test for the opt-in logical namespace backend. It does not claim browser
+    # crash, power-loss, database, or complete Chromium profile recovery.
+    test = 'wasmfs/wasmfs_opfs_profile_namespace_recovery.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_OWNER',
+        '-o', 'owner.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_MUTATOR',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT=1',
+        '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT=1',
+        '-o', 'mutator-before-selector.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_MUTATOR',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT=2',
+        '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT=2',
+        '-o', 'mutator-after-selector.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER',
+        '-o', 'verifier.html',
+      ],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        // This coordinates only the test module's selector-publication hook.
+        // It never reads or writes OPFS, and iframe disposal here is not a
+        // claim about browser, renderer, power-loss, or database recovery.
+        const kOwner = 0;
+        const kMutator = 1;
+        const kVerifier = 2;
+        const kReady = 0;
+        const kBusy = 1;
+        const kStagedTree = 2;
+        const kPublishedTree = 3;
+        const kBeforeSelectorPublication = 1;
+        const kAfterSelectorPublication = 2;
+        const kModuleTimeoutMs = 15000;
+        const kLeaseReleaseDeadlineMs = 10000;
+        const kLeaseRetryDelayMs = 100;
+        const kWitnessType = 'wasmfs-opfs-profile-namespace-recovery';
+        const pendingModules = new Map();
+        const pendingWitnesses = [];
+        let witnessWaiter = undefined;
+        const witnessChannel = new BroadcastChannel(kWitnessType);
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        async function startLeasedModule(path, role, description) {
+          const deadline = Date.now() + kLeaseReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            const candidate = await startModule(path);
+            if (candidate.message.role != role) {
+              candidate.frame.remove();
+              throw new Error(description + ' reported role ' +
+                              candidate.message.role + ', expected ' + role);
+            }
+            if (candidate.message.result != kBusy) {
+              return candidate;
+            }
+            candidate.frame.remove();
+            await delay(kLeaseRetryDelayMs);
+          }
+          throw new Error(description +
+                          ' did not acquire a fresh OPFS profile lease');
+        }
+
+        function settleWitness(witness) {
+          if (witnessWaiter && witnessWaiter.phase == witness.phase) {
+            const {resolve, timeout} = witnessWaiter;
+            witnessWaiter = undefined;
+            clearTimeout(timeout);
+            resolve(witness);
+          } else {
+            pendingWitnesses.push(witness);
+          }
+        }
+
+        function waitForWitness(phase) {
+          const index = pendingWitnesses.findIndex(
+            (witness) => witness.phase == phase);
+          if (index >= 0) {
+            return Promise.resolve(pendingWitnesses.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              witnessWaiter = undefined;
+              reject(new Error('timed out waiting for selector phase ' + phase));
+            }, kModuleTimeoutMs);
+            witnessWaiter = {phase, resolve, timeout};
+          });
+        }
+
+        witnessChannel.onmessage = (event) => {
+          if (event.data?.type == kWitnessType &&
+              (event.data.phase == kBeforeSelectorPublication ||
+               event.data.phase == kAfterSelectorPublication)) {
+            settleWitness(event.data);
+          }
+        };
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType ||
+              event.data.event != 'result') {
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function runInterruptionCase(mutatorPath, phase, disposition) {
+          const owner = await startLeasedModule('owner.html', kOwner, 'owner');
+          if (owner.message.result != kReady || owner.message.error != 0) {
+            owner.frame.remove();
+            throw new Error('owner failed: result=' + owner.message.result +
+                            ', errno=' + owner.message.error);
+          }
+
+          // The owner has already completed its result-bearing backend drain.
+          // Removing its now-idle iframe neither establishes nor extends the
+          // durability assertion made by this focused test.
+          owner.frame.remove();
+
+          const mutator = await startLeasedModule(
+            mutatorPath, kMutator, 'selector phase ' + phase + ' mutator');
+          if (mutator.message.result != kReady || mutator.message.error != 0) {
+            mutator.frame.remove();
+            throw new Error('selector phase ' + phase + ' mutator failed: ' +
+                            'result=' + mutator.message.result + ', errno=' +
+                            mutator.message.error);
+          }
+
+          await waitForWitness(phase);
+          // The mutator is stopped in a test-only backend hook. Disposing this
+          // document leaves the hook pending; the verifier must independently
+          // acquire the leased namespace and observe exactly one full tree.
+          mutator.frame.remove();
+
+          const verifier = await startLeasedModule(
+            'verifier.html', kVerifier, 'selector phase ' + phase + ' verifier');
+          if (verifier.message.result != disposition ||
+              verifier.message.error != 0) {
+            verifier.frame.remove();
+            const expected = disposition == kStagedTree ?
+              'complete staged tree' : 'complete published tree';
+            throw new Error('selector phase ' + phase +
+                            ' fresh verifier observed result=' +
+                            verifier.message.result + ', errno=' +
+                            verifier.message.error + ', expected ' + expected);
+          }
+          verifier.frame.remove();
+        }
+
+        (async () => {
+          await runInterruptionCase(
+            'mutator-before-selector.html', kBeforeSelectorPublication,
+            kStagedTree);
+          await runInterruptionCase(
+            'mutator-after-selector.html', kAfterSelectorPublication,
+            kPublishedTree);
+          witnessChannel.close();
+          reportResultToServer('0');
+        })().catch((error) => {
+          witnessChannel.close();
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')
   @no_wasm64()
