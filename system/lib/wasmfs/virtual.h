@@ -45,6 +45,12 @@ protected:
     return real->locked().setSize(size);
   }
   virtual int flush() override { return real->locked().flush(); }
+  virtual int persistMetadata(const Metadata& metadata) override {
+    // Keep the real and virtual File images in lockstep. In particular, do
+    // not let a virtual wrapper publish metadata if the real persistent file
+    // rejects its candidate.
+    return real->locked().setMetadata(metadata);
+  }
 
   friend std::shared_ptr<File> devirtualize(std::shared_ptr<File>);
 };
@@ -91,6 +97,9 @@ protected:
     return real->locked().getEntries();
   }
   virtual int flush() override { return real->locked().flush(); }
+  virtual int persistMetadata(const Metadata& metadata) override {
+    return real->locked().setMetadata(metadata);
+  }
   virtual std::string getName(std::shared_ptr<File> file) override {
     return real->locked().getName(file);
   }
@@ -108,6 +117,9 @@ public:
 
 protected:
   virtual std::string getTarget() const override { return real->getTarget(); }
+  virtual int persistMetadata(const Metadata& metadata) override {
+    return real->locked().setMetadata(metadata);
+  }
 
   friend std::shared_ptr<File> devirtualize(std::shared_ptr<File>);
 };

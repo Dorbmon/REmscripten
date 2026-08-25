@@ -23,12 +23,12 @@ public:
   virtual std::shared_ptr<Directory> createDirectory(mode_t mode) = 0;
   virtual std::shared_ptr<Symlink> createSymlink(std::string target) = 0;
 
-  // Whether this backend permits WasmFS to mutate a File's logical mode and
-  // timestamps in response to explicit POSIX metadata setters. A true result
-  // permits only the current in-memory WasmFS mutation; it does not promise
-  // that the metadata is durably stored or survives a remount or reload.
-  // Backends that cannot represent these setters must override this to avoid
-  // falsely reporting a successful logical mutation.
+  // Whether this backend permits WasmFS to attempt explicit POSIX mode and
+  // timestamp setters on its Files. A true result does not promise that the
+  // metadata is durable or survives a remount: each File may still reject its
+  // candidate metadata image from File::persistMetadata(). Backends that
+  // cannot represent these setters must override this to avoid falsely
+  // reporting a successful logical mutation.
   virtual bool supportsExplicitMetadataMutation() const { return true; }
 
   // Whether this backend provides a storage domain in which WasmFS can safely

@@ -13305,6 +13305,16 @@ Module.postRun = () => {{
     '': ([],),
     'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
   })
+  def test_wasmfs_metadata_persistence_error(self, args):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf(
+        'wasmfs/wasmfs_metadata_persistence_error.cpp', 'ok', cflags=args)
+
+  @parameterized({
+    '': ([],),
+    'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
   def test_wasmfs_ftruncate_descriptor_mode(self, args):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test(

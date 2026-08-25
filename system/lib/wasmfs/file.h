@@ -53,6 +53,17 @@ public:
     SymlinkKind = 3
   };
 
+  // A complete logical metadata image. Persistent backends receive this as a
+  // single candidate so, for example, chmod's mode and ctime can be committed
+  // together instead of exposing one of them before the other. The file type
+  // bits are owned by File and are preserved by Handle::setMetadata().
+  struct Metadata {
+    mode_t mode;
+    double atime;
+    double mtime;
+    double ctime;
+  };
+
   const FileKind kind;
 
   template<class T> bool is() const {
@@ -116,6 +127,18 @@ protected:
   // The size in bytes of a file or return a negative error code. May be
   // called on files that have not been opened.
   virtual off_t getSize() = 0;
+
+  // Persist a complete candidate metadata image. This is called with this
+  // File's mutex held, before the candidate is made visible through WasmFS's
+  // in-memory metadata. Backends that cannot durably represent metadata may
+  // return a negative errno; callers then leave the current in-memory image
+  // intact. The default preserves the historical in-memory-only behavior.
+  //
+  // This narrow hook is used for explicit POSIX metadata setters. Implicit
+  // timestamp updates from unrelated namespace and data mutations still use
+  // the existing in-memory helpers until their own persistence transactions
+  // can be specified atomically with those operations.
+  virtual int persistMetadata(const Metadata&) { return 0; }
 
   mode_t mode = 0; // User and group mode bits for access permission.
 
@@ -356,6 +379,31 @@ public:
     : lock(file->mutex, std::defer_lock), file(file) {}
   off_t getSize() { return file->getSize(); }
   mode_t getMode() { return file->mode; }
+
+  Metadata getMetadata() {
+    return {file->mode, file->atime, file->mtime, file->ctime};
+  }
+
+  // Ask the file's backend to persist a complete metadata candidate before
+  // publishing it to WasmFS. Preserve File's immutable type bits even if a
+  // backend returns a candidate built from a user-supplied mode.
+  [[nodiscard]] int setMetadata(Metadata metadata) {
+    metadata.mode = (file->mode & S_IFMT) | (metadata.mode & ~S_IFMT);
+    if (int error = file->persistMetadata(metadata)) {
+      // Backend hooks use WasmFS's negative-errno convention. Do not allow a
+      // malformed positive result to reach a syscall wrapper as success.
+      if (error >= 0) {
+        return -EIO;
+      }
+      return error;
+    }
+    file->mode = metadata.mode;
+    file->atime = metadata.atime;
+    file->mtime = metadata.mtime;
+    file->ctime = metadata.ctime;
+    return 0;
+  }
+
   void setMode(mode_t mode) {
     // The type bits can never be changed (whether something is a file or a
     // directory, for example).

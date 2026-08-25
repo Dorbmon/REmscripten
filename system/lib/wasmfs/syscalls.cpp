@@ -1940,14 +1940,14 @@ int __syscall_utimensat(int dirFD, intptr_t path_, intptr_t times_, int flags) {
   }
 
   auto locked = file->locked();
+  auto metadata = locked.getMetadata();
   if (aTime != INFINITY) {
-    locked.setATime(aTime);
+    metadata.atime = aTime;
   }
   if (mTime != INFINITY) {
-    locked.setMTime(mTime);
+    metadata.mtime = mTime;
   }
-
-  return 0;
+  return locked.setMetadata(metadata);
 }
 
 // TODO: Test this with non-AT_FDCWD values.
@@ -1966,10 +1966,11 @@ int __syscall_fchmodat2(int dirfd, intptr_t path, int mode, int flags) {
     return -ENOTSUP;
   }
   auto lockedFile = file->locked();
-  lockedFile.setMode(mode);
+  auto metadata = lockedFile.getMetadata();
+  metadata.mode = mode;
   // On POSIX, ctime is updated on metadata changes, like chmod.
-  lockedFile.updateCTime();
-  return 0;
+  metadata.ctime = emscripten_date_now();
+  return lockedFile.setMetadata(metadata);
 }
 
 int __syscall_chmod(intptr_t path, int mode) {
@@ -1991,9 +1992,10 @@ int __syscall_fchmod(int fd, int mode) {
     return -ENOTSUP;
   }
   auto lockedFile = file->locked();
-  lockedFile.setMode(mode);
-  lockedFile.updateCTime();
-  return 0;
+  auto metadata = lockedFile.getMetadata();
+  metadata.mode = mode;
+  metadata.ctime = emscripten_date_now();
+  return lockedFile.setMetadata(metadata);
 }
 
 int __syscall_fchownat(
