@@ -32,6 +32,18 @@ public:
   // reporting a successful logical mutation.
   virtual bool supportsExplicitMetadataMutation() const { return true; }
 
+  // A backend that persists a file's contents together with its implicit
+  // timestamp metadata must opt into the paired DataFile mutation hooks. Once
+  // this is true, WasmFS never falls back to write() or setSize() for a data
+  // mutation that changes content or length: a missing hook is an explicit
+  // ENOTSUP instead of a successful, split data/metadata update.
+  //
+  // This is deliberately narrower than supportsExplicitMetadataMutation().
+  // The latter covers chmod and utimens-style metadata-only operations;
+  // this capability covers the metadata post-image of write and resize
+  // transactions.
+  virtual bool requiresAtomicMetadataMutations() const { return false; }
+
   // Whether this backend provides a storage domain in which WasmFS can safely
   // implement POSIX process-owned record locks. Returning true is not a
   // promise that arbitrary external writers participate in locking. A

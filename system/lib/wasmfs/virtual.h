@@ -41,8 +41,18 @@ protected:
   virtual ssize_t write(const uint8_t* buf, size_t len, off_t offset) override {
     return real->locked().write(buf, len, offset);
   }
+  virtual ssize_t writeWithMetadata(const uint8_t* buf,
+                                    size_t len,
+                                    off_t offset,
+                                    const Metadata& metadata) override {
+    return real->locked().writeWithMetadata(buf, len, offset, metadata);
+  }
   virtual int setSize(off_t size) override {
     return real->locked().setSize(size);
+  }
+  virtual int setSizeWithMetadata(off_t size,
+                                  const Metadata& metadata) override {
+    return real->locked().setSizeWithMetadata(size, metadata);
   }
   virtual int flush() override { return real->locked().flush(); }
   virtual int persistMetadata(const Metadata& metadata) override {

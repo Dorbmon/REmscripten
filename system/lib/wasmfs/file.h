@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <emscripten.h>
 #include <emscripten/html5.h>
+#include <errno.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -177,10 +178,30 @@ protected:
   virtual ssize_t read(uint8_t* buf, size_t len, off_t offset) = 0;
   virtual ssize_t write(const uint8_t* buf, size_t len, off_t offset) = 0;
 
+  // Atomically write data and the complete metadata post-image. This hook is
+  // only selected for a Backend that requiresAtomicMetadataMutations(). A
+  // positive result means the returned bytes and `metadata` have committed as
+  // one backend transaction; zero is a no-progress short write and must not
+  // commit either. A negative errno means neither data nor metadata became
+  // visible. The default fails closed so an opted-in backend cannot silently
+  // fall back to the split write()/timestamp path.
+  virtual ssize_t writeWithMetadata(const uint8_t*,
+                                    size_t,
+                                    off_t,
+                                    const Metadata&) {
+    return -ENOTSUP;
+  }
+
   // Sets the size of the file to a specific size. If new space is allocated, it
   // should be zero-initialized. May be called on files that have not been
   // opened. Returns 0 on success or a negative error code.
   virtual int setSize(off_t size) = 0;
+
+  // Atomically resize data and commit the complete metadata post-image. This
+  // hook is only selected for a Backend that requiresAtomicMetadataMutations.
+  // A zero result commits both; a negative errno commits neither. The default
+  // explicitly rejects the operation instead of using setSize() separately.
+  virtual int setSizeWithMetadata(off_t, const Metadata&) { return -ENOTSUP; }
 
   // Sync the file data to the underlying persistent storage, if any. Returns 0
   // on success or a negative error code.
@@ -373,6 +394,25 @@ protected:
   std::unique_lock<std::recursive_mutex> lock;
   std::shared_ptr<File> file;
 
+  // The persistence hooks and paired data-mutation hooks receive complete
+  // metadata candidates. Keep the file type owned by File even if an internal
+  // caller accidentally supplies different type bits.
+  Metadata normalizeMetadata(Metadata metadata) const {
+    metadata.mode = (file->mode & S_IFMT) | (metadata.mode & ~S_IFMT);
+    return metadata;
+  }
+
+  // A paired data mutation has already committed its candidate metadata in
+  // its backend transaction. Publishing it here must therefore never invoke a
+  // second storage hook after that transaction succeeds.
+  void publishMetadata(Metadata metadata) {
+    metadata = normalizeMetadata(metadata);
+    file->mode = metadata.mode;
+    file->atime = metadata.atime;
+    file->mtime = metadata.mtime;
+    file->ctime = metadata.ctime;
+  }
+
 public:
   Handle(std::shared_ptr<File> file) : lock(file->mutex), file(file) {}
   Handle(std::shared_ptr<File> file, std::defer_lock_t)
@@ -388,7 +428,7 @@ public:
   // publishing it to WasmFS. Preserve File's immutable type bits even if a
   // backend returns a candidate built from a user-supplied mode.
   [[nodiscard]] int setMetadata(Metadata metadata) {
-    metadata.mode = (file->mode & S_IFMT) | (metadata.mode & ~S_IFMT);
+    metadata = normalizeMetadata(metadata);
     if (int error = file->persistMetadata(metadata)) {
       // Backend hooks use WasmFS's negative-errno convention. Do not allow a
       // malformed positive result to reach a syscall wrapper as success.
@@ -397,10 +437,7 @@ public:
       }
       return error;
     }
-    file->mode = metadata.mode;
-    file->atime = metadata.atime;
-    file->mtime = metadata.mtime;
-    file->ctime = metadata.ctime;
+    publishMetadata(metadata);
     return 0;
   }
 
@@ -472,8 +509,37 @@ public:
   ssize_t write(const uint8_t* buf, size_t len, off_t offset) {
     return getFile()->write(buf, len, offset);
   }
+  ssize_t writeWithMetadata(const uint8_t* buf,
+                            size_t len,
+                            off_t offset,
+                            Metadata metadata) {
+    metadata = normalizeMetadata(metadata);
+    auto result = getFile()->writeWithMetadata(buf, len, offset, metadata);
+    // Backends may short-write, but they may not report more bytes than the
+    // request. Do not publish the candidate after a malformed result.
+    if (result > 0 && static_cast<size_t>(result) > len) {
+      return -EIO;
+    }
+    if (result > 0) {
+      publishMetadata(metadata);
+    }
+    return result;
+  }
 
   [[nodiscard]] int setSize(off_t size) { return getFile()->setSize(size); }
+  [[nodiscard]] int setSizeWithMetadata(off_t size, Metadata metadata) {
+    metadata = normalizeMetadata(metadata);
+    int result = getFile()->setSizeWithMetadata(size, metadata);
+    // A resize hook has a zero-or-negative ABI. Do not let a malformed
+    // positive result become a successful syscall that may have split state.
+    if (result > 0) {
+      return -EIO;
+    }
+    if (result == 0) {
+      publishMetadata(metadata);
+    }
+    return result;
+  }
 
   // TODO: Design a proper API for flushing files.
   [[nodiscard]] int flush() { return getFile()->flush(); }

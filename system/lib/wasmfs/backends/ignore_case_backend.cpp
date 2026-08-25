@@ -228,6 +228,10 @@ public:
     return backend->supportsExplicitMetadataMutation();
   }
 
+  bool requiresAtomicMetadataMutations() const override {
+    return backend->requiresAtomicMetadataMutations();
+  }
+
   std::shared_ptr<DataFile> createFile(mode_t mode) override {
     return virtualize(backend->createFile(mode), this);
   }

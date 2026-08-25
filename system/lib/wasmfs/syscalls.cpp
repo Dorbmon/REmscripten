@@ -84,6 +84,42 @@ bool canMutateExplicitMetadata(const std::shared_ptr<wasmfs::File>& file) {
   return true;
 }
 
+// An opted-in backend owns a content/metadata transaction. The generic layer
+// must not write or resize first and then update mtime in WasmFS memory: an
+// interrupted operation would expose a persistent content image with a stale
+// metadata image. Backends that do not opt in retain the historical split
+// behavior while the profile backend is brought up incrementally.
+bool requiresAtomicMetadataMutations(
+  const std::shared_ptr<wasmfs::DataFile>& file) {
+  if (auto* backend = file->getBackend()) {
+    return backend->requiresAtomicMetadataMutations();
+  }
+  return false;
+}
+
+wasmfs::File::Metadata dataMutationMetadataPostImage(
+  wasmfs::DataFile::Handle& locked) {
+  auto metadata = locked.getMetadata();
+  // A data or length mutation changes both mtime and ctime. The complete
+  // candidate also carries mode and atime so a storage backend can replace
+  // one coherent metadata record rather than reconstructing fields.
+  const double now = emscripten_date_now();
+  metadata.mtime = now;
+  metadata.ctime = now;
+  return metadata;
+}
+
+int resizeDataFile(
+  const std::shared_ptr<wasmfs::DataFile>& dataFile,
+  wasmfs::DataFile::Handle& locked,
+  off_t size) {
+  if (!requiresAtomicMetadataMutations(dataFile)) {
+    return locked.setSize(size);
+  }
+  return locked.setSizeWithMetadata(
+    size, dataMutationMetadataPostImage(locked));
+}
+
 // Record locks in POSIX are process-owned. WasmFS has one process-global
 // instance, so a backend may opt in only when it has independently established
 // that no other WasmFS instance can concurrently mutate the same storage.
@@ -479,6 +515,8 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
   }
 
   auto lockedFile = dataFile->locked();
+  const bool atomicMetadataMutation =
+    requiresAtomicMetadataMutations(dataFile);
 
   if (setOffset == OffsetHandling::OpenFileState) {
     if (lockedOpenFile.getFlags() & O_APPEND) {
@@ -524,7 +562,16 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
       return __WASI_ERRNO_FBIG;
     }
 
-    auto result = lockedFile.write(buf, len, offset + bytesWritten);
+    // An opted-in backend must commit the bytes and their metadata post-image
+    // together. In particular, do not retry through write() if its paired hook
+    // reports ENOTSUP or a real storage failure.
+    auto result = atomicMetadataMutation
+                    ? lockedFile.writeWithMetadata(
+                        buf,
+                        len,
+                        offset + bytesWritten,
+                        dataMutationMetadataPostImage(lockedFile))
+                    : lockedFile.write(buf, len, offset + bytesWritten);
     if (result < 0) {
       // This individual write failed. Report the error unless we've already
       // written some bytes, in which case report a successful short write.
@@ -545,7 +592,7 @@ static __wasi_errno_t writeAtOffset(OffsetHandling setOffset,
       lockedOpenFile.getFile()->isSeekable()) {
     lockedOpenFile.setPosition(offset + bytesWritten);
   }
-  if (bytesWritten) {
+  if (bytesWritten && !atomicMetadataMutation) {
     lockedFile.updateMTime();
   }
   return __WASI_ERRNO_SUCCESS;
@@ -1095,10 +1142,17 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
       }
       return -EACCES;
     }
-    int truncateErr = child->cast<DataFile>()->locked().setSize(0);
+    auto dataFile = child->cast<DataFile>();
+    const bool atomicMetadataMutation =
+      requiresAtomicMetadataMutations(dataFile);
+    auto lockedDataFile = dataFile->locked();
+    int truncateErr = resizeDataFile(dataFile, lockedDataFile, 0);
     // Preserve the historical O_RDONLY | O_TRUNC behavior. In particular,
-    // OPFS may use a non-truncatable Blob for a read-only open.
-    if (truncateErr && accessMode != O_RDONLY) {
+    // OPFS may use a non-truncatable Blob for a read-only open. An opted-in
+    // atomic backend is different: accepting a failed paired mutation would
+    // falsely claim that its content/metadata transaction completed.
+    if (truncateErr &&
+        (accessMode != O_RDONLY || atomicMetadataMutation)) {
       // The state has not entered the file table. Release its physical open
       // before reporting the truncation failure, and prefer a cleanup failure
       // because it may leave a browser-side handle live.
@@ -2079,7 +2133,7 @@ static int doTruncate(std::shared_ptr<File>& file,
     return -EINVAL;
   }
 
-  int ret = locked.setSize(size);
+  int ret = resizeDataFile(dataFile, locked, size);
   assert(ret <= 0);
   return ret;
 }
@@ -2320,7 +2374,7 @@ int __syscall_fallocate(int fd, int mode, off_t offset, off_t len) {
     return size;
   }
   if (newNeededSize > size) {
-    if (auto err = locked.setSize(newNeededSize)) {
+    if (auto err = resizeDataFile(dataFile, locked, newNeededSize)) {
       assert(err < 0);
       return err;
     }
