@@ -57,8 +57,9 @@ typedef struct wasmfs_opfs_profile_drain_result {
   uint8_t backend_retired;
 } wasmfs_opfs_profile_drain_result;
 
-// Atomically seal, flush, close, and release one backend created by
-// wasmfs_create_opfs_backend_with_profile_lease(). This is an embedding
+// Atomically seal, flush, close, and release one backend created by either
+// wasmfs_create_opfs_backend_with_profile_lease() or
+// wasmfs_create_opfs_profile_namespace_backend(). This is an embedding
 // primitive for a profile-specific orderly handoff. It leaves unrelated
 // WasmFS mounts, descriptors, and stdio usable.
 //

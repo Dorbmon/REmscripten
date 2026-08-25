@@ -1860,6 +1860,31 @@ var WASMFS_OPFS_TEST_RETIRE_FENCE_FAILURE = 0;
 // [link]
 var WASMFS_OPFS_TEST_MOVE_INTERRUPT = 0;
 
+// Test-only selector for the logical profile-namespace backend's publication
+// boundaries. Any nonzero value emits its private C++ hook; the focused test's
+// own compile-time phase value decides whether it pauses before or after a
+// container selector write, the PREPARED journal write, the first PUBLISHED
+// journal write, or the PUBLISHED quorum mirror. Production builds leave this
+// disabled and expose no runtime configuration API.
+// [link]
+var WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT = 0;
+
+// Test-only selector for fail-closed validation of an established
+// profile-namespace journal. Values 1 and 2 make the native parser discard,
+// after a successful read, journal slot zero or one respectively. It never
+// changes OPFS bytes and exposes no runtime configuration API. Production
+// builds leave this disabled.
+// [link]
+var WASMFS_OPFS_PROFILE_NAMESPACE_TEST_JOURNAL_CORRUPTION = 0;
+
+// Test-only selector for profile-namespace factory failure handling. Values
+// 1, 2, and 3 make the C++ factory treat a completed root, lookup, or insert
+// proxy callback as though its completion acknowledgement were lost; 4 injects
+// a known failure immediately after an acknowledged fresh-container insert.
+// This controls code emitted at link time only and exposes no runtime API.
+// [link]
+var WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE = 0;
+
 // Test-only selector that makes the first OPFS SyncAccessHandle close fail.
 // This controls code emitted at link time only; it intentionally provides no
 // runtime configuration or recovery API.

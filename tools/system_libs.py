@@ -2030,6 +2030,12 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     self.ignore_case = kwargs.pop('ignore_case')
     self.record_lock_test = kwargs.pop('record_lock_test')
     self.opfs_profile_drain_test = kwargs.pop('opfs_profile_drain_test')
+    self.opfs_profile_namespace_test_interrupt = kwargs.pop(
+        'opfs_profile_namespace_test_interrupt')
+    self.opfs_profile_namespace_test_journal_corruption = kwargs.pop(
+        'opfs_profile_namespace_test_journal_corruption')
+    self.opfs_profile_namespace_test_initialisation_failure = kwargs.pop(
+        'opfs_profile_namespace_test_initialisation_failure')
     self.opfs_get_child_proxy_failure_test = kwargs.pop(
         'opfs_get_child_proxy_failure_test')
     super().__init__(**kwargs)
@@ -2042,6 +2048,16 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       cflags += ['-DWASMFS_RECORD_LOCK_TEST']
     if self.opfs_profile_drain_test:
       cflags += ['-DWASMFS_OPFS_PROFILE_DRAIN_TEST']
+    if self.opfs_profile_namespace_test_interrupt:
+      cflags += ['-DWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT']
+    if self.opfs_profile_namespace_test_journal_corruption:
+      cflags += [
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_TEST_JOURNAL_CORRUPTION=' +
+          str(self.opfs_profile_namespace_test_journal_corruption)]
+    if self.opfs_profile_namespace_test_initialisation_failure:
+      cflags += [
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE=' +
+          str(self.opfs_profile_namespace_test_initialisation_failure)]
     if self.opfs_get_child_proxy_failure_test:
       cflags += ['-DWASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE']
     return cflags
@@ -2054,6 +2070,14 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       name += '-record-lock-test'
     if self.opfs_profile_drain_test:
       name += '-opfs-profile-drain-test'
+    if self.opfs_profile_namespace_test_interrupt:
+      name += '-opfs-profile-namespace-test-interrupt'
+    if self.opfs_profile_namespace_test_journal_corruption:
+      name += '-opfs-profile-namespace-journal-corruption-' + str(
+          self.opfs_profile_namespace_test_journal_corruption)
+    if self.opfs_profile_namespace_test_initialisation_failure:
+      name += '-opfs-profile-namespace-init-failure-' + str(
+          self.opfs_profile_namespace_test_initialisation_failure)
     if self.opfs_get_child_proxy_failure_test:
       name += '-opfs-get-child-proxy-failure-test'
     return name
@@ -2062,6 +2086,9 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
   def vary_on(cls):
     return super().vary_on() + [
       'ignore_case', 'record_lock_test', 'opfs_profile_drain_test',
+      'opfs_profile_namespace_test_interrupt',
+      'opfs_profile_namespace_test_journal_corruption',
+      'opfs_profile_namespace_test_initialisation_failure',
       'opfs_get_child_proxy_failure_test']
 
   @classmethod
@@ -2070,6 +2097,12 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
         ignore_case=settings.CASE_INSENSITIVE_FS,
         record_lock_test=settings.WASMFS_RECORD_LOCK_TEST,
         opfs_profile_drain_test=settings.WASMFS_OPFS_PROFILE_DRAIN_TEST,
+        opfs_profile_namespace_test_interrupt=bool(
+            settings.WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT),
+        opfs_profile_namespace_test_journal_corruption=(
+            settings.WASMFS_OPFS_PROFILE_NAMESPACE_TEST_JOURNAL_CORRUPTION),
+        opfs_profile_namespace_test_initialisation_failure=(
+            settings.WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE),
         opfs_get_child_proxy_failure_test=(
             settings.WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE),
         **kwargs)

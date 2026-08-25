@@ -38,6 +38,12 @@ private:
   // This is reserved before an OPFS factory creates its ProxyWorker or asks
   // the browser for a Web Lock, then retained for the instance lifetime.
   bool terminalLeaseOwnerReserved = false;
+  // A factory can lose the completion acknowledgement of its lease acquire or
+  // early OPFS initialization before it can add a Backend to backendTable.
+  // Keep that reservation fail-closed, but also make it visible to terminal
+  // drain so an unrepresented worker/lease cannot be mistaken for a clean
+  // global handoff.
+  bool terminalLeaseOwnerReservationAmbiguous = false;
   FileTable fileTable;
   std::mutex mutex;
   std::mutex cwdTransitionMutex;
@@ -167,6 +173,7 @@ public:
   // exists. A factory must cancel a reservation when its acquisition fails.
   bool reserveTerminalLeaseOwner();
   void cancelTerminalLeaseOwnerReservation();
+  void markTerminalLeaseOwnerReservationAmbiguous();
 
   int beginScopedOPFSProfileDrain();
   void endScopedOPFSProfileDrain();

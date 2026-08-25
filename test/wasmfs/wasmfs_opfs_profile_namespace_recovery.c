@@ -8,11 +8,15 @@
 // disposes an iframe after a test-only hook has stopped one logical namespace
 // commit at a documented selector-publication boundary. A fresh leased module
 // then checks only the two complete namespace states produced by that one
-// populated-directory rename. The host page never reads or writes OPFS.
+// populated-directory rename. It also proves that a terminal drain closes the
+// namespace container before a second fresh verifier makes the same recovery
+// selection. The host page never reads or writes OPFS.
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -43,11 +47,10 @@
 #error "WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT must be 0, 1, or 2"
 #endif
 
-// This declaration intentionally remains local to the focused test until the
-// opt-in backend lands in the public WasmFS header. Keeping it here lets the
-// test's C source be syntax-checked before that implementation is merged.
-extern backend_t wasmfs_create_opfs_profile_namespace_backend(
-  const char* profile_name);
+#if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_TERMINAL_DRAIN) && \
+  !defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER)
+#error "terminal drain recovery role must also be a verifier"
+#endif
 
 enum TestRole {
   kOwner,
@@ -91,6 +94,16 @@ static const char kPublishedBlobPath[] = "/profile/Live/Cache/Index/blob";
 #endif
 static const char kManifestContents[] = "profile-namespace-generation-A";
 static const char kBlobContents[] = "nested-index-payload-A";
+#if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_MUTATOR) || \
+  defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER)
+static const char* const kStagedProfileEntries[] = {"staged"};
+static const char* const kRootEntries[] = {"Cache"};
+static const char* const kCacheEntries[] = {"Index"};
+static const char* const kIndexEntries[] = {"blob", "manifest"};
+#endif
+#if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER)
+static const char* const kPublishedProfileEntries[] = {"Live"};
+#endif
 
 static int ErrorOrEIO(void) {
   return errno ? errno : EIO;
@@ -134,6 +147,9 @@ static void ReportSelectorInterruptionOnBrowserThread(int phase) {
 // immediately after that selector's successful flush. It deliberately never
 // returns, so iframe disposal is the sole release path being exercised.
 void wasmfs_opfs_profile_namespace_test_maybe_interrupt_selector(int phase) {
+  if (phase != WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT) {
+    return;
+  }
   emscripten_async_run_in_main_runtime_thread(
     EM_FUNC_SIG_VI, ReportSelectorInterruptionOnBrowserThread, phase);
   while (1) {
@@ -163,13 +179,28 @@ static int DrainNamespace(backend_t backend) {
   return 0;
 }
 
+#if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_TERMINAL_DRAIN)
+static int TerminalDrainNamespace(void) {
+  wasmfs_terminal_drain_result details = {0};
+  int result = wasmfs_terminal_drain(&details);
+  if (result != 0 || details.error != 0 || details.data_file_states != 3 ||
+      details.libc_flush_failed != 0 || details.data_flush_failures != 0 ||
+      details.data_close_failures != 0 ||
+      details.backend_terminal_failures != 0) {
+    return EIO;
+  }
+  return 0;
+}
+#endif
+
 static int FinishNamespace(backend_t backend, int error) {
   int drain_error = DrainNamespace(backend);
   return error ? error : drain_error;
 }
 
 #if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_OWNER) || \
-  defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER)
+  (defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER) && \
+   !defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_TERMINAL_DRAIN))
 static int RemoveFileIfPresent(const char* path) {
   errno = 0;
   if (unlink(path) == 0 || errno == ENOENT) {
@@ -274,17 +305,62 @@ static int VerifyDirectory(const char* path) {
   return S_ISDIR(stat_buffer.st_mode) ? 0 : EIO;
 }
 
+static int VerifyExactDirectoryEntries(const char* path,
+                                       const char* const expected[],
+                                       size_t expected_count) {
+  struct dirent** entries = NULL;
+  int count = scandir(path, &entries, NULL, alphasort);
+  if (count < 0) {
+    return ErrorOrEIO();
+  }
+
+  int error = 0;
+  if ((size_t)count != expected_count + 2 ||
+      strcmp(entries[0]->d_name, ".") != 0 ||
+      strcmp(entries[1]->d_name, "..") != 0) {
+    error = EIO;
+  }
+  for (size_t i = 0; error == 0 && i != expected_count; ++i) {
+    if (strcmp(entries[i + 2]->d_name, expected[i]) != 0) {
+      error = EIO;
+    }
+  }
+  for (int i = 0; i != count; ++i) {
+    free(entries[i]);
+  }
+  free(entries);
+  return error;
+}
+
 static int VerifyTree(const char* root,
                       const char* cache,
                       const char* index,
                       const char* manifest,
-                      const char* blob) {
-  int error = VerifyDirectory(root);
+                      const char* blob,
+                      const char* const profile_entries[],
+                      size_t profile_entry_count) {
+  int error = VerifyDirectory(kMountPath);
+  if (error == 0) {
+    error = VerifyExactDirectoryEntries(
+      kMountPath, profile_entries, profile_entry_count);
+  }
+  if (error == 0) {
+    error = VerifyDirectory(root);
+  }
+  if (error == 0) {
+    error = VerifyExactDirectoryEntries(root, kRootEntries, 1);
+  }
   if (error == 0) {
     error = VerifyDirectory(cache);
   }
   if (error == 0) {
+    error = VerifyExactDirectoryEntries(cache, kCacheEntries, 1);
+  }
+  if (error == 0) {
     error = VerifyDirectory(index);
+  }
+  if (error == 0) {
+    error = VerifyExactDirectoryEntries(index, kIndexEntries, 2);
   }
   if (error == 0) {
     error = VerifyExactFile(manifest, kManifestContents);
@@ -357,7 +433,9 @@ static int VerifyDisposition(void) {
                  kStagedCachePath,
                  kStagedIndexPath,
                  kStagedManifestPath,
-                 kStagedBlobPath) == 0 &&
+                 kStagedBlobPath,
+                 kStagedProfileEntries,
+                 1) == 0 &&
       IsMissing(kPublishedPath) == 0) {
     return kStagedTree;
   }
@@ -365,7 +443,9 @@ static int VerifyDisposition(void) {
                  kPublishedCachePath,
                  kPublishedIndexPath,
                  kPublishedManifestPath,
-                 kPublishedBlobPath) == 0 &&
+                 kPublishedBlobPath,
+                 kPublishedProfileEntries,
+                 1) == 0 &&
       IsMissing(kStagedPath) == 0) {
     return kPublishedTree;
   }
@@ -373,7 +453,8 @@ static int VerifyDisposition(void) {
 }
 #endif
 
-#if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER)
+#if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER) && \
+  !defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_TERMINAL_DRAIN)
 static int CleanupFixture(void) {
   int error = RemoveKnownTree(kStagedPath,
                               kStagedCachePath,
@@ -386,6 +467,9 @@ static int CleanupFixture(void) {
                             kPublishedIndexPath,
                             kPublishedManifestPath,
                             kPublishedBlobPath);
+  }
+  if (error == 0) {
+    error = VerifyExactDirectoryEntries(kMountPath, NULL, 0);
   }
   if (error == 0) {
     error = FlushDirectory(kMountPath);
@@ -423,7 +507,9 @@ int main(void) {
                        kStagedCachePath,
                        kStagedIndexPath,
                        kStagedManifestPath,
-                       kStagedBlobPath);
+                       kStagedBlobPath,
+                       kStagedProfileEntries,
+                       1);
     if (error == 0) {
       error = IsMissing(kPublishedPath);
     }
@@ -449,10 +535,20 @@ int main(void) {
     if (disposition == kFailure) {
       error = EIO;
     }
+#if defined(WASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_TERMINAL_DRAIN)
+    if (error == 0) {
+      // This drains the complete WasmFS instance. In particular, the
+      // namespace backend must flush and close its long-lived container
+      // access handle before the inherited OPFS lease preflight can release
+      // the worker. A separate fresh verifier performs cleanup afterwards.
+      error = TerminalDrainNamespace();
+    }
+#else
     if (error == 0) {
       error = CleanupFixture();
     }
     error = FinishNamespace(backend, error);
+#endif
     ReportResult(kVerifier,
                  error == 0 ? disposition : kFailure,
                  error);

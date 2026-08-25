@@ -344,13 +344,21 @@ bool WasmFS::reserveTerminalLeaseOwner() {
     return false;
   }
   terminalLeaseOwnerReserved = true;
+  terminalLeaseOwnerReservationAmbiguous = false;
   return true;
 }
 
 void WasmFS::cancelTerminalLeaseOwnerReservation() {
   const std::lock_guard<std::mutex> lock(mutex);
   assert(terminalLeaseOwnerReserved);
+  assert(!terminalLeaseOwnerReservationAmbiguous);
   terminalLeaseOwnerReserved = false;
+}
+
+void WasmFS::markTerminalLeaseOwnerReservationAmbiguous() {
+  const std::lock_guard<std::mutex> lock(mutex);
+  assert(terminalLeaseOwnerReserved);
+  terminalLeaseOwnerReservationAmbiguous = true;
 }
 
 namespace {
@@ -514,6 +522,21 @@ int WasmFS::terminalDrain(wasmfs_terminal_drain_result* result) {
     if (int error = file.close()) {
       recordDrainError(*result, error, result->data_close_failures);
     }
+  }
+
+  // A failed leased-OPFS factory can retain a dedicated worker before it has
+  // an object in backendTable. Its reservation is deliberately fail-closed;
+  // make that hidden owner result-bearing as well, so terminal drain cannot
+  // report success while a browser Web Lock or access handle may remain live.
+  bool unrepresentedLeaseOwner = false;
+  {
+    const std::lock_guard<std::mutex> lock(mutex);
+    unrepresentedLeaseOwner = terminalLeaseOwnerReservationAmbiguous;
+  }
+  if (unrepresentedLeaseOwner) {
+    recordDrainError(*result,
+                     -ESHUTDOWN,
+                     result->backend_terminal_failures);
   }
 
   // The table is terminal before notifying backends, and the public-operation

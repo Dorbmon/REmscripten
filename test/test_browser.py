@@ -6324,6 +6324,11 @@ Module["preRun"] = () => {
     # crash, power-loss, database, or complete Chromium profile recovery.
     test = 'wasmfs/wasmfs_opfs_profile_namespace_recovery.c'
     common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    terminal_drain_args = common_args + [
+      '-sPTHREAD_POOL_SIZE=4',
+      '-sEXIT_RUNTIME',
+      '-sALLOW_BLOCKING_ON_MAIN_THREAD=0',
+    ]
     self.compile_btest(
       test,
       common_args + [
@@ -6351,9 +6356,17 @@ Module["preRun"] = () => {
       reporting=Reporting.NONE)
     self.compile_btest(
       test,
+      terminal_drain_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_TERMINAL_DRAIN',
+        '-o', 'verifier-terminal-drain.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
       common_args + [
         '-DWASMFS_OPFS_PROFILE_NAMESPACE_RECOVERY_VERIFIER',
-        '-o', 'verifier.html',
+        '-o', 'verifier-cleanup.html',
       ],
       reporting=Reporting.NONE)
     self.add_browser_reporting()
@@ -6499,19 +6512,45 @@ Module["preRun"] = () => {
           // acquire the leased namespace and observe exactly one full tree.
           mutator.frame.remove();
 
-          const verifier = await startLeasedModule(
-            'verifier.html', kVerifier, 'selector phase ' + phase + ' verifier');
-          if (verifier.message.result != disposition ||
-              verifier.message.error != 0) {
-            verifier.frame.remove();
+          const terminalVerifier = await startLeasedModule(
+            'verifier-terminal-drain.html', kVerifier,
+            'selector phase ' + phase + ' terminal verifier');
+          if (terminalVerifier.message.result != disposition ||
+              terminalVerifier.message.error != 0) {
+            terminalVerifier.frame.remove();
             const expected = disposition == kStagedTree ?
               'complete staged tree' : 'complete published tree';
             throw new Error('selector phase ' + phase +
-                            ' fresh verifier observed result=' +
-                            verifier.message.result + ', errno=' +
-                            verifier.message.error + ', expected ' + expected);
+                            ' terminal verifier observed result=' +
+                            terminalVerifier.message.result + ', errno=' +
+                            terminalVerifier.message.error + ', expected ' +
+                            expected);
           }
-          verifier.frame.remove();
+
+          // A second independently leased module must make the same exact
+          // recovery selection while the terminal verifier's document remains
+          // alive. That acquisition proves the explicit terminal drain—not
+          // iframe teardown—released its Web Lock and container handle. This
+          // verifier is the one that removes the fixture after its check.
+          try {
+            const cleanupVerifier = await startLeasedModule(
+              'verifier-cleanup.html', kVerifier,
+              'selector phase ' + phase + ' cleanup verifier');
+            if (cleanupVerifier.message.result != disposition ||
+                cleanupVerifier.message.error != 0) {
+              cleanupVerifier.frame.remove();
+              const expected = disposition == kStagedTree ?
+                'complete staged tree' : 'complete published tree';
+              throw new Error('selector phase ' + phase +
+                              ' cleanup verifier observed result=' +
+                              cleanupVerifier.message.result + ', errno=' +
+                              cleanupVerifier.message.error + ', expected ' +
+                              expected);
+            }
+            cleanupVerifier.frame.remove();
+          } finally {
+            terminalVerifier.frame.remove();
+          }
         }
 
         (async () => {
@@ -6525,6 +6564,957 @@ Module["preRun"] = () => {
           reportResultToServer('0');
         })().catch((error) => {
           witnessChannel.close();
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_namespace_bootstrap_recovery(self):
+    # Exercise every durable first-mount boundary. This is deliberately a
+    # controlled outer-document interruption test for the experimental
+    # namespace backend, not evidence of browser/power-loss/database recovery.
+    test = 'wasmfs/wasmfs_opfs_profile_namespace_bootstrap_recovery.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile_nonce = f'{random.getrandbits(64):016x}'
+    cases = [
+      # A PREPARED recovery owns the initial mode until it flushes PUBLISHED.
+      ('before-selector', 1, '0750'),
+      ('after-selector', 2, '0750'),
+      ('after-prepared-journal', 3, '0750'),
+      # Once PUBLISHED is durable, a fresh mount must preserve its original
+      # root mode rather than treating the profile as an unexposed bootstrap.
+      ('after-published-journal', 4, '0711'),
+      ('after-published-journal-mirror', 5, '0711'),
+    ]
+    case_literals = []
+    for stem, phase, expected_mode in cases:
+      profile = f'wasmfs_bootstrap_{profile_nonce}_{phase}'
+      interrupter = f'bootstrap-{stem}-interrupter.html'
+      verifier = f'bootstrap-{stem}-verifier.html'
+      self.compile_btest(
+        test,
+        common_args + [
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_INTERRUPTER',
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_PROFILE_NAME=' + profile,
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_INITIAL_MODE=0711',
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_PHASE=' + str(phase),
+          '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT=1',
+          '-o', interrupter,
+        ],
+        reporting=Reporting.NONE)
+      self.compile_btest(
+        test,
+        common_args + [
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_VERIFIER',
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_PROFILE_NAME=' + profile,
+          # The fresh caller always asks for 0750. Before the first durable
+          # PUBLISHED record it owns the initial mode; afterward it must
+          # observe the interrupter's already-published 0711 instead.
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_INITIAL_MODE=0750',
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_BOOTSTRAP_EXPECTED_MODE=' +
+          expected_mode,
+          '-o', verifier,
+        ],
+        reporting=Reporting.NONE)
+      case_literals.append(
+        "{ expectedMode: %d, interrupter: '%s', phase: %d, verifier: '%s' }" %
+        (int(expected_mode, 8), interrupter, phase, verifier))
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        // This page only schedules documented test hooks and disposes an
+        // iframe. It never reads or writes OPFS itself.
+        const kInterrupter = 0;
+        const kVerifier = 1;
+        const kResult = 0;
+        const kInterruption = 1;
+        const kReady = 0;
+        const kBusy = 1;
+        const kModuleTimeoutMs = 15000;
+        const kLeaseReleaseDeadlineMs = 10000;
+        const kLeaseRetryDelayMs = 100;
+        const kWitnessType =
+          'wasmfs-opfs-profile-namespace-bootstrap-recovery';
+        const cases = [__BOOTSTRAP_CASES__];
+        const pendingInterrupters = new Map();
+        const pendingModules = new Map();
+        const pendingWitnesses = [];
+        let witnessWaiter;
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        function startInterrupter(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          let rejectFailure;
+          const failure = new Promise((resolve, reject) => {
+            rejectFailure = reject;
+          });
+          pendingInterrupters.set(frame.contentWindow, {frame, rejectFailure});
+          frame.src = path;
+          return {failure, frame};
+        }
+
+        function disposeInterrupter(interrupter) {
+          if (!interrupter) {
+            return;
+          }
+          pendingInterrupters.delete(interrupter.frame.contentWindow);
+          interrupter.frame.remove();
+        }
+
+        function settleWitness(witness) {
+          if (witnessWaiter && witnessWaiter.phase == witness.mode) {
+            const {resolve, timeout} = witnessWaiter;
+            witnessWaiter = undefined;
+            clearTimeout(timeout);
+            resolve(witness);
+          } else {
+            pendingWitnesses.push(witness);
+          }
+        }
+
+        function waitForWitness(phase) {
+          const index = pendingWitnesses.findIndex(
+            (witness) => witness.mode == phase);
+          if (index >= 0) {
+            return Promise.resolve(pendingWitnesses.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              witnessWaiter = undefined;
+              reject(new Error('timed out waiting for bootstrap phase ' + phase));
+            }, kModuleTimeoutMs);
+            witnessWaiter = {phase, resolve, timeout};
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType) {
+            return;
+          }
+          if (event.data.event == kInterruption &&
+              event.data.role == kInterrupter &&
+              event.data.result == kReady && event.data.error == 0) {
+            settleWitness(event.data);
+            return;
+          }
+          if (event.data.event != kResult) {
+            return;
+          }
+          const interrupter = pendingInterrupters.get(event.source);
+          if (interrupter) {
+            pendingInterrupters.delete(event.source);
+            interrupter.rejectFailure(new Error(
+              'bootstrap interrupter returned before its hook: result=' +
+              event.data.result + ', errno=' + event.data.error));
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function startLeasedVerifier(path, description) {
+          const deadline = Date.now() + kLeaseReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            const candidate = await startModule(path);
+            if (candidate.message.role != kVerifier) {
+              candidate.frame.remove();
+              throw new Error(description + ' reported role ' +
+                              candidate.message.role + ', expected verifier');
+            }
+            if (candidate.message.result != kBusy) {
+              return candidate;
+            }
+            candidate.frame.remove();
+            await delay(kLeaseRetryDelayMs);
+          }
+          throw new Error(description + ' did not acquire a fresh OPFS lease');
+        }
+
+        async function runCase(testCase) {
+          let interrupter;
+          let verifier;
+          try {
+            const witness = waitForWitness(testCase.phase);
+            interrupter = startInterrupter(testCase.interrupter);
+            await Promise.race([witness, interrupter.failure]);
+
+            // The only interruption is teardown of the holder document after
+            // its native test hook has reported the durable boundary.
+            disposeInterrupter(interrupter);
+            interrupter = undefined;
+
+            verifier = await startLeasedVerifier(
+              testCase.verifier, 'bootstrap phase ' + testCase.phase);
+            if (verifier.message.result != kReady ||
+                verifier.message.error != 0 ||
+                verifier.message.mode != testCase.expectedMode) {
+              throw new Error('bootstrap phase ' + testCase.phase +
+                              ' recovery failed: result=' +
+                              verifier.message.result + ', errno=' +
+                              verifier.message.error + ', mode=' +
+                              verifier.message.mode + ', expected mode=' +
+                              testCase.expectedMode);
+            }
+          } finally {
+            verifier?.frame.remove();
+            disposeInterrupter(interrupter);
+          }
+        }
+
+        (async () => {
+          for (const testCase of cases) {
+            await runCase(testCase);
+          }
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    '''.replace('__BOOTSTRAP_CASES__', ', '.join(case_literals)))
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_namespace_empty_drain(self):
+    # A namespace factory durably writes a PREPARED journal before callers
+    # mount its logical root. This test keeps a successfully drained iframe
+    # alive while a fresh module publishes the same profile, so context
+    # teardown cannot hide a leaked Web Lock or a stranded bootstrap record.
+    test = 'wasmfs/wasmfs_opfs_profile_namespace_empty_drain.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile_nonce = f'{random.getrandbits(64):016x}'
+    scoped_profile = f'wasmfs_empty_scoped_{profile_nonce}'
+    terminal_profile = f'wasmfs_empty_terminal_{profile_nonce}'
+    terminal_drain_args = common_args + [
+      '-sPTHREAD_POOL_SIZE=4',
+      '-sEXIT_RUNTIME',
+      '-sALLOW_BLOCKING_ON_MAIN_THREAD=0',
+    ]
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_DRAIN',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_PROFILE_NAME=' +
+        scoped_profile,
+        '-o', 'empty-scoped.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_FRESH',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_PROFILE_NAME=' +
+        scoped_profile,
+        '-o', 'fresh-after-scoped.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      terminal_drain_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_DRAIN',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_TERMINAL',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_PROFILE_NAME=' +
+        terminal_profile,
+        '-o', 'empty-terminal.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_FRESH',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_EMPTY_PROFILE_NAME=' +
+        terminal_profile,
+        '-o', 'fresh-after-terminal.html',
+      ],
+      reporting=Reporting.NONE)
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kDrain = 0;
+        const kFresh = 1;
+        const kReady = 0;
+        const kBusy = 1;
+        const kModuleTimeoutMs = 15000;
+        const kLeaseReleaseDeadlineMs = 10000;
+        const kLeaseRetryDelayMs = 100;
+        const kWitnessType = 'wasmfs-opfs-profile-namespace-empty-drain';
+        const pendingModules = new Map();
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        async function startLeasedModule(path, role, description) {
+          const deadline = Date.now() + kLeaseReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            const candidate = await startModule(path);
+            if (candidate.message.role != role) {
+              candidate.frame.remove();
+              throw new Error(description + ' reported role ' +
+                              candidate.message.role + ', expected ' + role);
+            }
+            if (candidate.message.result != kBusy) {
+              return candidate;
+            }
+            candidate.frame.remove();
+            await delay(kLeaseRetryDelayMs);
+          }
+          throw new Error(description +
+                          ' did not acquire a fresh OPFS profile lease');
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType ||
+              event.data.event != 'result') {
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function runCase(drainPath, freshPath, description) {
+          const drain = await startLeasedModule(drainPath, kDrain, description);
+          if (drain.message.result != kReady || drain.message.error != 0) {
+            drain.frame.remove();
+            throw new Error(description + ' drain failed: result=' +
+                            drain.message.result + ', errno=' +
+                            drain.message.error);
+          }
+
+          // Keep the drained iframe alive. The fresh mount therefore proves
+          // the drain itself released its Web Lock and preserved a usable
+          // PREPARED journal, rather than relying on document destruction.
+          try {
+            const fresh = await startLeasedModule(
+              freshPath, kFresh, description + ' fresh mount');
+            if (fresh.message.result != kReady || fresh.message.error != 0) {
+              fresh.frame.remove();
+              throw new Error(description + ' fresh mount failed: result=' +
+                              fresh.message.result + ', errno=' +
+                              fresh.message.error);
+            }
+            fresh.frame.remove();
+          } finally {
+            drain.frame.remove();
+          }
+        }
+
+        (async () => {
+          await runCase('empty-scoped.html', 'fresh-after-scoped.html',
+                        'scoped empty-container drain');
+          await runCase('empty-terminal.html', 'fresh-after-terminal.html',
+                        'terminal empty-container drain');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_namespace_initialisation_failure(self):
+    # Exercise factory failure ownership separately from ordinary namespace
+    # recovery. The test-only variations discard a completed initialization
+    # acknowledgement; they must retain a terminally visible tombstone. The
+    # ordinary fresh modules then prove that private bootstrap debris can be
+    # recovered only after the holder document has gone away.
+    test = 'wasmfs/wasmfs_opfs_profile_namespace_initialisation_failure.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile_nonce = f'{random.getrandbits(64):016x}'
+    profiles = {
+      'root': f'wasmfs_init_root_{profile_nonce}',
+      'lookup': f'wasmfs_init_lookup_{profile_nonce}',
+      'insert': f'wasmfs_init_insert_{profile_nonce}',
+      'known': f'wasmfs_init_known_{profile_nonce}',
+    }
+
+    for name, phase in [('root', 1), ('lookup', 2), ('insert', 3)]:
+      self.compile_btest(
+        test,
+        common_args + [
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_TOMBSTONE',
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_PROFILE_NAME=' +
+          profiles[name],
+          '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE=' +
+          str(phase),
+          '-o', name + '-tombstone.html',
+        ],
+        reporting=Reporting.NONE)
+      self.compile_btest(
+        test,
+        common_args + [
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_FRESH',
+          '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_PROFILE_NAME=' +
+          profiles[name],
+          '-o', name + '-fresh.html',
+        ],
+        reporting=Reporting.NONE)
+
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_KNOWN',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_PROFILE_NAME=' +
+        profiles['known'],
+        '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE=4',
+        '-o', 'known-failure.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_FRESH',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_INIT_FAILURE_PROFILE_NAME=' +
+        profiles['known'],
+        '-o', 'known-fresh.html',
+      ],
+      reporting=Reporting.NONE)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kTombstone = 0;
+        const kKnownFailure = 1;
+        const kFresh = 2;
+        const kReady = 0;
+        const kBusy = 1;
+        const kTombstoned = 2;
+        const kModuleTimeoutMs = 15000;
+        const kLeaseReleaseDeadlineMs = 10000;
+        const kLeaseRetryDelayMs = 100;
+        const kWitnessType =
+          'wasmfs-opfs-profile-namespace-initialisation-failure';
+        const pendingModules = new Map();
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        async function startLeasedModule(path, role, description) {
+          const deadline = Date.now() + kLeaseReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            const candidate = await startModule(path);
+            if (candidate.message.role != role) {
+              candidate.frame.remove();
+              throw new Error(description + ' reported role ' +
+                              candidate.message.role + ', expected ' + role);
+            }
+            if (candidate.message.result != kBusy) {
+              return candidate;
+            }
+            candidate.frame.remove();
+            await delay(kLeaseRetryDelayMs);
+          }
+          throw new Error(description +
+                          ' did not acquire a fresh OPFS profile lease');
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType || event.data.event != 'result') {
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function runTombstoneCase(holderPath, freshPath, description) {
+          const holder = await startLeasedModule(
+            holderPath, kTombstone, description + ' holder');
+          if (holder.message.result != kTombstoned ||
+              holder.message.error != 0) {
+            holder.frame.remove();
+            throw new Error(description + ' was not terminally fail-closed: ' +
+                            'result=' + holder.message.result + ', errno=' +
+                            holder.message.error);
+          }
+          // A second document must be blocked by the real browser Web Lock,
+          // not merely by the failed factory's in-process reservation. Do one
+          // no-retry contender while the tombstone remains alive, then remove
+          // the holder and permit the ordinary retrying recovery path.
+          try {
+            const blocked = await startModule(freshPath);
+            if (blocked.message.role != kFresh ||
+                blocked.message.result != kBusy) {
+              blocked.frame.remove();
+              throw new Error(description + ' did not hold the browser lease: ' +
+                              'result=' + blocked.message.result + ', errno=' +
+                              blocked.message.error + ', stage=' +
+                              blocked.message.stage);
+            }
+            blocked.frame.remove();
+          } finally {
+            holder.frame.remove();
+          }
+          const fresh = await startLeasedModule(
+            freshPath, kFresh, description + ' fresh recovery');
+          if (fresh.message.result != kReady || fresh.message.error != 0) {
+            fresh.frame.remove();
+            throw new Error(description + ' fresh recovery failed: result=' +
+                            fresh.message.result + ', errno=' +
+                            fresh.message.error + ', stage=' +
+                            fresh.message.stage);
+          }
+          fresh.frame.remove();
+        }
+
+        async function runKnownFailureCase() {
+          const holder = await startLeasedModule(
+            'known-failure.html', kKnownFailure, 'known factory failure');
+          if (holder.message.result != kReady || holder.message.error != 0) {
+            holder.frame.remove();
+            throw new Error('known factory failure did not cleanly hand off: ' +
+                            'result=' + holder.message.result + ', errno=' +
+                            holder.message.error);
+          }
+          // Keep this document alive: fresh acquisition proves the confirmed
+          // remove/release path itself, not document teardown.
+          try {
+            const fresh = await startLeasedModule(
+              'known-fresh.html', kFresh, 'known failure fresh recovery');
+            if (fresh.message.result != kReady || fresh.message.error != 0) {
+              fresh.frame.remove();
+              throw new Error('known failure fresh recovery failed: result=' +
+                              fresh.message.result + ', errno=' +
+                              fresh.message.error);
+            }
+            fresh.frame.remove();
+          } finally {
+            holder.frame.remove();
+          }
+        }
+
+        (async () => {
+          await runTombstoneCase(
+            'root-tombstone.html', 'root-fresh.html',
+            'root initialization acknowledgement');
+          await runTombstoneCase(
+            'lookup-tombstone.html', 'lookup-fresh.html',
+            'published-name lookup acknowledgement');
+          await runTombstoneCase(
+            'insert-tombstone.html', 'insert-fresh.html',
+            'bootstrap insert acknowledgement');
+          await runKnownFailureCase();
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_namespace_profile_name_isolation(self):
+    # Keep the first profile's PREPARED bootstrap artifacts live while a
+    # second profile whose logical name has the old bootstrap suffix
+    # initializes. A random stem avoids persistent OPFS state from an earlier
+    # browser test run while preserving the exact `collision` /
+    # `collision.bootstrap` relationship.
+    test = 'wasmfs/wasmfs_opfs_profile_namespace_profile_name_isolation.c'
+    common_args = [
+      '-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-sPTHREAD_POOL_SIZE=4',
+      '-lopfs.js',
+    ]
+    profile_nonce = f'{random.getrandbits(64):016x}'
+    profiles = {
+      'collision': f'wasmfs_collision_{profile_nonce}',
+      'collision.bootstrap': f'wasmfs_collision_{profile_nonce}.bootstrap',
+    }
+
+    def profile_args(profile, sentinel, role):
+      return [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_PROFILE_NAME=' + profile,
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_SENTINEL=' + sentinel,
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_PROFILE_ROLE=' + str(role),
+      ]
+
+    self.compile_btest(
+      test,
+      common_args + profile_args(profiles['collision'], 'first_sentinel', 0) + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_HOLDER',
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_PAUSE_BOOTSTRAP',
+        '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INTERRUPT=1',
+        '-o', 'collision-holder.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args +
+      profile_args(profiles['collision.bootstrap'], 'second_sentinel', 1) + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_HOLDER',
+        '-o', 'collision-bootstrap-holder.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + profile_args(profiles['collision'], 'first_sentinel', 0) + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_VERIFIER',
+        '-o', 'collision-verifier.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args +
+      profile_args(profiles['collision.bootstrap'], 'second_sentinel', 1) + [
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_ISOLATION_VERIFIER',
+        '-o', 'collision-bootstrap-verifier.html',
+      ],
+      reporting=Reporting.NONE)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kCollision = 0;
+        const kCollisionBootstrap = 1;
+        const kBootstrapReady = 0;
+        const kReady = 1;
+        const kDrained = 2;
+        const kVerified = 3;
+        const kModuleTimeoutMs = 20000;
+        const kWitnessType =
+          'wasmfs-opfs-profile-namespace-profile-name-isolation';
+        const liveModules = new Map();
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {events: [], frame, path, waiters: new Map()};
+          liveModules.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function waitForEvent(module, expectedEvent, description) {
+          const index = module.events.findIndex(
+            (message) => message.event == expectedEvent);
+          if (index >= 0) {
+            return Promise.resolve(module.events.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              module.waiters.delete(expectedEvent);
+              reject(new Error('timed out waiting for ' + description));
+            }, kModuleTimeoutMs);
+            module.waiters.set(expectedEvent, {resolve, timeout});
+          });
+        }
+
+        async function expectEvent(module, expectedRole, expectedEvent,
+                                   description) {
+          const message = await waitForEvent(module, expectedEvent, description);
+          if (message.role != expectedRole || message.error != 0) {
+            throw new Error(description + ' failed: role=' + message.role +
+                            ', event=' + message.event + ', errno=' +
+                            message.error);
+          }
+          return message;
+        }
+
+        function callExport(module, name, description) {
+          const exported = module.frame.contentWindow.Module?.[name];
+          if (typeof exported != 'function') {
+            throw new Error(description + ' is missing export ' + name);
+          }
+          exported();
+        }
+
+        function disposeModule(module) {
+          if (!module) {
+            return;
+          }
+          for (const waiter of module.waiters.values()) {
+            clearTimeout(waiter.timeout);
+          }
+          module.waiters.clear();
+          liveModules.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType) {
+            return;
+          }
+          const module = liveModules.get(event.source);
+          if (!module) {
+            return;
+          }
+          const waiter = module.waiters.get(event.data.event);
+          if (!waiter) {
+            module.events.push(event.data);
+            return;
+          }
+          module.waiters.delete(event.data.event);
+          clearTimeout(waiter.timeout);
+          waiter.resolve(event.data);
+        });
+
+        (async () => {
+          let firstHolder;
+          let secondHolder;
+          let firstVerifier;
+          let secondVerifier;
+          try {
+            firstHolder = launchModule('collision-holder.html');
+            await expectEvent(firstHolder, kCollision, kBootstrapReady,
+                              'collision bootstrap staging');
+
+            // Both profile leases remain live from here until their explicit
+            // drains. If physical names are suffix-derived, this second
+            // factory sees one of the first profile's bootstrap artifacts as
+            // its canonical object and cannot produce this ready witness.
+            secondHolder = launchModule('collision-bootstrap-holder.html');
+            await expectEvent(secondHolder, kCollisionBootstrap, kReady,
+                              'collision.bootstrap holder');
+
+            callExport(firstHolder,
+                       '_wasmfs_opfs_profile_namespace_isolation_resume_bootstrap',
+                       'collision holder');
+            await expectEvent(firstHolder, kCollision, kReady,
+                              'collision holder');
+
+            // Keep both holder documents alive while their result-bearing
+            // drains run. A later verifier must acquire after the explicit
+            // release, not after iframe teardown.
+            callExport(firstHolder,
+                       '_wasmfs_opfs_profile_namespace_isolation_request_drain',
+                       'collision holder');
+            callExport(secondHolder,
+                       '_wasmfs_opfs_profile_namespace_isolation_request_drain',
+                       'collision.bootstrap holder');
+            await expectEvent(firstHolder, kCollision, kDrained,
+                              'collision holder scoped drain');
+            await expectEvent(secondHolder, kCollisionBootstrap, kDrained,
+                              'collision.bootstrap holder scoped drain');
+
+            firstVerifier = launchModule('collision-verifier.html');
+            secondVerifier = launchModule('collision-bootstrap-verifier.html');
+            await expectEvent(firstVerifier, kCollision, kVerified,
+                              'collision reopen verifier');
+            await expectEvent(secondVerifier, kCollisionBootstrap, kVerified,
+                              'collision.bootstrap reopen verifier');
+            reportResultToServer('0');
+          } finally {
+            disposeModule(secondVerifier);
+            disposeModule(firstVerifier);
+            disposeModule(secondHolder);
+            disposeModule(firstHolder);
+          }
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_namespace_journal_corruption(self):
+    # A completed PUBLISHED namespace has two permanent journal witnesses.
+    # Simulate loss of either successfully-read witness in a fresh module and
+    # require EIO, then reopen normally to prove the failure did not reset the
+    # established profile. This deliberately remains a native parser test,
+    # not raw-OPFS mutation or browser/power-loss/database recovery evidence.
+    test = 'wasmfs/wasmfs_opfs_profile_namespace_journal_corruption.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = f'wasmfs_journal_corruption_{random.getrandbits(64):016x}'
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_NAMESPACE_JOURNAL_PROFILE_NAME=' + profile)
+
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_JOURNAL_OWNER',
+        '-o', 'journal-owner.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_JOURNAL_CORRUPTOR',
+        '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_JOURNAL_CORRUPTION=1',
+        '-o', 'journal-corrupt-slot-zero.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_JOURNAL_CORRUPTOR',
+        '-sWASMFS_OPFS_PROFILE_NAMESPACE_TEST_JOURNAL_CORRUPTION=2',
+        '-o', 'journal-corrupt-slot-one.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_NAMESPACE_JOURNAL_VERIFIER',
+        '-o', 'journal-verifier.html',
+      ],
+      reporting=Reporting.NONE)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kOwner = 0;
+        const kCorruptor = 1;
+        const kVerifier = 2;
+        const kModuleTimeoutMs = 20000;
+        const kWitnessType =
+          'wasmfs-opfs-profile-namespace-journal-corruption';
+        const pendingModules = new Map();
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType) {
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function expectSuccess(path, role, description) {
+          const module = await startModule(path);
+          try {
+            if (module.message.role != role || module.message.error != 0) {
+              throw new Error(description + ' failed: role=' +
+                              module.message.role + ', errno=' +
+                              module.message.error);
+            }
+          } finally {
+            module.frame.remove();
+          }
+        }
+
+        (async () => {
+          await expectSuccess('journal-owner.html', kOwner,
+                              'published namespace owner');
+          await expectSuccess('journal-corrupt-slot-zero.html', kCorruptor,
+                              'slot-zero journal corruption rejection');
+          await expectSuccess('journal-corrupt-slot-one.html', kCorruptor,
+                              'slot-one journal corruption rejection');
+          await expectSuccess('journal-verifier.html', kVerifier,
+                              'normal published namespace verifier');
+          reportResultToServer('0');
+        })().catch((error) => {
           reportResultToServer('failure: ' + error.message);
         });
       </script>

@@ -127,6 +127,42 @@ backend_t wasmfs_create_opfs_backend(void);
 backend_t wasmfs_create_opfs_backend_with_profile_lease(
   const char* profile_name);
 
+// Creates an opt-in leased OPFS backend whose visible filesystem namespace is
+// stored in one opaque container file: an append-only payload log with two
+// alternating mutable, checksummed selector blocks. A second permanent,
+// checksummed PREPARED/PUBLISHED journal records whether that container may be
+// reset as an unexposed bootstrap or is an established profile identity.
+// Unlike the direct OPFS backend, this backend can make a populated directory
+// rename a single committed namespace-root transition and can flush that
+// namespace root from a directory descriptor. It is intended for a
+// profile-specific embedding that requires those semantics; it does not alter
+// the behavior or capabilities of wasmfs_create_opfs_backend().
+//
+// The container is write-through in this initial implementation: a successful
+// namespace mutation has already written and flushed a new complete namespace
+// generation before it returns. First mount writes and flushes the caller's
+// root mode before flushing PUBLISHED and exposing the root. This trades
+// performance and container growth for a narrow, fail-closed recovery
+// boundary. It currently supports regular files and directories only.
+// Symlinks, explicit POSIX metadata setters, and persistence of WasmFS's
+// implicit atime/mtime/ctime updates remain unsupported; a successful
+// directory fsync is therefore not a claim of complete POSIX metadata
+// durability. Callers must still use
+// wasmfs_drain_opfs_profile_backend (or wasmfs_terminal_drain) for the leased
+// backend's orderly handoff. One namespace backend supports one logical mount
+// for its lifetime; a caller must not alias or remount it in the same WasmFS
+// instance, because WasmFS File identity carries append and record-lock state.
+// Complete the drain and create a fresh backend instead.
+//
+// The same profile-name validation, pthread requirement, cooperative Web Lock
+// ownership, and one-leased-backend-per-WasmFS-instance rules as
+// wasmfs_create_opfs_backend_with_profile_lease() apply. On failure returns
+// NULL and sets errno. A caller must not treat this experimental backend as a
+// complete Chromium profile implementation without separately proving its
+// higher-level service shutdown and database semantics.
+backend_t wasmfs_create_opfs_profile_namespace_backend(
+  const char* profile_name);
+
 // Creates a generic JSIMPL backend
 backend_t wasmfs_create_jsimpl_backend(void);
 
