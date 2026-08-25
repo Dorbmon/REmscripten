@@ -1885,6 +1885,23 @@ var WASMFS_OPFS_PROFILE_NAMESPACE_TEST_JOURNAL_CORRUPTION = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE = 0;
 
+// Test-only selectors for the bounded V2 profile-log control primitive. The
+// interruption hook pauses after one or both flushed CLEAN phase witnesses;
+// the corruption selector makes the native parser discard a successfully-read
+// selected phase (1) or descriptor witness (2). They expose no production
+// runtime API and do not grant host JavaScript OPFS access.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT = 0;
+
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION = 0;
+
+// Test-only V2 ambiguity hook. Value 1 models loss of native completion after
+// the inactive root image has flushed, then traces any later Worker proxy so
+// the focused regression can require a no-proxy terminal tombstone.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE = 0;
+
 // Test-only selector that makes the first OPFS SyncAccessHandle close fail.
 // This controls code emitted at link time only; it intentionally provides no
 // runtime configuration or recovery API.

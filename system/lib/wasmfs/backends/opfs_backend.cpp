@@ -62,6 +62,29 @@ constexpr char kOPFSGetChildProxyFailureTestName[] =
 #error "invalid direct OPFS directory proxy completion failure selector"
 #endif
 
+#ifndef WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE
+#define WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE 0
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE > 1
+#error "invalid profile-log V2 proxy completion failure selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE
+// This is a narrow test trace: once V2 synthetically enters the terminal
+// post-acknowledgement-loss state, later Worker::proxy calls are counted. The
+// regression asserts none occur through its explicit failed drain; it does
+// not observe runtime destruction after the iframe is disposed. The normal
+// runtime has neither the flag nor the counter.
+std::atomic<bool> profileLogV2ProxyCompletionLatchForTesting = false;
+std::atomic<uint32_t> profileLogV2ProxiesAfterLatchForTesting = 0;
+
+void latchProfileLogV2ProxyCompletionForTesting() {
+  profileLogV2ProxyCompletionLatchForTesting.store(true);
+}
+#endif
+
 #if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 2
 constexpr char kOPFSDirectOperationAdmissionRaceLatcherTestName[] =
   "__wasmfs_opfs_test_direct_operation_admission_latcher__";
@@ -167,7 +190,14 @@ public:
 #ifdef __EMSCRIPTEN_PTHREADS__
   ProxyWorker proxy;
 
-  template<typename T> bool operator()(T func) { return proxy(func); }
+  template<typename T> bool operator()(T func) {
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE
+    if (profileLogV2ProxyCompletionLatchForTesting.load()) {
+      ++profileLogV2ProxiesAfterLatchForTesting;
+    }
+#endif
+    return proxy(func);
+  }
 
   em_proxying_queue* getQueue() const { return proxy.getQueue(); }
   int fenceForRetirement() { return proxy.fenceForRetirement(); }
@@ -836,6 +866,20 @@ class OPFSFile : public DataFile {
     return -EIO;
   }
 
+  int rejectDirectOperation(const DirectOPFSOperation& operation) {
+    // A later wrapper can encounter the backend-wide lost-completion latch
+    // before it has made any browser request itself. Convert its locally open
+    // state into a no-proxy tombstone so detached descriptors and eventual
+    // wrapper destruction cannot try to close or free a browser handle after
+    // the OPFS state has become ambiguous.
+    if (directOperationFailureState &&
+        directOperationFailureState->getUnacknowledgedProxyError()) {
+      state.poison();
+      failedFileHandleRelease = true;
+    }
+    return operation.getError();
+  }
+
   // The File mutex protects the open state, JS file-handle ID, and locator.
   // Keep the locator locally rather than deriving it from Directory::getName:
   // normal file operations already hold this mutex and must not acquire the
@@ -899,6 +943,17 @@ public:
       profileLeaseState(std::move(profileLeaseState)),
       directOperationFailureState(std::move(directOperationFailureState)) {}
 
+  // V2's private physical files are not in WasmFS's descriptor table. When a
+  // lost completion prevents any further OPFS proxying, the control backend
+  // marks every one of them this way before it abandons its worker. Keep the
+  // browser handle ID pinned for document teardown rather than falsely freeing
+  // or closing it later.
+  void abandonForTerminalFailure() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    state.poison();
+    failedFileHandleRelease = true;
+  }
+
   ~OPFSFile() override {
     // A rejected AccessHandle close remains intentionally quarantined in the
     // ProxyWorker until its context is torn down. The file wrapper itself can
@@ -923,7 +978,7 @@ public:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     if (state.getKind() == OpenState::FailedAccessClose) {
       return -EIO;
@@ -957,7 +1012,7 @@ private:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     off_t size = -EIO;
     switch (state.getKind()) {
@@ -1002,7 +1057,7 @@ private:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     int err = 0;
     switch (state.getKind()) {
@@ -1048,7 +1103,7 @@ private:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     if (state.getKind() == OpenState::FailedAccessClose) {
       return -EIO;
@@ -1073,7 +1128,7 @@ private:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     int err = state.close(proxy);
     if (err) {
@@ -1103,7 +1158,7 @@ private:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     // TODO: use an i64 here.
     int32_t nread = -EIO;
@@ -1140,7 +1195,7 @@ private:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     if (state.getKind() == OpenState::FailedAccessClose) {
       return -EIO;
@@ -1161,7 +1216,7 @@ private:
     DirectOPFSOperation operation(
       *profileLeaseState, directOperationFailureState);
     if (!operation) {
-      return operation.getError();
+      return rejectDirectOperation(operation);
     }
     int err = 0;
     switch (state.getKind()) {
@@ -3556,6 +3611,1028 @@ std::shared_ptr<Directory> ProfileNamespaceBackend::createDirectory(mode_t mode)
   return makeDirectory(root);
 }
 
+// V2 is intentionally a control-plane experiment rather than a replacement
+// for ProfileNamespaceBackend above.  In particular, it has no directory
+// tree, data-file, metadata, or Chrome integration surface.  Its purpose is
+// to make one sharply bounded recovery property executable: a fresh document
+// can select either an old or a new opaque root only from fixed regular files,
+// without depending on OPFS directory fsync or directory rename.
+constexpr size_t kProfileLogV2RecordSize = 64;
+constexpr size_t kProfileLogV2BootstrapSize = 2 * kProfileLogV2RecordSize;
+constexpr size_t kProfileLogV2ControlSize = 6 * kProfileLogV2RecordSize;
+constexpr size_t kProfileLogV2RootSize = kProfileLogV2RecordSize;
+constexpr uint64_t kProfileLogV2MaxSafeOffset = UINT64_C(9007199254740991);
+static_assert(kProfileLogV2BootstrapSize <= kProfileLogV2MaxSafeOffset);
+static_assert(kProfileLogV2ControlSize <= kProfileLogV2MaxSafeOffset);
+static_assert(kProfileLogV2RootSize <= kProfileLogV2MaxSafeOffset);
+constexpr uint32_t kProfileLogV2FormatVersion = 2;
+constexpr uint32_t kProfileLogV2BootstrapReady = 1;
+constexpr uint32_t kProfileLogV2PhaseClean = 1;
+constexpr std::array<uint8_t, 8> kProfileLogV2BootstrapMagic = {
+  'W', 'F', 'S', 'L', 'G', '2', 'B', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV2RootMagic = {
+  'W', 'F', 'S', 'L', 'G', '2', 'R', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV2DescriptorMagic = {
+  'W', 'F', 'S', 'L', 'G', '2', 'D', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV2PhaseMagic = {
+  'W', 'F', 'S', 'L', 'G', '2', 'P', '0'};
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT
+#define WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT 0
+#endif
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION
+#define WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION 0
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT > 1
+#error "invalid profile-log V2 interruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION > 2
+#error "invalid profile-log V2 selected-control corruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT
+// The browser regression defines this only in a link variation that pauses
+// after bootstrap witness zero, or after the first or second flushed CLEAN
+// phase witness. It never provides a production recovery mechanism and is
+// deliberately not an OPFS write hook.
+extern "C" void wasmfs_opfs_profile_log_v2_test_maybe_interrupt(
+  int checkpoint);
+#endif
+
+struct ProfileLogV2RootImage {
+  uint64_t generation;
+  uint64_t value;
+  uint64_t checksum;
+};
+
+struct ProfileLogV2Descriptor {
+  uint64_t generation;
+  uint32_t rootSlot;
+  uint64_t rootChecksum;
+  uint64_t recordChecksum;
+};
+
+struct ProfileLogV2Phase {
+  uint64_t generation;
+  uint32_t rootSlot;
+  uint64_t descriptorChecksum;
+};
+
+uint64_t profileLogV2Checksum(const uint8_t* data, size_t size) {
+  uint64_t result = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i != size; ++i) {
+    result ^= data[i];
+    result *= UINT64_C(1099511628211);
+  }
+  return result;
+}
+
+template <size_t Size>
+bool profileLogV2HasZeroTail(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  return std::all_of(data.begin() + offset,
+                     data.end(),
+                     [](uint8_t value) { return value == 0; });
+}
+
+template <size_t Size>
+void writeProfileLogV2U32(std::array<uint8_t, Size>& data,
+                          size_t offset,
+                          uint32_t value) {
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+template <size_t Size>
+void writeProfileLogV2U64(std::array<uint8_t, Size>& data,
+                          size_t offset,
+                          uint64_t value) {
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+template <size_t Size>
+uint32_t readProfileLogV2U32(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  uint32_t value = 0;
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    value |= uint32_t(data[offset + i]) << (8 * i);
+  }
+  return value;
+}
+
+template <size_t Size>
+uint64_t readProfileLogV2U64(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  uint64_t value = 0;
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    value |= uint64_t(data[offset + i]) << (8 * i);
+  }
+  return value;
+}
+
+class ProfileLogV2ControlBackend final : public OPFSBackend {
+  std::recursive_mutex controlMutex;
+  std::shared_ptr<OPFSDirectory> physicalRoot;
+  std::shared_ptr<OPFSFile> bootstrap;
+  std::shared_ptr<OPFSFile> control;
+  std::array<std::shared_ptr<OPFSFile>, 2> roots;
+  std::array<bool, 2> rootsOpen = {};
+  bool bootstrapOpen = false;
+  bool controlOpen = false;
+  bool initialisationAmbiguous = false;
+  uint64_t profileChecksum = 0;
+  uint32_t profileLength = 0;
+  uint64_t generation = 0;
+  uint64_t rootValue = 0;
+  // A fresh open can safely *read* the old root when exactly one CLEAN
+  // witness names the next generation, but it must not overwrite that known
+  // partial transaction with another commit. A future V2 extension may add a
+  // separately durable repair decision; this small primitive deliberately
+  // exposes only the conservative read-and-drain outcome.
+  bool recoveryNeedsRepair = false;
+  int fatalError = 0;
+  std::string bootstrapName;
+  std::string controlName;
+  std::array<std::string, 2> rootNames;
+
+  static std::string storageStem(std::string_view profileName) {
+    // Length-delimiting keeps profile names injective without asking OPFS for
+    // any directory operation during a transaction.
+    std::string result = ".wasmfs-profile-log-v2-";
+    result += std::to_string(profileName.size());
+    result += '-';
+    result.append(profileName.data(), profileName.size());
+    return result;
+  }
+
+  static uint64_t descriptorOffset(uint64_t generation, uint64_t copy) {
+    // Two independently checksummed descriptor witnesses are retained for
+    // each parity. The next generation overwrites only the inactive parity,
+    // leaving the old CLEAN root recoverable until the new CLEAN quorum.
+    return ((generation & 1) * 2 + copy) * kProfileLogV2RecordSize;
+  }
+
+  static uint64_t phaseOffset(uint64_t copy) {
+    return (4 + copy) * kProfileLogV2RecordSize;
+  }
+
+  int poisonLocked(int error) {
+    if (error >= 0) {
+      error = -EIO;
+    }
+    if (!fatalError) {
+      fatalError = error;
+    }
+    return fatalError;
+  }
+
+  int recordInitialisationProxyFailure() {
+    initialisationAmbiguous = true;
+    terminalCloseState->recordUnacknowledgedProxyCompletion();
+    return -EIO;
+  }
+
+  std::shared_ptr<OPFSFile> makePhysicalFile(const std::string& name) {
+    auto file = std::make_shared<OPFSFile>(0600,
+                                           this,
+                                           kOPFSRootDirectoryID,
+                                           name,
+                                           proxy,
+                                           terminalCloseState,
+                                           profileLeaseState,
+                                           terminalCloseState);
+    file->locked().setParent(physicalRoot);
+    return file;
+  }
+
+  int initialisePhysicalRootLocked() {
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    if (!proxy([](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); })) {
+      return recordInitialisationProxyFailure();
+    }
+    physicalRoot = std::make_shared<OPFSDirectory>(0700,
+                                                    this,
+                                                    kOPFSRootDirectoryID,
+                                                    proxy,
+                                                    terminalCloseState,
+                                                    profileLeaseState,
+                                                    terminalCloseState);
+    return 0;
+  }
+
+  int lookupPhysicalFileLocked(const std::string& name) {
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    int childType = 0;
+    int childID = -EIO;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_get_child(ctx.ctx,
+                                 kOPFSRootDirectoryID,
+                                 name.c_str(),
+                                 &childType,
+                                 &childID);
+        })) {
+      return recordInitialisationProxyFailure();
+    }
+    if (childID == -ENOENT) {
+      return -ENOENT;
+    }
+    // OPFS files deliberately retain no JS file-handle ID after creation, so
+    // a regular child is represented by type 1 and id 0.
+    return childType == 1 && childID == 0 ? 0 : -EIO;
+  }
+
+  int insertPhysicalFileLocked(const std::string& name) {
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    int childID = -EIO;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_insert_file(
+            ctx.ctx, kOPFSRootDirectoryID, name.c_str(), &childID);
+        })) {
+      return recordInitialisationProxyFailure();
+    }
+    return childID == 0 ? 0 : childID < 0 ? childID : -EIO;
+  }
+
+  int openFileLocked(const std::shared_ptr<OPFSFile>& file, bool* opened) {
+    if (!file || !opened) {
+      return -EIO;
+    }
+    int error = file->locked().open(O_RDWR);
+    if (!error) {
+      *opened = true;
+    }
+    return error;
+  }
+
+  int openAllFilesLocked() {
+    if (int error = openFileLocked(bootstrap, &bootstrapOpen)) {
+      return error;
+    }
+    if (int error = openFileLocked(control, &controlOpen)) {
+      return error;
+    }
+    for (size_t i = 0; i != roots.size(); ++i) {
+      if (int error = openFileLocked(roots[i], &rootsOpen[i])) {
+        return error;
+      }
+    }
+    return 0;
+  }
+
+  int closeFileForRetirementLocked(const std::shared_ptr<OPFSFile>& file,
+                                   bool* opened,
+                                   bool flushFirst) {
+    if (!opened || !*opened) {
+      return 0;
+    }
+    int firstError = flushFirst ? file->locked().flush() : 0;
+    int closeError = file->locked().close();
+    if (!closeError) {
+      *opened = false;
+    } else if (!firstError) {
+      firstError = closeError;
+    }
+    return firstError;
+  }
+
+  int closeAllFilesForRetirementLocked(bool flushFirst) {
+    // A completed flush/close error is not an ambiguity grant: keep closing
+    // the remaining private AccessHandles so a later failed handoff cannot
+    // abandon healthy wrappers in Access state. Stop only if a close loses its
+    // completion acknowledgement; prepareOPFSProfileRetirement will then turn
+    // every wrapper into a no-proxy tombstone before it abandons the worker.
+    int firstError = 0;
+    auto closeOne = [&](const std::shared_ptr<OPFSFile>& file, bool* opened) {
+      int error = closeFileForRetirementLocked(file, opened, flushFirst);
+      if (!firstError && error) {
+        firstError = error;
+      }
+      return terminalCloseState->getUnacknowledgedProxyError() == 0;
+    };
+    if (!closeOne(roots[0], &rootsOpen[0]) ||
+        !closeOne(roots[1], &rootsOpen[1]) ||
+        !closeOne(control, &controlOpen) ||
+        !closeOne(bootstrap, &bootstrapOpen)) {
+      return firstError ? firstError
+                        : terminalCloseState->getUnacknowledgedProxyError();
+    }
+    return firstError;
+  }
+
+  void abandonPhysicalFilesLocked() {
+    // No wrapper reset occurs here: the shared_ptrs remain alive through the
+    // destructor-proxy gate, and each retained browser handle belongs to the
+    // abandoned worker context until document teardown. This is intentionally
+    // a native-only state transition with no OPFS callback.
+    if (bootstrap) {
+      bootstrap->abandonForTerminalFailure();
+    }
+    if (control) {
+      control->abandonForTerminalFailure();
+    }
+    for (const auto& root : roots) {
+      if (root) {
+        root->abandonForTerminalFailure();
+      }
+    }
+  }
+
+  int stopAfterUnacknowledgedProxyLocked() {
+    const int error = terminalCloseState->getUnacknowledgedProxyError();
+    if (!error) {
+      return 0;
+    }
+    abandonPhysicalFilesLocked();
+    // This gate is purely native admission/waiting. Closing it prevents later
+    // wrapper destructors from submitting a best-effort handle free before
+    // finishOPFSProfileDrain(false) detaches the dedicated worker.
+    profileLeaseState->closeDestructorProxying();
+    return error;
+  }
+
+  int setFixedSizeLocked(const std::shared_ptr<OPFSFile>& file, size_t size) {
+    if (!file ||
+        size > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    if (int error = file->locked().setSize(size)) {
+      return error;
+    }
+    return file->locked().flush();
+  }
+
+  int requireFixedSizeLocked(const std::shared_ptr<OPFSFile>& file,
+                             size_t expectedSize) {
+    if (!file || expectedSize >
+                   static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const off_t size = file->locked().getSize();
+    if (size < 0) {
+      return size;
+    }
+    return size_t(size) == expectedSize ? 0 : -EIO;
+  }
+
+  int writeRecordLocked(const std::shared_ptr<OPFSFile>& file,
+                        uint64_t offset,
+                        const std::array<uint8_t, kProfileLogV2RecordSize>&
+                          record) {
+    if (!file || offset > std::numeric_limits<off_t>::max()) {
+      return -EOVERFLOW;
+    }
+    ssize_t written = file->locked().write(record.data(), record.size(), offset);
+    if (written < 0) {
+      return written;
+    }
+    if (size_t(written) != record.size()) {
+      return -EIO;
+    }
+    return file->locked().flush();
+  }
+
+  int readRecordLocked(const std::shared_ptr<OPFSFile>& file,
+                       uint64_t offset,
+                       std::array<uint8_t, kProfileLogV2RecordSize>* record) {
+    if (!file || !record || offset > std::numeric_limits<off_t>::max()) {
+      return -EOVERFLOW;
+    }
+    ssize_t read = file->locked().read(record->data(), record->size(), offset);
+    if (read < 0) {
+      return read;
+    }
+    return size_t(read) == record->size() ? 0 : -EIO;
+  }
+
+  std::array<uint8_t, kProfileLogV2RecordSize> makeBootstrapRecord() const {
+    std::array<uint8_t, kProfileLogV2RecordSize> record = {};
+    std::copy(kProfileLogV2BootstrapMagic.begin(),
+              kProfileLogV2BootstrapMagic.end(),
+              record.begin());
+    writeProfileLogV2U32(record, 8, kProfileLogV2FormatVersion);
+    writeProfileLogV2U32(record, 12, kProfileLogV2RecordSize);
+    writeProfileLogV2U64(record, 16, profileChecksum);
+    writeProfileLogV2U32(record, 24, profileLength);
+    writeProfileLogV2U32(record, 28, kProfileLogV2BootstrapReady);
+    writeProfileLogV2U64(record, 32, 1);
+    writeProfileLogV2U64(record, 40, profileLogV2Checksum(record.data(), 40));
+    return record;
+  }
+
+  bool parseBootstrapRecord(
+    const std::array<uint8_t, kProfileLogV2RecordSize>& record) const {
+    return std::equal(kProfileLogV2BootstrapMagic.begin(),
+                      kProfileLogV2BootstrapMagic.end(),
+                      record.begin()) &&
+           readProfileLogV2U32(record, 8) == kProfileLogV2FormatVersion &&
+           readProfileLogV2U32(record, 12) == kProfileLogV2RecordSize &&
+           readProfileLogV2U64(record, 16) == profileChecksum &&
+           readProfileLogV2U32(record, 24) == profileLength &&
+           readProfileLogV2U32(record, 28) == kProfileLogV2BootstrapReady &&
+           readProfileLogV2U64(record, 32) == 1 &&
+           readProfileLogV2U64(record, 40) ==
+             profileLogV2Checksum(record.data(), 40) &&
+           profileLogV2HasZeroTail(record, 48);
+  }
+
+  std::array<uint8_t, kProfileLogV2RecordSize> makeRootRecord(
+    uint64_t recordGeneration,
+    uint64_t value) const {
+    std::array<uint8_t, kProfileLogV2RecordSize> record = {};
+    std::copy(kProfileLogV2RootMagic.begin(),
+              kProfileLogV2RootMagic.end(),
+              record.begin());
+    writeProfileLogV2U32(record, 8, kProfileLogV2FormatVersion);
+    writeProfileLogV2U32(record, 12, kProfileLogV2RecordSize);
+    writeProfileLogV2U64(record, 16, recordGeneration);
+    writeProfileLogV2U64(record, 24, value);
+    writeProfileLogV2U64(record, 32, profileChecksum);
+    writeProfileLogV2U64(record, 40, profileLogV2Checksum(record.data(), 40));
+    return record;
+  }
+
+  std::optional<ProfileLogV2RootImage> parseRootRecord(
+    const std::array<uint8_t, kProfileLogV2RecordSize>& record) const {
+    if (!std::equal(kProfileLogV2RootMagic.begin(),
+                    kProfileLogV2RootMagic.end(),
+                    record.begin()) ||
+        readProfileLogV2U32(record, 8) != kProfileLogV2FormatVersion ||
+        readProfileLogV2U32(record, 12) != kProfileLogV2RecordSize ||
+        readProfileLogV2U64(record, 32) != profileChecksum ||
+        readProfileLogV2U64(record, 40) !=
+          profileLogV2Checksum(record.data(), 40) ||
+        !profileLogV2HasZeroTail(record, 48)) {
+      return std::nullopt;
+    }
+    uint64_t recordGeneration = readProfileLogV2U64(record, 16);
+    if (!recordGeneration) {
+      return std::nullopt;
+    }
+    return ProfileLogV2RootImage{recordGeneration,
+                                 readProfileLogV2U64(record, 24),
+                                 readProfileLogV2U64(record, 40)};
+  }
+
+  std::array<uint8_t, kProfileLogV2RecordSize> makeDescriptorRecord(
+    uint64_t recordGeneration,
+    uint32_t rootSlot,
+    uint64_t rootChecksum) const {
+    std::array<uint8_t, kProfileLogV2RecordSize> record = {};
+    std::copy(kProfileLogV2DescriptorMagic.begin(),
+              kProfileLogV2DescriptorMagic.end(),
+              record.begin());
+    writeProfileLogV2U32(record, 8, kProfileLogV2FormatVersion);
+    writeProfileLogV2U32(record, 12, kProfileLogV2RecordSize);
+    writeProfileLogV2U64(record, 16, recordGeneration);
+    writeProfileLogV2U32(record, 24, rootSlot);
+    writeProfileLogV2U64(record, 32, rootChecksum);
+    writeProfileLogV2U64(record, 40, profileChecksum);
+    writeProfileLogV2U64(record, 48, profileLogV2Checksum(record.data(), 48));
+    return record;
+  }
+
+  std::optional<ProfileLogV2Descriptor> parseDescriptorRecord(
+    const std::array<uint8_t, kProfileLogV2RecordSize>& record) const {
+    if (!std::equal(kProfileLogV2DescriptorMagic.begin(),
+                    kProfileLogV2DescriptorMagic.end(),
+                    record.begin()) ||
+        readProfileLogV2U32(record, 8) != kProfileLogV2FormatVersion ||
+        readProfileLogV2U32(record, 12) != kProfileLogV2RecordSize ||
+        readProfileLogV2U64(record, 40) != profileChecksum ||
+        readProfileLogV2U64(record, 48) !=
+          profileLogV2Checksum(record.data(), 48) ||
+        !profileLogV2HasZeroTail(record, 56)) {
+      return std::nullopt;
+    }
+    uint64_t recordGeneration = readProfileLogV2U64(record, 16);
+    uint32_t rootSlot = readProfileLogV2U32(record, 24);
+    if (!recordGeneration || rootSlot > 1) {
+      return std::nullopt;
+    }
+    return ProfileLogV2Descriptor{recordGeneration,
+                                  rootSlot,
+                                  readProfileLogV2U64(record, 32),
+                                  readProfileLogV2U64(record, 48)};
+  }
+
+  std::array<uint8_t, kProfileLogV2RecordSize> makePhaseRecord(
+    uint64_t recordGeneration,
+    uint32_t rootSlot,
+    uint64_t descriptorChecksum) const {
+    std::array<uint8_t, kProfileLogV2RecordSize> record = {};
+    std::copy(kProfileLogV2PhaseMagic.begin(),
+              kProfileLogV2PhaseMagic.end(),
+              record.begin());
+    writeProfileLogV2U32(record, 8, kProfileLogV2FormatVersion);
+    writeProfileLogV2U32(record, 12, kProfileLogV2RecordSize);
+    writeProfileLogV2U64(record, 16, recordGeneration);
+    writeProfileLogV2U32(record, 24, rootSlot);
+    writeProfileLogV2U32(record, 28, kProfileLogV2PhaseClean);
+    writeProfileLogV2U64(record, 32, descriptorChecksum);
+    writeProfileLogV2U64(record, 40, profileChecksum);
+    writeProfileLogV2U64(record, 48, profileLogV2Checksum(record.data(), 48));
+    return record;
+  }
+
+  std::optional<ProfileLogV2Phase> parsePhaseRecord(
+    const std::array<uint8_t, kProfileLogV2RecordSize>& record) const {
+    if (!std::equal(kProfileLogV2PhaseMagic.begin(),
+                    kProfileLogV2PhaseMagic.end(),
+                    record.begin()) ||
+        readProfileLogV2U32(record, 8) != kProfileLogV2FormatVersion ||
+        readProfileLogV2U32(record, 12) != kProfileLogV2RecordSize ||
+        readProfileLogV2U64(record, 40) != profileChecksum ||
+        readProfileLogV2U32(record, 28) != kProfileLogV2PhaseClean ||
+        readProfileLogV2U64(record, 48) !=
+          profileLogV2Checksum(record.data(), 48) ||
+        !profileLogV2HasZeroTail(record, 56)) {
+      return std::nullopt;
+    }
+    uint64_t recordGeneration = readProfileLogV2U64(record, 16);
+    uint32_t rootSlot = readProfileLogV2U32(record, 24);
+    if (!recordGeneration || rootSlot > 1) {
+      return std::nullopt;
+    }
+    return ProfileLogV2Phase{recordGeneration,
+                             rootSlot,
+                             readProfileLogV2U64(record, 32)};
+  }
+
+  int writeDescriptorPairLocked(uint64_t recordGeneration,
+                                uint64_t rootChecksum,
+                                uint64_t* descriptorChecksum) {
+    auto record = makeDescriptorRecord(
+      recordGeneration, recordGeneration & 1, rootChecksum);
+    if (descriptorChecksum) {
+      *descriptorChecksum = readProfileLogV2U64(record, 48);
+    }
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      if (int error = writeRecordLocked(
+            control, descriptorOffset(recordGeneration, copy), record)) {
+        return error;
+      }
+    }
+    return 0;
+  }
+
+  int writePhaseWitnessLocked(uint64_t copy,
+                              uint64_t recordGeneration,
+                              uint32_t rootSlot,
+                              uint64_t descriptorChecksum) {
+    return writeRecordLocked(
+      control,
+      phaseOffset(copy),
+      makePhaseRecord(recordGeneration, rootSlot, descriptorChecksum));
+  }
+
+  int initialiseFreshLocked() {
+    // Never recover an incomplete bootstrap by directory inspection or
+    // deletion. A missing bootstrap next to any fixed V2 name is ambiguous
+    // without durable directory operations and is rejected by the caller.
+    if (int error = insertPhysicalFileLocked(rootNames[0])) {
+      return error;
+    }
+    if (int error = insertPhysicalFileLocked(rootNames[1])) {
+      return error;
+    }
+    if (int error = insertPhysicalFileLocked(controlName)) {
+      return error;
+    }
+    if (int error = insertPhysicalFileLocked(bootstrapName)) {
+      return error;
+    }
+    bootstrap = makePhysicalFile(bootstrapName);
+    control = makePhysicalFile(controlName);
+    roots[0] = makePhysicalFile(rootNames[0]);
+    roots[1] = makePhysicalFile(rootNames[1]);
+    if (int error = openAllFilesLocked()) {
+      return error;
+    }
+    if (int error = setFixedSizeLocked(bootstrap, kProfileLogV2BootstrapSize)) {
+      return error;
+    }
+    if (int error = setFixedSizeLocked(control, kProfileLogV2ControlSize)) {
+      return error;
+    }
+    for (const auto& root : roots) {
+      if (int error = setFixedSizeLocked(root, kProfileLogV2RootSize)) {
+        return error;
+      }
+    }
+
+    // Generation one lives in slot one. Slot zero is deliberately initialized
+    // only to a fixed length; no selector can choose it until generation two
+    // has written and flushed a complete root image there.
+    const auto root = makeRootRecord(1, 0);
+    if (int error = writeRecordLocked(roots[1], 0, root)) {
+      return error;
+    }
+    uint64_t descriptorChecksum = 0;
+    if (int error = writeDescriptorPairLocked(
+          1, readProfileLogV2U64(root, 40), &descriptorChecksum)) {
+      return error;
+    }
+    if (int error = writePhaseWitnessLocked(0, 1, 1, descriptorChecksum)) {
+      return error;
+    }
+    if (int error = writePhaseWitnessLocked(1, 1, 1, descriptorChecksum)) {
+      return error;
+    }
+
+    // Bootstrap is deliberately published last and requires two flushed
+    // identical witnesses. A partially created file set is never adopted by
+    // a later factory; it fails closed rather than pretending direct OPFS
+    // directory creation was durable.
+    const auto bootstrapRecord = makeBootstrapRecord();
+    if (int error = writeRecordLocked(bootstrap, 0, bootstrapRecord)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v2_test_maybe_interrupt(0);
+#endif
+    if (int error = writeRecordLocked(
+          bootstrap, kProfileLogV2RecordSize, bootstrapRecord)) {
+      return error;
+    }
+    generation = 1;
+    rootValue = 0;
+    return 0;
+  }
+
+  int verifyBootstrapLocked() {
+    std::array<uint8_t, kProfileLogV2RecordSize> first;
+    std::array<uint8_t, kProfileLogV2RecordSize> second;
+    if (int error = readRecordLocked(bootstrap, 0, &first)) {
+      return error;
+    }
+    if (int error = readRecordLocked(
+          bootstrap, kProfileLogV2RecordSize, &second)) {
+      return error;
+    }
+    // Equal bytes prevent one damaged witness from accidentally being treated
+    // as a second endorsement of the same profile identity.
+    return parseBootstrapRecord(first) && parseBootstrapRecord(second) &&
+           first == second
+             ? 0
+             : -EIO;
+  }
+
+  // Validate one phase witness all the way to its root image. In particular,
+  // a g/g+1 phase split is a known pre-quorum state only if *both* the old and
+  // new independently duplicated descriptor/root chains are sound. Merely
+  // seeing adjacent generation numbers cannot turn a damaged selected control
+  // record into a rollback authorization.
+  int validatePhaseRootLocked(const ProfileLogV2Phase& phase,
+                              ProfileLogV2RootImage* rootImage) {
+    if (!rootImage || phase.rootSlot != (phase.generation & 1)) {
+      return -EIO;
+    }
+    std::array<std::optional<ProfileLogV2Descriptor>, 2> descriptors;
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      std::array<uint8_t, kProfileLogV2RecordSize> record;
+      if (int error = readRecordLocked(
+            control, descriptorOffset(phase.generation, copy), &record)) {
+        return error;
+      }
+      descriptors[copy] = parseDescriptorRecord(record);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION == 2
+    // This fault is applied only after the native parser has successfully
+    // read the physical witness. The only permissible outcome is a failed
+    // factory; it must not select an older root through damaged control.
+    descriptors[0].reset();
+#endif
+    if (!descriptors[0] || !descriptors[1] ||
+        descriptors[0]->generation != phase.generation ||
+        descriptors[1]->generation != phase.generation ||
+        descriptors[0]->rootSlot != phase.rootSlot ||
+        descriptors[1]->rootSlot != phase.rootSlot ||
+        descriptors[0]->rootChecksum != descriptors[1]->rootChecksum ||
+        descriptors[0]->recordChecksum != phase.descriptorChecksum ||
+        descriptors[1]->recordChecksum != phase.descriptorChecksum) {
+      return -EIO;
+    }
+    std::array<uint8_t, kProfileLogV2RecordSize> record;
+    if (int error = readRecordLocked(roots[phase.rootSlot], 0, &record)) {
+      return error;
+    }
+    auto root = parseRootRecord(record);
+    if (!root || root->generation != phase.generation ||
+        root->checksum != descriptors[0]->rootChecksum) {
+      return -EIO;
+    }
+    *rootImage = *root;
+    return 0;
+  }
+
+  int recoverControlLocked() {
+    std::array<std::optional<ProfileLogV2Phase>, 2> phases;
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      std::array<uint8_t, kProfileLogV2RecordSize> record;
+      if (int error = readRecordLocked(control, phaseOffset(copy), &record)) {
+        return error;
+      }
+      phases[copy] = parsePhaseRecord(record);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION == 1
+    // The focused test discards one successfully-read selected phase witness.
+    // It never mutates OPFS and asserts the native recovery parser fails
+    // closed instead of falling back through a damaged selected control state.
+    phases[0].reset();
+#endif
+    if (!phases[0] || !phases[1]) {
+      return -EIO;
+    }
+
+    ProfileLogV2RootImage selectedRoot = {};
+    recoveryNeedsRepair = false;
+    if (phases[0]->generation == phases[1]->generation) {
+      // A CLEAN quorum has to select one exact descriptor/root chain. Two
+      // same-generation witnesses with different targets are corruption, not
+      // an invitation to pick either copy.
+      if (phases[0]->rootSlot != phases[1]->rootSlot ||
+          phases[0]->descriptorChecksum != phases[1]->descriptorChecksum) {
+        return -EIO;
+      }
+      if (int error = validatePhaseRootLocked(*phases[0], &selectedRoot)) {
+        return error;
+      }
+    } else {
+      const ProfileLogV2Phase& oldPhase =
+        phases[0]->generation < phases[1]->generation ? *phases[0]
+                                                       : *phases[1];
+      const ProfileLogV2Phase& newPhase =
+        phases[0]->generation < phases[1]->generation ? *phases[1]
+                                                       : *phases[0];
+      // Exactly one new CLEAN witness is a durable pre-quorum state. It may
+      // expose the old root only after both chains validate; a gap, slot
+      // mismatch, malformed descriptor, or bad root remains fail-closed.
+      if (oldPhase.generation == std::numeric_limits<uint64_t>::max() ||
+          newPhase.generation != oldPhase.generation + 1 ||
+          oldPhase.rootSlot != (oldPhase.generation & 1) ||
+          newPhase.rootSlot != (newPhase.generation & 1)) {
+        return -EIO;
+      }
+      if (int error = validatePhaseRootLocked(oldPhase, &selectedRoot)) {
+        return error;
+      }
+      ProfileLogV2RootImage newRoot = {};
+      if (int error = validatePhaseRootLocked(newPhase, &newRoot)) {
+        return error;
+      }
+      // Do not reuse the g+1 root slot or descriptors. V2 has no durable
+      // rollback/roll-forward decision yet, so this fresh instance is read
+      // only until it drains and hands off the profile lease.
+      recoveryNeedsRepair = true;
+    }
+    generation = selectedRoot.generation;
+    rootValue = selectedRoot.value;
+    return 0;
+  }
+
+  int openEstablishedLocked() {
+    bootstrap = makePhysicalFile(bootstrapName);
+    control = makePhysicalFile(controlName);
+    roots[0] = makePhysicalFile(rootNames[0]);
+    roots[1] = makePhysicalFile(rootNames[1]);
+    if (int error = openAllFilesLocked()) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(
+          bootstrap, kProfileLogV2BootstrapSize)) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(control, kProfileLogV2ControlSize)) {
+      return error;
+    }
+    for (const auto& root : roots) {
+      if (int error = requireFixedSizeLocked(root, kProfileLogV2RootSize)) {
+        return error;
+      }
+    }
+    if (int error = verifyBootstrapLocked()) {
+      return error;
+    }
+    return recoverControlLocked();
+  }
+
+public:
+  // This factory does not expose a mountable root. A caller can only exercise
+  // the documented control API, so V2 cannot accidentally become a drop-in
+  // direct OPFS profile filesystem while its bounded protocol is under test.
+  bool supportsRecordLocks() const override { return false; }
+  std::shared_ptr<DataFile> createFile(mode_t) override { return nullptr; }
+  std::shared_ptr<Directory> createDirectory(mode_t) override {
+    return nullptr;
+  }
+  std::shared_ptr<Symlink> createSymlink(std::string) override {
+    return nullptr;
+  }
+
+  int initialise(const char* profileName) {
+    std::lock_guard<std::recursive_mutex> lock(controlMutex);
+    if (!profileName) {
+      return -EINVAL;
+    }
+    const std::string_view profile(profileName);
+    profileChecksum = profileLogV2Checksum(
+      reinterpret_cast<const uint8_t*>(profile.data()), profile.size());
+    if (profile.size() > std::numeric_limits<uint32_t>::max()) {
+      return -EOVERFLOW;
+    }
+    profileLength = profile.size();
+    const std::string stem = storageStem(profile);
+    bootstrapName = stem + "-bootstrap";
+    controlName = stem + "-control";
+    rootNames[0] = stem + "-root-0";
+    rootNames[1] = stem + "-root-1";
+
+    if (int error = initialisePhysicalRootLocked()) {
+      return error;
+    }
+    const int bootstrapStatus = lookupPhysicalFileLocked(bootstrapName);
+    if (bootstrapStatus == -ENOENT) {
+      // Bootstrap does not exist only for a completely absent profile. Do not
+      // use directory cleanup to reinterpret an interrupted setup as empty.
+      for (const auto& name : {controlName, rootNames[0], rootNames[1]}) {
+        if (int status = lookupPhysicalFileLocked(name); status != -ENOENT) {
+          return status == 0 ? -EIO : status;
+        }
+      }
+      return initialiseFreshLocked();
+    }
+    if (bootstrapStatus) {
+      return bootstrapStatus;
+    }
+    for (const auto& name : {controlName, rootNames[0], rootNames[1]}) {
+      if (int status = lookupPhysicalFileLocked(name)) {
+        return status == -ENOENT ? -EIO : status;
+      }
+    }
+    return openEstablishedLocked();
+  }
+
+  int readOPFSProfileLogV2Root(uint64_t* value) override {
+    if (!value) {
+      return -EINVAL;
+    }
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(controlMutex);
+    if (fatalError || !generation) {
+      return fatalError ? fatalError : -ESHUTDOWN;
+    }
+    *value = rootValue;
+    return 0;
+  }
+
+  int commitOPFSProfileLogV2Root(uint64_t value) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(controlMutex);
+    if (fatalError || !generation) {
+      return fatalError ? fatalError : -ESHUTDOWN;
+    }
+    if (recoveryNeedsRepair) {
+      // A g/g+1 phase split is readable as the old root, but V2 intentionally
+      // has no durable transition that may discard or finish g+1. Refuse to
+      // overwrite it until a future protocol supplies such a decision.
+      return -ESHUTDOWN;
+    }
+    if (generation == std::numeric_limits<uint64_t>::max()) {
+      return poisonLocked(-EOVERFLOW);
+    }
+    const uint64_t nextGeneration = generation + 1;
+    const uint32_t nextRootSlot = nextGeneration & 1;
+    const auto root = makeRootRecord(nextGeneration, value);
+    if (int error = writeRecordLocked(roots[nextRootSlot], 0, root)) {
+      return poisonLocked(error);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE == 1
+    // Test-only synthetic fault: the root write and flush have returned, then
+    // enter the same terminal state used for a lost native acknowledgement.
+    // This does not make ProxyWorker::operator() return false; it proves the
+    // no-later-proxy response to that state through the explicit failed drain.
+    latchProfileLogV2ProxyCompletionForTesting();
+    terminalCloseState->recordUnacknowledgedProxyCompletion();
+    return poisonLocked(-EIO);
+#endif
+    uint64_t descriptorChecksum = 0;
+    if (int error = writeDescriptorPairLocked(
+          nextGeneration,
+          readProfileLogV2U64(root, 40),
+          &descriptorChecksum)) {
+      return poisonLocked(error);
+    }
+
+    // The first durable CLEAN witness is intentionally insufficient for a
+    // fresh recovery to select |nextGeneration|. It leaves the old phase
+    // witness intact, which is the entire old-root-before-quorum proof.
+    if (int error = writePhaseWitnessLocked(
+          0, nextGeneration, nextRootSlot, descriptorChecksum)) {
+      return poisonLocked(error);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v2_test_maybe_interrupt(1);
+#endif
+    if (int error = writePhaseWitnessLocked(
+          1, nextGeneration, nextRootSlot, descriptorChecksum)) {
+      return poisonLocked(error);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v2_test_maybe_interrupt(2);
+#endif
+    generation = nextGeneration;
+    rootValue = value;
+    return 0;
+  }
+
+  int prepareOPFSProfileRetirement(bool checkResources) override {
+    int firstError = 0;
+    {
+      ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+      if (!operation) {
+        firstError = operation.getError();
+      } else {
+        std::lock_guard<std::recursive_mutex> lock(controlMutex);
+        if (int error = stopAfterUnacknowledgedProxyLocked()) {
+          return error;
+        }
+        // The fixed opaque files retain SyncAccessHandles while live. Close
+        // them before the inherited preflight, but do not issue a fresh flush
+        // after an earlier protocol failure has already made the control
+        // outcome terminally visible.
+        firstError = closeAllFilesForRetirementLocked(!fatalError);
+        // A close itself can lose completion. Do not fence, preflight, release,
+        // or try a second physical close after that latch: the worker becomes
+        // a deliberate tombstone and its retained handles die with the
+        // document context.
+        if (int error = stopAfterUnacknowledgedProxyLocked()) {
+          return error;
+        }
+        if (!firstError && fatalError) {
+          firstError = fatalError;
+        }
+      }
+    }
+    int inherited = OPFSBackend::prepareOPFSProfileRetirement(
+      checkResources && firstError == 0);
+    return firstError ? firstError : inherited;
+  }
+
+  bool abandonFailedInitialisation() {
+    if (initialisationAmbiguous || getOPFSProfilePriorCloseError()) {
+      {
+        std::lock_guard<std::recursive_mutex> lock(controlMutex);
+        abandonPhysicalFilesLocked();
+      }
+      profileLeaseState->closeDestructorProxying();
+      if (beginOPFSProfileDrain() == 0) {
+        bool leaseReleased = false;
+        (void)finishOPFSProfileDrain(false, &leaseReleased);
+        assert(!leaseReleased);
+      } else {
+        proxy.abandonScopedProfileWorker();
+      }
+      return false;
+    }
+    if (beginOPFSProfileDrain()) {
+      return false;
+    }
+    const int preparation = prepareOPFSProfileRetirement(true);
+    bool leaseReleased = false;
+    const int finish = finishOPFSProfileDrain(
+      preparation == 0, &leaseReleased);
+    if (!leaseReleased) {
+      return false;
+    }
+    const int retirement = retireOPFSProfileBackend(
+      preparation == 0 && finish == 0);
+    return preparation == 0 && finish == 0 && retirement == 0;
+  }
+};
+
 } // anonymous namespace
 
 extern "C" {
@@ -3575,6 +4652,12 @@ void wasmfs_opfs_direct_operation_admission_race_test_continue(void) {
 
 void wasmfs_opfs_direct_operation_admission_race_test_reset(void) {
   resetDirectOperationAdmissionRaceForTesting();
+}
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE
+int wasmfs_opfs_profile_log_v2_test_proxies_after_latch(void) {
+  return profileLogV2ProxiesAfterLatchForTesting.load();
 }
 #endif
 
@@ -3710,6 +4793,93 @@ backend_t wasmfs_create_opfs_profile_namespace_backend(
   }
   return wasmFS.addBackend(std::move(backend));
 #endif
+}
+
+backend_t wasmfs_create_opfs_profile_log_v2_control_backend(
+  const char* profile_name) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
+  if (!IsValidProfileLeaseName(profile_name)) {
+    errno = EINVAL;
+    return NullBackend;
+  }
+
+#ifndef __EMSCRIPTEN_PTHREADS__
+  // The fixed-file selector and its cooperative lease need one dedicated
+  // worker lifetime. Main-thread Asyncify/JSPI cannot provide that boundary.
+  errno = ENOTSUP;
+  return NullBackend;
+#else
+  if (!wasmFS.reserveTerminalLeaseOwner()) {
+    errno = EBUSY;
+    return NullBackend;
+  }
+  assert(!emscripten_is_main_browser_thread() &&
+         "Cannot safely create leased OPFS backend on main browser thread");
+
+  auto backend = std::make_unique<ProfileLogV2ControlBackend>();
+  bool acquireProxyCompleted = false;
+  int error = backend->acquireProfileLease(
+    profile_name, &acquireProxyCompleted);
+  if (error) {
+    assert(error < 0);
+    if (acquireProxyCompleted) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+      backend->abandonUnacknowledgedProfileLeaseAcquire();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  error = backend->initialise(profile_name);
+  if (error) {
+    assert(error < 0);
+    if (backend->abandonFailedInitialisation()) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  return wasmFS.addBackend(std::move(backend));
+#endif
+}
+
+int wasmfs_opfs_profile_log_v2_read_root(backend_t backend,
+                                         uint64_t* value) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    return -operation.getError();
+  }
+  auto internal = reinterpret_cast<wasmfs::backend_t>(backend);
+  if (!value || !wasmFS.ownsBackend(internal)) {
+    return -EINVAL;
+  }
+  if (int error = operation.admitBackend(internal)) {
+    return error;
+  }
+  return internal->readOPFSProfileLogV2Root(value);
+}
+
+int wasmfs_opfs_profile_log_v2_commit_root(backend_t backend,
+                                           uint64_t value) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    return -operation.getError();
+  }
+  auto internal = reinterpret_cast<wasmfs::backend_t>(backend);
+  if (!wasmFS.ownsBackend(internal)) {
+    return -EINVAL;
+  }
+  if (int error = operation.admitBackend(internal)) {
+    return error;
+  }
+  return internal->commitOPFSProfileLogV2Root(value);
 }
 
 void EMSCRIPTEN_KEEPALIVE _wasmfs_opfs_record_entry(

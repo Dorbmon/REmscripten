@@ -7521,6 +7521,435 @@ Module["preRun"] = () => {
     ''')
     self.run_browser('a.html', '/report_result?0', timeout=120)
 
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v2_control(self):
+    # The V2 control primitive is intentionally smaller than the namespace
+    # backend: it commits one opaque integer root through fixed regular OPFS
+    # files. These fresh-iframe tests prove bootstrap partial-set rejection,
+    # old-root selection before CLEAN quorum, new-root selection after it, and
+    # fail-closed selected-control parser behavior. They also check that the
+    # control backend cannot be mounted and that an ordinary owned backend
+    # rejects V2 calls. They do not claim browser/power-loss/directory/database
+    # or complete Chromium profile recovery.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v2_control.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    new_root = '0x4c6f675632ULL'
+    before_profile = f'wasmfs_profile_log_v2_before_{random.getrandbits(64):016x}'
+    after_profile = f'wasmfs_profile_log_v2_after_{random.getrandbits(64):016x}'
+    bootstrap_profile = f'wasmfs_profile_log_v2_bootstrap_{random.getrandbits(64):016x}'
+    corrupt_profile = f'wasmfs_profile_log_v2_corrupt_{random.getrandbits(64):016x}'
+
+    def profile_arg(profile):
+      return '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_PROFILE_NAME=' + profile
+
+    def compile_role(output, profile, role_args, extra_args=None):
+      self.compile_btest(
+        test,
+        common_args + [profile_arg(profile)] + role_args +
+          (extra_args or []) + ['-o', output],
+        reporting=Reporting.NONE)
+
+    compile_role('v2-before-owner.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_OWNER'])
+    compile_role('v2-before-mutator.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_MUTATOR',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT_PHASE=1'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT=1'])
+    compile_role('v2-before-verifier.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_EXPECTED_ROOT=0ULL',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_EXPECT_COMMIT_REJECTION'])
+
+    compile_role('v2-after-owner.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_OWNER'])
+    compile_role('v2-after-mutator.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_MUTATOR',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT_PHASE=2'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT=1'])
+    compile_role('v2-after-verifier.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_EXPECTED_ROOT=' + new_root])
+
+    compile_role('v2-bootstrap-owner.html', bootstrap_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_OWNER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT_PHASE=0'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT=1'])
+    compile_role('v2-bootstrap-corruptor.html', bootstrap_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_CORRUPTOR'])
+
+    compile_role('v2-corrupt-owner.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_OWNER'])
+    compile_role('v2-corrupt-mutator.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_MUTATOR'])
+    compile_role('v2-corrupt-phase.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_CORRUPTOR'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION=1'])
+    compile_role('v2-corrupt-descriptor.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_CORRUPTOR'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION=2'])
+    compile_role('v2-corrupt-verifier.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_EXPECTED_ROOT=' + new_root])
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kOwner = 0;
+        const kMutator = 1;
+        const kVerifier = 2;
+        const kCorruptor = 3;
+        const kReady = 0;
+        const kCorruptionRejected = 1;
+        const kBusy = 16;
+        const kWitnessType = 'wasmfs-opfs-profile-log-v2-control';
+        const kEventTimeoutMs = 20000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, predicate, description) {
+          const index = module.events.findIndex(predicate);
+          if (index >= 0) {
+            return Promise.resolve(module.events.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const waiter = module.waiters.findIndex(
+                (candidate) => candidate.resolve === resolve);
+              if (waiter >= 0) {
+                module.waiters.splice(waiter, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({predicate, resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          const waiter = module.waiters.findIndex(
+            (candidate) => candidate.predicate(event.data));
+          if (waiter >= 0) {
+            const candidate = module.waiters.splice(waiter, 1)[0];
+            clearTimeout(candidate.timeout);
+            candidate.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runResult(path, role, result, description) {
+          const module = launchModule(path);
+          try {
+            const message = await waitFor(
+              module, (event) => event.event === 'result', description);
+            if (message.role !== role || message.result !== result ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error);
+            }
+          } finally {
+            disposeModule(module);
+          }
+        }
+
+        async function runVerifierAfterRelease(path, expected, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(
+                module, (event) => event.event === 'result', description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== kVerifier || message.result !== kReady ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error + ', expected=' + expected);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function runInterruptedScenario(owner, mutator, verifier,
+                                               phase, expected, description) {
+          await runResult(owner, kOwner, kReady, description + ' owner');
+          const module = launchModule(mutator);
+          try {
+            const interruption = await waitFor(
+              module,
+              (event) => event.event === 'interrupt' && event.phase === phase,
+              description + ' interruption');
+            if (interruption.phase !== phase) {
+              throw new Error(description + ' reported wrong interruption');
+            }
+          } finally {
+            // Disposing this fresh document is the deliberate controlled
+            // interruption. The parent never touches OPFS directly.
+            disposeModule(module);
+          }
+          await runVerifierAfterRelease(verifier, expected,
+                                        description + ' fresh verifier');
+        }
+
+        async function runCorruptorAfterRelease(path, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(
+                module, (event) => event.event === 'result', description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== kCorruptor ||
+                message.result !== kCorruptionRejected ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function runBootstrapInterruption(owner, corruptor) {
+          const module = launchModule(owner);
+          try {
+            const interruption = await waitFor(
+              module,
+              (event) => event.event === 'interrupt' && event.phase === 0,
+              'first bootstrap witness interruption');
+            if (interruption.phase !== 0) {
+              throw new Error('bootstrap interruption reported wrong witness');
+            }
+          } finally {
+            // The incomplete fixed-file set remains in OPFS. The next factory
+            // must fail closed rather than recreate or adopt it.
+            disposeModule(module);
+          }
+          await runCorruptorAfterRelease(
+            corruptor, 'partial bootstrap fresh factory rejection');
+        }
+
+        (async () => {
+          await runBootstrapInterruption(
+            'v2-bootstrap-owner.html', 'v2-bootstrap-corruptor.html');
+          await runInterruptedScenario(
+            'v2-before-owner.html', 'v2-before-mutator.html',
+            'v2-before-verifier.html', 1, 0,
+            'old root before CLEAN quorum');
+          await runInterruptedScenario(
+            'v2-after-owner.html', 'v2-after-mutator.html',
+            'v2-after-verifier.html', 2, 0x4c6f675632,
+            'new root after CLEAN quorum');
+          await runResult('v2-corrupt-owner.html', kOwner, kReady,
+                          'selected-control owner');
+          await runResult('v2-corrupt-mutator.html', kMutator, kReady,
+                          'selected-control update');
+          await runResult('v2-corrupt-phase.html', kCorruptor,
+                          kCorruptionRejected,
+                          'selected phase corruption rejection');
+          await runResult('v2-corrupt-descriptor.html', kCorruptor,
+                          kCorruptionRejected,
+                          'selected descriptor corruption rejection');
+          await runVerifierAfterRelease('v2-corrupt-verifier.html',
+                                        0x4c6f675632,
+                                        'normal verifier after rejection');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v2_proxy_completion_failure(self):
+    # A test-only terminal latch after a successfully flushed inactive V2 root
+    # must make the explicit failed drain issue no later Worker proxy. It
+    # models loss of the native acknowledgement, not a literal ProxyWorker
+    # failure, and cannot observe C++ destruction after iframe disposal. This
+    # remains a controlled acknowledgement test, not a physical crash model or
+    # complete Chromium-profile proof.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v2_proxy_completion_failure.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = f'wasmfs_profile_log_v2_proxy_{random.getrandbits(64):016x}'
+    profile_arg = '-DWASMFS_OPFS_PROFILE_LOG_V2_PROXY_PROFILE_NAME=' + profile
+
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_LOG_V2_PROXY_HOLDER',
+        '-sWASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE=1',
+        '-o', 'v2-proxy-holder.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_LOG_V2_PROXY_CONTENDER',
+        '-o', 'v2-proxy-contender.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_LOG_V2_PROXY_VERIFIER',
+        '-o', 'v2-proxy-verifier.html',
+      ],
+      reporting=Reporting.NONE)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kVerifier = 2;
+        const kTerminalFailure = 0;
+        const kBusy = 1;
+        const kRecoveredOldRoot = 2;
+        const kEBusy = 16;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v2-proxy-completion';
+        const kTimeoutMs = 20000;
+        const pending = new Map();
+
+        function launch(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pending.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kTimeoutMs);
+            pending.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType ||
+              event.data.event !== 'result') {
+            return;
+          }
+          const item = pending.get(event.source);
+          if (!item) {
+            return;
+          }
+          pending.delete(event.source);
+          clearTimeout(item.timeout);
+          item.resolve({frame: item.frame, message: event.data});
+        });
+
+        function expect(module, role, result, description) {
+          if (module.message.role !== role || module.message.result !== result ||
+              module.message.error !== 0) {
+            throw new Error(description + ' failed: role=' +
+                            module.message.role + ', result=' +
+                            module.message.result + ', errno=' +
+                            module.message.error);
+          }
+        }
+
+        async function verifyAfterDispose() {
+          for (let attempt = 0; attempt < 80; ++attempt) {
+            const verifier = await launch('v2-proxy-verifier.html');
+            try {
+              if (verifier.message.error === kEBusy) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                continue;
+              }
+              expect(verifier, kVerifier, kRecoveredOldRoot,
+                     'fresh old-root verifier');
+              return;
+            } finally {
+              verifier.frame.remove();
+            }
+          }
+          throw new Error('fresh verifier never acquired released holder lock');
+        }
+
+        (async () => {
+          const holder = await launch('v2-proxy-holder.html');
+          try {
+            expect(holder, kHolder, kTerminalFailure,
+                   'terminal no-proxy holder');
+            const contender = await launch('v2-proxy-contender.html');
+            try {
+              expect(contender, kContender, kBusy,
+                     'contender while terminal holder lives');
+            } finally {
+              contender.frame.remove();
+            }
+          } finally {
+            // The failed holder deliberately owns a worker/lease tombstone;
+            // document disposal is the only release path being exercised.
+            holder.frame.remove();
+          }
+          await verifyAfterDispose();
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
   @no_firefox('no OPFS support yet')
   @no_safari('no SyncAccessHandle support yet')
   @no_wasm64()

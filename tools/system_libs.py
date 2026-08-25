@@ -2036,6 +2036,12 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
         'opfs_profile_namespace_test_journal_corruption')
     self.opfs_profile_namespace_test_initialisation_failure = kwargs.pop(
         'opfs_profile_namespace_test_initialisation_failure')
+    self.opfs_profile_log_v2_test_interrupt = kwargs.pop(
+        'opfs_profile_log_v2_test_interrupt')
+    self.opfs_profile_log_v2_test_selected_control_corruption = kwargs.pop(
+        'opfs_profile_log_v2_test_selected_control_corruption')
+    self.opfs_profile_log_v2_test_proxy_completion_failure = kwargs.pop(
+        'opfs_profile_log_v2_test_proxy_completion_failure')
     self.opfs_get_child_proxy_failure_test = kwargs.pop(
         'opfs_get_child_proxy_failure_test')
     self.opfs_directory_proxy_completion_failure_test = kwargs.pop(
@@ -2060,6 +2066,16 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       cflags += [
           '-DWASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE=' +
           str(self.opfs_profile_namespace_test_initialisation_failure)]
+    if self.opfs_profile_log_v2_test_interrupt:
+      cflags += ['-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT=1']
+    if self.opfs_profile_log_v2_test_selected_control_corruption:
+      cflags += [
+          '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION=' +
+          str(self.opfs_profile_log_v2_test_selected_control_corruption)]
+    if self.opfs_profile_log_v2_test_proxy_completion_failure:
+      cflags += [
+          '-DWASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE=' +
+          str(self.opfs_profile_log_v2_test_proxy_completion_failure)]
     if self.opfs_get_child_proxy_failure_test:
       cflags += ['-DWASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE']
     if self.opfs_directory_proxy_completion_failure_test:
@@ -2084,6 +2100,14 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     if self.opfs_profile_namespace_test_initialisation_failure:
       name += '-opfs-profile-namespace-init-failure-' + str(
           self.opfs_profile_namespace_test_initialisation_failure)
+    if self.opfs_profile_log_v2_test_interrupt:
+      name += '-opfs-profile-log-v2-interrupt'
+    if self.opfs_profile_log_v2_test_selected_control_corruption:
+      name += '-opfs-profile-log-v2-selected-control-corruption-' + str(
+          self.opfs_profile_log_v2_test_selected_control_corruption)
+    if self.opfs_profile_log_v2_test_proxy_completion_failure:
+      name += '-opfs-profile-log-v2-proxy-completion-failure-' + str(
+          self.opfs_profile_log_v2_test_proxy_completion_failure)
     if self.opfs_get_child_proxy_failure_test:
       name += '-opfs-get-child-proxy-failure-test'
     if self.opfs_directory_proxy_completion_failure_test:
@@ -2098,6 +2122,9 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       'opfs_profile_namespace_test_interrupt',
       'opfs_profile_namespace_test_journal_corruption',
       'opfs_profile_namespace_test_initialisation_failure',
+      'opfs_profile_log_v2_test_interrupt',
+      'opfs_profile_log_v2_test_selected_control_corruption',
+      'opfs_profile_log_v2_test_proxy_completion_failure',
       'opfs_get_child_proxy_failure_test',
       'opfs_directory_proxy_completion_failure_test']
 
@@ -2113,6 +2140,12 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
             settings.WASMFS_OPFS_PROFILE_NAMESPACE_TEST_JOURNAL_CORRUPTION),
         opfs_profile_namespace_test_initialisation_failure=(
             settings.WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE),
+        opfs_profile_log_v2_test_interrupt=bool(
+            settings.WASMFS_OPFS_PROFILE_LOG_V2_TEST_INTERRUPT),
+        opfs_profile_log_v2_test_selected_control_corruption=(
+            settings.WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION),
+        opfs_profile_log_v2_test_proxy_completion_failure=(
+            settings.WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE),
         opfs_get_child_proxy_failure_test=(
             settings.WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE),
         opfs_directory_proxy_completion_failure_test=(

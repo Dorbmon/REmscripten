@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <errno.h>
 
 #include "file.h"
@@ -45,9 +46,9 @@ public:
   virtual int acquireProfileOperation() { return 0; }
   virtual void releaseProfileOperation() {}
 
-  // These hooks are intentionally implemented only by the backend returned
-  // from wasmfs_create_opfs_backend_with_profile_lease(). The scoped drain
-  // never treats an arbitrary persistent backend as safe to hand off.
+  // These hooks are intentionally implemented only by the explicit leased
+  // OPFS profile factories. The scoped drain never treats an arbitrary
+  // persistent backend as safe to hand off.
   virtual bool isLeasedOPFSProfileBackend() const { return false; }
   virtual int beginOPFSProfileDrain() { return -ENOTSUP; }
   // Preflight the browser-owned resources that must be quiescent before a
@@ -72,6 +73,19 @@ public:
     return -ENOTSUP;
   }
   virtual int getOPFSProfilePriorCloseError() const { return 0; }
+
+  // Experimental, deliberately narrow control-plane interface for the
+  // profile-log V2 recovery primitive.  This is not a general filesystem
+  // operation: the only payload is one opaque root value, and non-V2
+  // backends reject it explicitly.  Keeping the dispatch here lets the C ABI
+  // validate an opaque backend pointer through WasmFS before it reaches a
+  // backend-specific implementation.
+  virtual int readOPFSProfileLogV2Root(uint64_t* value) {
+    return -ENOTSUP;
+  }
+  virtual int commitOPFSProfileLogV2Root(uint64_t value) {
+    return -ENOTSUP;
+  }
 
   // Called after WasmFS has permanently drained its public descriptor table.
   // Backends must not begin new filesystem work from this hook. A false

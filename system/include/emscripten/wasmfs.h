@@ -163,6 +163,39 @@ backend_t wasmfs_create_opfs_backend_with_profile_lease(
 backend_t wasmfs_create_opfs_profile_namespace_backend(
   const char* profile_name);
 
+// Creates the experimental V2 profile-log recovery control primitive.  It is
+// intentionally *not* a filesystem backend: callers can only read or replace
+// one unsigned 64-bit logical-root value through the two functions below.
+//
+// The primitive keeps its bootstrap, two fixed root images, and control
+// records in opaque regular OPFS files. A replacement writes and flushes an
+// inactive root image and duplicated descriptor first, then flushes two CLEAN
+// phase witnesses. A fresh factory chooses the old root while exactly one
+// phase witness names the new generation and chooses the new root only after
+// both do. It fails closed when the selected phase or descriptor quorum is
+// malformed; it does not use OPFS directory rename or directory fsync.
+// A fresh instance that observes the valid one-witness state is read-only:
+// read_root returns the old root, while commit_root returns -ESHUTDOWN until a
+// future protocol defines a separately durable repair decision.
+//
+// This is a focused protocol experiment, not a Chromium profile backend. It
+// has no directory tree, database, metadata, crash, or physical directory
+// durability claim. It follows the leased-OPFS factory's profile-name,
+// pthread, cooperative Web Lock, and explicit-drain requirements. On failure
+// it returns NULL and sets errno.
+backend_t wasmfs_create_opfs_profile_log_v2_control_backend(
+  const char* profile_name);
+
+// Read or replace the V2 primitive's opaque logical-root value. Both return
+// zero on success or a negative errno. `backend` must be the exact V2 control
+// backend returned by the factory above; foreign and ordinary OPFS backends
+// fail with -ENOTSUP. These calls participate in WasmFS operation admission,
+// so they fail closed after a scoped or terminal drain.
+int wasmfs_opfs_profile_log_v2_read_root(backend_t backend,
+                                         uint64_t* _Nonnull value);
+int wasmfs_opfs_profile_log_v2_commit_root(backend_t backend,
+                                           uint64_t value);
+
 // Creates a generic JSIMPL backend
 backend_t wasmfs_create_jsimpl_backend(void);
 
