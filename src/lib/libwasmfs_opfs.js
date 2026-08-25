@@ -479,6 +479,7 @@ addToLibrary({
     '$wasmfsOPFSProxyFinish',
     '$stackSave',
     '$stackRestore',
+    '$stringToUTF8OnStack',
     '_wasmfs_opfs_record_entry',
   ],
   _wasmfs_opfs_get_entries__async: 'auto',

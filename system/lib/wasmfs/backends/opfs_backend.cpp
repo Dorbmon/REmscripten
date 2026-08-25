@@ -53,6 +53,84 @@ constexpr char kOPFSGetChildProxyFailureTestName[] =
   "__wasmfs_opfs_test_get_child_proxy_failure__";
 #endif
 
+#ifndef WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE
+#define WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE 0
+#endif
+
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE < 0 || \
+  WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE > 5
+#error "invalid direct OPFS directory proxy completion failure selector"
+#endif
+
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 2
+constexpr char kOPFSDirectOperationAdmissionRaceLatcherTestName[] =
+  "__wasmfs_opfs_test_direct_operation_admission_latcher__";
+
+enum DirectOperationAdmissionRaceState {
+  DirectOperationAdmissionRaceIdle,
+  DirectOperationAdmissionRaceArmed,
+  DirectOperationAdmissionRaceLatcherPaused,
+  DirectOperationAdmissionRaceFollowerBlocked,
+  DirectOperationAdmissionRaceFollowerBypassed,
+  DirectOperationAdmissionRaceContinue,
+};
+
+// This test-only barrier proves that an in-flight direct operation owns the
+// ambiguity admission domain until it either gets a completion or latches an
+// unacknowledged one. It is compiled only into the existing phase-2 fault
+// variation, never into normal direct or namespace builds.
+std::atomic<int> directOperationAdmissionRaceState =
+  DirectOperationAdmissionRaceIdle;
+
+void armDirectOperationAdmissionRaceForTesting() {
+  int expected = DirectOperationAdmissionRaceIdle;
+  assert(directOperationAdmissionRaceState.compare_exchange_strong(
+    expected, DirectOperationAdmissionRaceArmed));
+}
+
+void pauseDirectOperationAdmissionRaceForTesting() {
+  int expected = DirectOperationAdmissionRaceArmed;
+  assert(directOperationAdmissionRaceState.compare_exchange_strong(
+    expected, DirectOperationAdmissionRaceLatcherPaused));
+  while (directOperationAdmissionRaceState.load() !=
+         DirectOperationAdmissionRaceContinue) {
+    emscripten_thread_sleep(1);
+  }
+}
+
+void noteDirectOperationAdmissionAttemptForTesting(
+  std::recursive_mutex& directOperationMutex) {
+  if (directOperationAdmissionRaceState.load() !=
+      DirectOperationAdmissionRaceLatcherPaused) {
+    return;
+  }
+
+  int expected = DirectOperationAdmissionRaceLatcherPaused;
+  if (directOperationMutex.try_lock()) {
+    directOperationMutex.unlock();
+    (void)directOperationAdmissionRaceState.compare_exchange_strong(
+      expected, DirectOperationAdmissionRaceFollowerBypassed);
+  } else {
+    (void)directOperationAdmissionRaceState.compare_exchange_strong(
+      expected, DirectOperationAdmissionRaceFollowerBlocked);
+  }
+}
+
+void continueDirectOperationAdmissionRaceForTesting() {
+  int state = directOperationAdmissionRaceState.load();
+  assert(state == DirectOperationAdmissionRaceLatcherPaused ||
+         state == DirectOperationAdmissionRaceFollowerBlocked ||
+         state == DirectOperationAdmissionRaceFollowerBypassed);
+  directOperationAdmissionRaceState.store(DirectOperationAdmissionRaceContinue);
+}
+
+void resetDirectOperationAdmissionRaceForTesting() {
+  int expected = DirectOperationAdmissionRaceContinue;
+  assert(directOperationAdmissionRaceState.compare_exchange_strong(
+    expected, DirectOperationAdmissionRaceIdle));
+}
+#endif
+
 #ifndef WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE
 #define WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE 0
 #endif
@@ -119,11 +197,24 @@ public:
 };
 
 // File wrappers can outlive the particular OpenFileState that observed a
-// rejected SyncAccessHandle close. Keep this per-backend state separately so a
-// later terminal drain cannot mistake an already-removed descriptor table for
-// proof that browser-side access handles are no longer live.
+// rejected SyncAccessHandle close. A lost ProxyWorker completion is equally
+// ambiguous: the browser-side operation may have changed a directory, opened
+// or released a handle, even though C++ did not observe its result. Keep this
+// per-backend state separately so later wrappers fail closed and a terminal
+// drain cannot mistake an already-removed descriptor table for proof that the
+// browser-side OPFS state is known.
 class TerminalCloseState {
   std::atomic<int> firstError = 0;
+  // A completed browser operation can report its own error and still retain
+  // the existing terminal-drain semantics. Only a missing native completion
+  // acknowledgement makes *other* direct wrappers unable to reason about the
+  // browser-side namespace, so keep that narrower global gate separately.
+  std::atomic<int> unacknowledgedProxyError = 0;
+  // Direct wrappers must check the ambiguity latch and submit their browser
+  // callback as one admission step. Otherwise a second wrapper could sample a
+  // healthy latch, wait while another wrapper loses its completion, and then
+  // issue a browser request after the backend has become ambiguous.
+  std::recursive_mutex directOperationMutex;
 
 public:
   void recordFailedAccessClose(int error) {
@@ -134,7 +225,21 @@ public:
     (void)firstError.compare_exchange_strong(expected, error);
   }
 
+  void recordUnacknowledgedProxyCompletion() {
+    int expected = 0;
+    (void)unacknowledgedProxyError.compare_exchange_strong(expected, -EIO);
+    recordFailedAccessClose(-EIO);
+  }
+
   int getFailedAccessCloseError() const { return firstError.load(); }
+
+  int getUnacknowledgedProxyError() const {
+    return unacknowledgedProxyError.load();
+  }
+
+  std::recursive_mutex& getDirectOperationMutex() {
+    return directOperationMutex;
+  }
 };
 
 // The cooperative profile lease is an explicit admission domain, separate
@@ -467,6 +572,74 @@ public:
 thread_local ProfileLeaseState* ProfileLeaseState::drainState = nullptr;
 thread_local std::vector<ProfileLeaseState*> ProfileLeaseState::externalStates;
 
+// Direct OPFS wrappers share one terminal error state.  Namespace-backend
+// physical helper wrappers pass no failure gate here: they retain their
+// established, separately journaled failure protocol rather than inheriting
+// the direct backend's global operation fence.
+class DirectOPFSOperation {
+  ProfileLeaseState::InternalOperation profileOperation;
+  std::shared_ptr<TerminalCloseState> terminalCloseState;
+  std::unique_lock<std::recursive_mutex> directOperationLock;
+  int error = 0;
+
+public:
+  DirectOPFSOperation(
+    ProfileLeaseState& profileLeaseState,
+    std::shared_ptr<TerminalCloseState> terminalCloseState)
+    : profileOperation(profileLeaseState),
+      terminalCloseState(std::move(terminalCloseState)) {
+    if (!profileOperation) {
+      error = profileOperation.getError();
+    } else if (this->terminalCloseState) {
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 2
+      noteDirectOperationAdmissionAttemptForTesting(
+        this->terminalCloseState->getDirectOperationMutex());
+#endif
+      directOperationLock = std::unique_lock(
+        this->terminalCloseState->getDirectOperationMutex());
+      if ((error =
+             this->terminalCloseState->getUnacknowledgedProxyError())) {
+        // A completed browser-operation failure preserves its existing local
+        // error behavior. Only a lost proxy completion is backend-wide
+        // ambiguous and therefore closes this direct-operation gate.
+      }
+    }
+  }
+
+  explicit operator bool() const { return error == 0; }
+  int getError() const { return error; }
+};
+
+// Cached direct OPFS wrappers can proxy a best-effort JS-handle free from a
+// destructor, after ordinary syscall admission has ended. Keep those proxies
+// in the same ambiguity admission domain without changing the namespace
+// backend's separately journaled physical-helper lifecycle.
+class DirectOPFSDestructorOperation {
+  ProfileLeaseState::DestructorProxyOperation profileOperation;
+  std::unique_lock<std::recursive_mutex> directOperationLock;
+  bool admitted = false;
+
+public:
+  DirectOPFSDestructorOperation(
+    ProfileLeaseState& profileLeaseState,
+    std::shared_ptr<TerminalCloseState> terminalCloseState)
+    : profileOperation(profileLeaseState) {
+    if (!profileOperation) {
+      return;
+    }
+    if (terminalCloseState) {
+      directOperationLock = std::unique_lock(
+        terminalCloseState->getDirectOperationMutex());
+      if (terminalCloseState->getUnacknowledgedProxyError()) {
+        return;
+      }
+    }
+    admitted = true;
+  }
+
+  explicit operator bool() const { return admitted; }
+};
+
 class OpenState {
 public:
   enum Kind { None, Access, Blob, FailedAccessClose };
@@ -475,6 +648,10 @@ private:
   Kind kind = None;
   int id = -1;
   size_t openCount = 0;
+  // A browser operation can report a completed error without making other
+  // wrappers' view of OPFS indeterminate. Keep the narrower missing-proxy
+  // acknowledgement signal separate from the resource poison kind.
+  bool unacknowledgedProxyCompletion = false;
 
 public:
   Kind getKind() const { return kind; }
@@ -496,6 +673,7 @@ public:
             if (!proxy([&](auto ctx) {
                   _wasmfs_opfs_open_access(ctx.ctx, fileID, &newID);
                 })) {
+              unacknowledgedProxyCompletion = true;
               kind = FailedAccessClose;
               return -EIO;
             }
@@ -515,6 +693,7 @@ public:
             if (!proxy([&](auto ctx) {
                   _wasmfs_opfs_open_blob(ctx.ctx, fileID, &newID);
                 })) {
+              unacknowledgedProxyCompletion = true;
               kind = FailedAccessClose;
               return -EIO;
             }
@@ -534,6 +713,7 @@ public:
       if (!proxy([&](auto ctx) {
             _wasmfs_opfs_open_access(ctx.ctx, fileID, &newID);
           })) {
+        unacknowledgedProxyCompletion = true;
         kind = FailedAccessClose;
         return -EIO;
       }
@@ -545,6 +725,7 @@ public:
         // The browser may have opened the access handle and may or may not
         // have closed the blob. Quarantine this wrapper until terminal
         // retirement verifies that no browser-owned handle remains.
+        unacknowledgedProxyCompletion = true;
         id = newID;
         kind = FailedAccessClose;
         return -EIO;
@@ -567,11 +748,13 @@ public:
           if (!proxy([&](auto ctx) {
                 _wasmfs_opfs_close_access(ctx.ctx, id, &err);
               })) {
+            unacknowledgedProxyCompletion = true;
             err = -EIO;
           }
           break;
         case Blob:
           if (!proxy([&]() { _wasmfs_opfs_close_blob(id); })) {
+            unacknowledgedProxyCompletion = true;
             err = -EIO;
           }
           break;
@@ -609,10 +792,17 @@ public:
     return id;
   }
 
+  bool hasUnacknowledgedProxyCompletion() const {
+    return unacknowledgedProxyCompletion;
+  }
+
   // A cancelled proxy operation does not tell us whether the browser-side
   // operation ran.  Do not let a later operation (especially a close) make a
   // second request against that ambiguous handle state.
-  void poison() { kind = FailedAccessClose; }
+  void poison() {
+    unacknowledgedProxyCompletion = true;
+    kind = FailedAccessClose;
+  }
 };
 
 class OPFSFile : public DataFile {
@@ -631,6 +821,10 @@ class OPFSFile : public DataFile {
   OpenState state;
   std::shared_ptr<TerminalCloseState> terminalCloseState;
   std::shared_ptr<ProfileLeaseState> profileLeaseState;
+  // Direct OPFS passes the backend-wide terminal state here. The namespace
+  // backend leaves it null so its physical helper wrappers keep their own
+  // journaled recovery behavior.
+  std::shared_ptr<TerminalCloseState> directOperationFailureState;
 
   int recordProxyFailure() {
     // This covers cancelled access/blob operations as well as a cancelled
@@ -638,13 +832,8 @@ class OPFSFile : public DataFile {
     // distinguish an operation that never reached the worker from one whose
     // completion acknowledgement was lost.
     state.poison();
-    terminalCloseState->recordFailedAccessClose(-EIO);
+    terminalCloseState->recordUnacknowledgedProxyCompletion();
     return -EIO;
-  }
-
-  bool hasUnacknowledgedBrowserOperation() const {
-    return state.getKind() == OpenState::FailedAccessClose ||
-           failedFileHandleRelease;
   }
 
   // The File mutex protects the open state, JS file-handle ID, and locator.
@@ -703,10 +892,12 @@ public:
            std::string name,
            Worker& proxy,
            std::shared_ptr<TerminalCloseState> terminalCloseState,
-           std::shared_ptr<ProfileLeaseState> profileLeaseState)
+           std::shared_ptr<ProfileLeaseState> profileLeaseState,
+           std::shared_ptr<TerminalCloseState> directOperationFailureState)
     : DataFile(mode, backend), proxy(proxy), parentID(parentID),
       name(std::move(name)), terminalCloseState(std::move(terminalCloseState)),
-      profileLeaseState(std::move(profileLeaseState)) {}
+      profileLeaseState(std::move(profileLeaseState)),
+      directOperationFailureState(std::move(directOperationFailureState)) {}
 
   ~OPFSFile() override {
     // A rejected AccessHandle close remains intentionally quarantined in the
@@ -714,22 +905,23 @@ public:
     // still be destroyed without pretending the close succeeded.
     assert(state.getKind() == OpenState::None ||
            state.getKind() == OpenState::FailedAccessClose);
-    ProfileLeaseState::DestructorProxyOperation destructorOperation(
-      *profileLeaseState);
+    DirectOPFSDestructorOperation destructorOperation(
+      *profileLeaseState, directOperationFailureState);
     // Once a proxy completion is lost, even a best-effort free would be a
     // second ambiguous operation.  The scoped worker tombstone owns that
     // browser resource until document teardown instead.
     if (destructorOperation && fileID >= 0 &&
         state.getKind() == OpenState::None && !failedFileHandleRelease) {
       if (!proxy([&]() { _wasmfs_opfs_free_file(fileID); })) {
-        terminalCloseState->recordFailedAccessClose(-EIO);
+        terminalCloseState->recordUnacknowledgedProxyCompletion();
       }
     }
   }
 
   int moveTo(int newParentID, const std::string& newName) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -762,7 +954,8 @@ public:
 
 private:
   off_t getSize() override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -806,7 +999,8 @@ private:
   }
 
   int setSize(off_t size) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -851,7 +1045,8 @@ private:
   }
 
   int open(oflags_t flags) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -864,18 +1059,19 @@ private:
     int err = state.open(proxy, fileID, flags);
     // Failed opens do not leave an open state to own an idle file handle.
     int releaseError = releaseFileIDIfIdle();
-    if (err && hasUnacknowledgedBrowserOperation()) {
+    if (err && state.hasUnacknowledgedProxyCompletion()) {
       // A completed browser-side open rejection has no live handle to carry
       // into retirement.  Only a lost proxy acknowledgement (or a failed
       // follow-up file-handle release) needs to poison the backend-wide
       // handoff state.
-      terminalCloseState->recordFailedAccessClose(err);
+      terminalCloseState->recordUnacknowledgedProxyCompletion();
     }
     return err ? err : releaseError;
   }
 
   int close() override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -885,7 +1081,11 @@ private:
       // before it calls us. Remember an ambiguous SyncAccessHandle close at
       // backend scope so terminalDrainFinished() retains a profile lease even
       // when the descriptor table is otherwise empty.
-      terminalCloseState->recordFailedAccessClose(err);
+      if (state.hasUnacknowledgedProxyCompletion()) {
+        terminalCloseState->recordUnacknowledgedProxyCompletion();
+      } else {
+        terminalCloseState->recordFailedAccessClose(err);
+      }
     }
     // Keep a rejected close's FileSystemFileHandle only alongside its
     // quarantined SyncAccessHandle. A successful final close has no need for
@@ -900,7 +1100,8 @@ private:
   }
 
   ssize_t read(uint8_t* buf, size_t len, off_t offset) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -936,7 +1137,8 @@ private:
 #ifdef WASMFS_OPFS_PROFILE_DRAIN_TEST
     wasmfs_opfs_profile_drain_test_maybe_block_file_operation();
 #endif
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -956,7 +1158,8 @@ private:
   }
 
   int flush() override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -989,30 +1192,40 @@ public:
   int dirID = 0;
   std::shared_ptr<TerminalCloseState> terminalCloseState;
   std::shared_ptr<ProfileLeaseState> profileLeaseState;
+  std::shared_ptr<TerminalCloseState> directOperationFailureState;
 
   OPFSDirectory(mode_t mode,
                 backend_t backend,
                 int dirID,
                 Worker& proxy,
                 std::shared_ptr<TerminalCloseState> terminalCloseState,
-                std::shared_ptr<ProfileLeaseState> profileLeaseState)
+                std::shared_ptr<ProfileLeaseState> profileLeaseState,
+                std::shared_ptr<TerminalCloseState> directOperationFailureState)
     : Directory(mode, backend), proxy(proxy), dirID(dirID),
       terminalCloseState(std::move(terminalCloseState)),
-      profileLeaseState(std::move(profileLeaseState)) {}
+      profileLeaseState(std::move(profileLeaseState)),
+      directOperationFailureState(std::move(directOperationFailureState)) {}
 
   ~OPFSDirectory() override {
     // The root handle is shared by all mounts of this backend, so only child
     // directory handles are owned by their C++ wrappers. Slot 0 is reserved.
-    ProfileLeaseState::DestructorProxyOperation destructorOperation(
-      *profileLeaseState);
-    if (destructorOperation && dirID != 0 && dirID != kOPFSRootDirectoryID) {
-      proxy([&]() { _wasmfs_opfs_free_directory(dirID); });
+    DirectOPFSDestructorOperation destructorOperation(
+      *profileLeaseState, directOperationFailureState);
+    if (destructorOperation && dirID != 0 && dirID != kOPFSRootDirectoryID &&
+        !proxy([&]() { _wasmfs_opfs_free_directory(dirID); })) {
+      terminalCloseState->recordUnacknowledgedProxyCompletion();
     }
   }
 
 private:
+  int recordProxyFailure() {
+    terminalCloseState->recordUnacknowledgedProxyCompletion();
+    return -EIO;
+  }
+
   off_t getSize() override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -1028,7 +1241,8 @@ private:
   }
 
   Directory::MaybeFile getChildWithError(const std::string& name) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -1049,7 +1263,7 @@ private:
       });
     }
     if (!proxyCompleted) {
-      return -EIO;
+      return recordProxyFailure();
     }
     if (childID < 0) {
       if (childID == -ENOENT) {
@@ -1065,7 +1279,8 @@ private:
         name,
         proxy,
         terminalCloseState,
-        profileLeaseState);
+        profileLeaseState,
+        directOperationFailureState);
     }
     if (childType == 2 && childID > kOPFSRootDirectoryID) {
       return std::make_shared<OPFSDirectory>(
@@ -1074,7 +1289,8 @@ private:
         childID,
         proxy,
         terminalCloseState,
-        profileLeaseState);
+        profileLeaseState,
+        directOperationFailureState);
     }
     // Neither a malformed JS result nor a cancelled/failed proxy is a missing
     // child. Propagate EIO to the syscall layer instead of trapping or
@@ -1084,15 +1300,35 @@ private:
 
   std::shared_ptr<DataFile> insertDataFile(const std::string& name,
                                            mode_t mode) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return nullptr;
     }
-    int childID = 0;
-    proxy([&](auto ctx) {
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 2
+    if (name == kOPFSDirectOperationAdmissionRaceLatcherTestName) {
+      // The DirectOPFSOperation above already owns the shared admission
+      // mutex. Pause here so a second directory can prove it blocks at that
+      // mutex rather than issuing a browser request before this operation
+      // latches its deliberately lost completion.
+      pauseDirectOperationAdmissionRaceForTesting();
+    }
+#endif
+    int childID = -EIO;
+    bool proxyCompleted = proxy([&](auto ctx) {
       _wasmfs_opfs_insert_file(ctx.ctx, dirID, name.c_str(), &childID);
     });
-    if (childID < 0) {
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 2
+    // Model a callback that did reach the OPFS worker but whose native
+    // completion acknowledgement was lost.
+    if (proxyCompleted) {
+      proxyCompleted = false;
+    }
+#endif
+    if (!proxyCompleted || childID != 0) {
+      if (!proxyCompleted) {
+        recordProxyFailure();
+      }
       // TODO: Propagate specific errors.
       return nullptr;
     }
@@ -1103,20 +1339,32 @@ private:
       name,
       proxy,
       terminalCloseState,
-      profileLeaseState);
+      profileLeaseState,
+      directOperationFailureState);
   }
 
   std::shared_ptr<Directory> insertDirectory(const std::string& name,
                                              mode_t mode) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return nullptr;
     }
-    int childID = 0;
-    proxy([&](auto ctx) {
+    int childID = -EIO;
+    bool proxyCompleted = proxy([&](auto ctx) {
       _wasmfs_opfs_insert_directory(ctx.ctx, dirID, name.c_str(), &childID);
     });
-    if (childID < 0) {
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 3
+    // Model a callback that did reach the OPFS worker but whose native
+    // completion acknowledgement was lost.
+    if (proxyCompleted) {
+      proxyCompleted = false;
+    }
+#endif
+    if (!proxyCompleted || childID <= kOPFSRootDirectoryID) {
+      if (!proxyCompleted) {
+        recordProxyFailure();
+      }
       // TODO: Propagate specific errors.
       return nullptr;
     }
@@ -1126,7 +1374,8 @@ private:
       childID,
       proxy,
       terminalCloseState,
-      profileLeaseState);
+      profileLeaseState,
+      directOperationFailureState);
   }
 
   std::shared_ptr<Symlink> insertSymlink(const std::string& name,
@@ -1137,35 +1386,53 @@ private:
   }
 
   int insertMove(const std::string& name, std::shared_ptr<File> file) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (file->is<DataFile>()) {
+      // moveTo() owns the direct-operation admission around its browser
+      // callback. Do not take it here as well: rename holds this destination
+      // directory lock, while moveTo() takes the source-file lock before its
+      // own admission, and an unrelated source-file operation can otherwise
+      // form a directory-gate/file-lock cycle.
+      auto opfsFile = std::static_pointer_cast<OPFSFile>(file);
+      return opfsFile->moveTo(dirID, name);
+    }
+
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
-    if (file->is<DataFile>()) {
-      auto opfsFile = std::static_pointer_cast<OPFSFile>(file);
-      return opfsFile->moveTo(dirID, name);
-    } else {
-      // TODO: Support moving directories once OPFS supports that.
-      // EBUSY can be returned when the directory is "in use by the system,"
-      // which can mean whatever we want.
-      return -EBUSY;
-    }
+    // TODO: Support moving directories once OPFS supports that.
+    // EBUSY can be returned when the directory is "in use by the system,"
+    // which can mean whatever we want.
+    return -EBUSY;
   }
 
   int removeChild(const std::string& name) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
     int err = 0;
-    proxy([&](auto ctx) {
+    bool proxyCompleted = proxy([&](auto ctx) {
       _wasmfs_opfs_remove_child(ctx.ctx, dirID, name.c_str(), &err);
     });
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 4
+    // Model a callback that did reach the OPFS worker but whose native
+    // completion acknowledgement was lost.
+    if (proxyCompleted) {
+      proxyCompleted = false;
+    }
+#endif
+    if (!proxyCompleted) {
+      return recordProxyFailure();
+    }
     return err;
   }
 
   ssize_t getNumEntries() override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return operation.getError();
     }
@@ -1177,15 +1444,26 @@ private:
   }
 
   Directory::MaybeEntries getEntries() override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(
+      *profileLeaseState, directOperationFailureState);
     if (!operation) {
       return {operation.getError()};
     }
     std::vector<Directory::Entry> entries;
     int err = 0;
-    proxy([&](auto ctx) {
+    bool proxyCompleted = proxy([&](auto ctx) {
       _wasmfs_opfs_get_entries(ctx.ctx, dirID, &entries, &err);
     });
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 5
+    // Model a callback that did reach the OPFS worker but whose native
+    // completion acknowledgement was lost.
+    if (proxyCompleted) {
+      proxyCompleted = false;
+    }
+#endif
+    if (!proxyCompleted) {
+      return {recordProxyFailure()};
+    }
     if (err) {
       assert(err < 0);
       return {err};
@@ -1414,18 +1692,31 @@ public:
   }
 
   std::shared_ptr<Directory> createDirectory(mode_t mode) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
     if (!operation) {
       return nullptr;
     }
-    proxy([](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); });
+    bool proxyCompleted = proxy(
+      [](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); });
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 1
+    // Model a callback that did reach the OPFS worker but whose native
+    // completion acknowledgement was lost.
+    if (proxyCompleted) {
+      proxyCompleted = false;
+    }
+#endif
+    if (!proxyCompleted) {
+      terminalCloseState->recordUnacknowledgedProxyCompletion();
+      return nullptr;
+    }
     return std::make_shared<OPFSDirectory>(
       mode,
       this,
       kOPFSRootDirectoryID,
       proxy,
       terminalCloseState,
-      profileLeaseState);
+      profileLeaseState,
+      terminalCloseState);
   }
 
   std::shared_ptr<Symlink> createSymlink(std::string target) override {
@@ -2154,7 +2445,8 @@ class ProfileNamespaceBackend : public OPFSBackend {
       name,
       proxy,
       terminalCloseState,
-      profileLeaseState);
+      profileLeaseState,
+      nullptr);
     file->locked().setParent(physicalRoot);
     return file;
   }
@@ -2506,7 +2798,8 @@ public:
       kOPFSRootDirectoryID,
       proxy,
       terminalCloseState,
-      profileLeaseState);
+      profileLeaseState,
+      nullptr);
     const std::string_view profileNameView(profileName);
     profileNameLength = profileNameView.size();
     profileNameChecksum = checksum(
@@ -3266,6 +3559,24 @@ std::shared_ptr<Directory> ProfileNamespaceBackend::createDirectory(mode_t mode)
 } // anonymous namespace
 
 extern "C" {
+
+#if WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE == 2
+void wasmfs_opfs_direct_operation_admission_race_test_arm(void) {
+  armDirectOperationAdmissionRaceForTesting();
+}
+
+int wasmfs_opfs_direct_operation_admission_race_test_state(void) {
+  return directOperationAdmissionRaceState.load();
+}
+
+void wasmfs_opfs_direct_operation_admission_race_test_continue(void) {
+  continueDirectOperationAdmissionRaceForTesting();
+}
+
+void wasmfs_opfs_direct_operation_admission_race_test_reset(void) {
+  resetDirectOperationAdmissionRaceForTesting();
+}
+#endif
 
 backend_t wasmfs_create_opfs_backend() {
   WasmFS::Operation operation(wasmFS);

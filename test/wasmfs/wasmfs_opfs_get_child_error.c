@@ -19,6 +19,7 @@ static const char kInjectedErrorPath[] =
   "/opfs/__wasmfs_opfs_test_get_child_eio__";
 static const char kProxyFailurePath[] =
   "/opfs/__wasmfs_opfs_test_get_child_proxy_failure__";
+static const char kPoisonedPath[] = "/opfs/normal-after-proxy-failure";
 static const char kMalformedFilePath[] =
   "/opfs/__wasmfs_opfs_test_get_child_malformed_file__";
 static const char kMalformedDirectoryPath[] =
@@ -57,18 +58,34 @@ static void assertLookupAndCreationFailWithEIO(const char* path,
   assert(entryIsAbsent(name));
 }
 
+static void assertProxyFailurePoisonsDirectBackend(void) {
+  // This selector models a ProxyWorker callback whose completion was never
+  // acknowledged. The browser-side lookup may therefore be indeterminate;
+  // do not inspect the raw directory state or attempt a cleanup mutation.
+  errno = 0;
+  assert(access(kProxyFailurePath, F_OK) == -1);
+  assert(errno == EIO);
+
+  // A different, ordinary path must be rejected before it can make a later
+  // browser request. In particular, neither ENOENT nor a successful creation
+  // can stand in for an unknown completion of the preceding lookup.
+  errno = 0;
+  assert(access(kPoisonedPath, F_OK) == -1);
+  assert(errno == EIO);
+  errno = 0;
+  assert(open(kPoisonedPath, O_CREAT | O_EXCL | O_RDWR, 0600) == -1);
+  assert(errno == EIO);
+}
+
 int main(void) {
   backend_t backend = wasmfs_create_opfs_backend();
   assert(backend);
   assert(wasmfs_create_directory(kMountPath, 0700, backend) == 0);
 
-  // Lookups that fail in JS, whose proxy never begins, or whose bridge output
-  // is malformed must all reject creation without changing either the dcache
-  // or OPFS namespace.
+  // Completed JS failures and malformed bridge output must reject creation
+  // without changing either the dcache or OPFS namespace.
   assertLookupAndCreationFailWithEIO(
     kInjectedErrorPath, "__wasmfs_opfs_test_get_child_eio__");
-  assertLookupAndCreationFailWithEIO(
-    kProxyFailurePath, "__wasmfs_opfs_test_get_child_proxy_failure__");
   assertLookupAndCreationFailWithEIO(
     kMalformedFilePath, "__wasmfs_opfs_test_get_child_malformed_file__");
   assertLookupAndCreationFailWithEIO(
@@ -86,5 +103,9 @@ int main(void) {
   assert(close(fd) == 0);
   assert(access(kCreatedPath, F_OK) == 0);
   assert(unlink(kCreatedPath) == 0);
+
+  // A lost proxy acknowledgement is unlike a completed browser rejection:
+  // the direct backend must remain poisoned for the rest of its lifetime.
+  assertProxyFailurePoisonsDirectBackend();
   return 0;
 }

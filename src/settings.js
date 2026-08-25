@@ -1916,6 +1916,15 @@ var WASMFS_OPFS_TEST_GET_CHILD_ERROR = 0;
 // [link]
 var WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE = 0;
 
+// Test-only selector that makes one direct OPFS directory callback behave as
+// though it completed in the worker but its native proxy completion
+// acknowledgement was lost. Values 1 through 5 select root initialization,
+// file creation, directory creation, removal, and enumeration respectively.
+// This controls code emitted at link time only; production builds leave it
+// disabled and expose no runtime configuration API.
+// [link]
+var WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE = 0;
+
 // Test-only selector that returns malformed OPFS child ABI values for exact
 // names. This verifies that C++ rejects malformed bridge output as EIO rather
 // than constructing an invalid File or Directory. Production builds leave it

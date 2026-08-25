@@ -2038,6 +2038,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
         'opfs_profile_namespace_test_initialisation_failure')
     self.opfs_get_child_proxy_failure_test = kwargs.pop(
         'opfs_get_child_proxy_failure_test')
+    self.opfs_directory_proxy_completion_failure_test = kwargs.pop(
+        'opfs_directory_proxy_completion_failure_test')
     super().__init__(**kwargs)
 
   def get_cflags(self):
@@ -2060,6 +2062,10 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
           str(self.opfs_profile_namespace_test_initialisation_failure)]
     if self.opfs_get_child_proxy_failure_test:
       cflags += ['-DWASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE']
+    if self.opfs_directory_proxy_completion_failure_test:
+      cflags += [
+          '-DWASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE=' +
+          str(self.opfs_directory_proxy_completion_failure_test)]
     return cflags
 
   def get_base_name(self):
@@ -2080,6 +2086,9 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
           self.opfs_profile_namespace_test_initialisation_failure)
     if self.opfs_get_child_proxy_failure_test:
       name += '-opfs-get-child-proxy-failure-test'
+    if self.opfs_directory_proxy_completion_failure_test:
+      name += '-opfs-directory-proxy-completion-failure-' + str(
+          self.opfs_directory_proxy_completion_failure_test)
     return name
 
   @classmethod
@@ -2089,7 +2098,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       'opfs_profile_namespace_test_interrupt',
       'opfs_profile_namespace_test_journal_corruption',
       'opfs_profile_namespace_test_initialisation_failure',
-      'opfs_get_child_proxy_failure_test']
+      'opfs_get_child_proxy_failure_test',
+      'opfs_directory_proxy_completion_failure_test']
 
   @classmethod
   def get_default_variation(cls, **kwargs):
@@ -2105,6 +2115,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
             settings.WASMFS_OPFS_PROFILE_NAMESPACE_TEST_INITIALISATION_FAILURE),
         opfs_get_child_proxy_failure_test=(
             settings.WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE),
+        opfs_directory_proxy_completion_failure_test=(
+            settings.WASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE),
         **kwargs)
 
   def get_files(self):

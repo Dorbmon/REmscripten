@@ -8610,6 +8610,271 @@ Module["preRun"] = () => {
               '-sWASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE=1',
               '-sWASMFS_OPFS_TEST_GET_CHILD_MALFORMED_RESULT=1'])
 
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_direct_operation_admission_race(self):
+    self.compile_btest(
+      'wasmfs/wasmfs_opfs_direct_operation_admission_race.c',
+      [
+        '-sWASMFS',
+        '-sFORCE_FILESYSTEM',
+        '-pthread',
+        '-sPROXY_TO_PTHREAD',
+        '-sPTHREAD_POOL_SIZE=4',
+        '-sEXIT_RUNTIME',
+        '-sALLOW_BLOCKING_ON_MAIN_THREAD=0',
+        '-sWASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE=2',
+        '-DWASMFS_OPFS_DIRECT_ADMISSION_RACE_MOUNT='
+        'wasmfs_direct_admission_%016x' % random.getrandbits(64),
+        '-o', 'direct-opfs-admission-race.html',
+      ],
+      reporting=Reporting.NONE)
+    self.run_browser('direct-opfs-admission-race.html', '/report_result?0',
+                     timeout=90)
+
+  @no_firefox('no OPFS support yet')
+  @no_safari('no SyncAccessHandle or Web Locks support yet')
+  @no_wasm64()
+  def test_wasmfs_opfs_direct_proxy_completion_failure(self):
+    # This checks direct OPFS fail-closed behavior only. It does not exercise
+    # the profile-namespace backend or claim physical crash recovery.
+    test = 'wasmfs/wasmfs_opfs_direct_proxy_completion_failure.c'
+    common_args = [
+      '-sWASMFS',
+      '-sFORCE_FILESYSTEM',
+      '-pthread',
+      '-sPROXY_TO_PTHREAD',
+      '-sPTHREAD_POOL_SIZE=4',
+      '-sEXIT_RUNTIME',
+      '-sALLOW_BLOCKING_ON_MAIN_THREAD=0',
+      '-lopfs.js',
+    ]
+    nonce = f'{random.getrandbits(64):016x}'
+    cases = [
+      ('root', 1),
+      ('create-file', 2),
+      ('create-directory', 3),
+      ('remove', 4),
+      ('enumerate', 5),
+    ]
+    create_file('direct-proxy-holder-pre.js', r'''
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-direct-proxy-completion',
+          },
+          window.location.origin);
+      };
+    ''')
+    case_literals = []
+    for stem, phase in cases:
+      profile = f'wasmfs_direct_proxy_{nonce}_{phase}'
+      mount = f'direct_proxy_{nonce}_{phase}'
+      holder = f'direct-proxy-{stem}-holder.html'
+      contender = f'direct-proxy-{stem}-contender.html'
+      fixture_args = [
+        '-DWASMFS_OPFS_DIRECT_PROXY_COMPLETION_PHASE=' + str(phase),
+        '-DWASMFS_OPFS_DIRECT_PROXY_COMPLETION_PROFILE_NAME=' + profile,
+        '-DWASMFS_OPFS_DIRECT_PROXY_COMPLETION_MOUNT_NAME=' + mount,
+      ]
+      self.compile_btest(
+        test,
+        common_args + fixture_args + [
+          '-DWASMFS_OPFS_DIRECT_PROXY_COMPLETION_HOLDER',
+          '-sWASMFS_OPFS_TEST_DIRECTORY_PROXY_COMPLETION_FAILURE=' +
+          str(phase),
+          '--pre-js', 'direct-proxy-holder-pre.js',
+          '-o', holder,
+        ],
+        reporting=Reporting.NONE)
+      self.compile_btest(
+        test,
+        common_args + fixture_args + [
+          '-DWASMFS_OPFS_DIRECT_PROXY_COMPLETION_CONTENDER',
+          '-o', contender,
+        ],
+        reporting=Reporting.NONE)
+      case_literals.append(
+        "{ contender: '%s', holder: '%s', name: '%s' }" %
+        (contender, holder, stem))
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kReady = 0;
+        const kBusy = 1;
+        const kModuleTimeoutMs = 15000;
+        const kLeaseReleaseDeadlineMs = 10000;
+        const kLeaseRetryDelayMs = 100;
+        const kMessageType = 'wasmfs-opfs-direct-proxy-completion';
+        const cases = [__DIRECT_PROXY_CASES__];
+        const pendingHolderExits = new Map();
+        const pendingModules = new Map();
+
+        function delay(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kModuleTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for holder cleanup'));
+            }, kModuleTimeoutMs);
+            pendingHolderExits.set(
+              frame.contentWindow, {resolve, reject, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kMessageType) {
+            return;
+          }
+          if (event.data.event == 'holder-exit') {
+            const pendingExit = pendingHolderExits.get(event.source);
+            if (!pendingExit) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pendingExit.timeout);
+            if (event.data.status != 0) {
+              pendingExit.reject(new Error(
+                'holder cleanup exited with status ' + event.data.status));
+            } else {
+              pendingExit.resolve();
+            }
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function waitForHolderContextRelease(testCase) {
+          // The failed holder intentionally retains its Web Lock until its
+          // document is disposed. Browser-context lock cleanup is asynchronous,
+          // so confirm that it has completed before starting the next phase or
+          // an unrelated direct-OPFS browser test. This is cleanup only: the
+          // live-holder contender above is the no-release assertion.
+          const deadline = Date.now() + kLeaseReleaseDeadlineMs;
+          while (Date.now() < deadline) {
+            const candidate = await startModule(testCase.contender);
+            try {
+              if (candidate.message.role != kContender) {
+                throw new Error(testCase.name +
+                                ' cleanup contender reported role ' +
+                                candidate.message.role);
+              }
+              if (candidate.message.result == kReady &&
+                  candidate.message.error == 0) {
+                return;
+              }
+              if (candidate.message.result != kBusy ||
+                  candidate.message.error == 0) {
+                throw new Error(testCase.name +
+                                ' cleanup contender failed: result=' +
+                                candidate.message.result + ', errno=' +
+                                candidate.message.error);
+              }
+            } finally {
+              // A ready contender has already completed its successful
+              // terminal drain; a busy contender owns no lease. Either frame
+              // may be dropped before the next cleanup poll.
+              candidate.frame.remove();
+            }
+            await delay(kLeaseRetryDelayMs);
+          }
+          throw new Error(testCase.name +
+                          ' holder context did not release its profile lease');
+        }
+
+        async function runCase(testCase) {
+          let holder;
+          let contender;
+          try {
+            holder = await startModule(testCase.holder);
+            if (holder.message.role != kHolder ||
+                holder.message.result != kReady || holder.message.error != 0) {
+              throw new Error(testCase.name + ' holder did not fail closed: ' +
+                              'role=' + holder.message.role + ', result=' +
+                              holder.message.result + ', errno=' +
+                              holder.message.error);
+            }
+
+            // The holder has completed its failed terminal drain but remains
+            // alive. EBUSY here is the lease-retention witness; disposing the
+            // holder below is only test cleanup, not persistence evidence.
+            contender = await startModule(testCase.contender);
+            if (contender.message.role != kContender ||
+                contender.message.result != kBusy ||
+                contender.message.error == 0) {
+              throw new Error(testCase.name + ' contender did not observe a ' +
+                              'retained lease: role=' + contender.message.role +
+                              ', result=' + contender.message.result +
+                              ', errno=' + contender.message.error);
+            }
+            contender.frame.remove();
+            contender = undefined;
+
+            const holderExit = waitForHolderExit(holder.frame);
+            holder.frame.contentWindow.Module
+              ._wasmfs_opfs_direct_proxy_completion_holder_shutdown();
+            await holderExit;
+            holder.frame.remove();
+            holder = undefined;
+            await waitForHolderContextRelease(testCase);
+          } finally {
+            if (contender) {
+              contender.frame.remove();
+            }
+            if (holder) {
+              pendingHolderExits.delete(holder.frame.contentWindow);
+              holder.frame.remove();
+            }
+          }
+        }
+
+        (async () => {
+          for (const testCase of cases) {
+            await runCase(testCase);
+          }
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    '''.replace('__DIRECT_PROXY_CASES__', ', '.join(case_literals)))
+    self.run_browser('a.html', '/report_result?0', timeout=120)
+
   def test_wasmfs_multi_environment(self):
     # Test that WasmFS's Node backend can be enabled conditionally, allowing
     # the same binaries to run on both web and Node.js environments.
