@@ -13272,6 +13272,10 @@ Module.postRun = () => {{
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test('wasmfs/wasmfs_fdatasync.c')
 
+  def test_wasmfs_directory_flush(self):
+    self.set_setting('WASMFS')
+    self.do_run_in_out_file_test('wasmfs/wasmfs_directory_flush.cpp')
+
   def test_wasmfs_sync_open_unsupported(self):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test(

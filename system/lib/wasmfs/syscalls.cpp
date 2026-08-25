@@ -741,10 +741,11 @@ __wasi_errno_t __wasi_fd_sync(__wasi_fd_t fd) {
     return -ret;
   }
 
-  // WasmFS does not provide a directory flushing operation, so do not report a
-  // successful sync that cannot persist directory metadata.
-  if (file->is<Directory>()) {
-    return ENOTSUP;
+  if (auto directory = file->dynCast<Directory>()) {
+    auto ret = directory->locked().flush();
+    assert(ret <= 0);
+    // Translate to WASI standard of positive return codes.
+    return -ret;
   }
 
   return __WASI_ERRNO_SUCCESS;

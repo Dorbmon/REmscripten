@@ -280,6 +280,12 @@ protected:
   // The list of entries in this directory or a negative error code.
   virtual MaybeEntries getEntries() = 0;
 
+  // Sync directory metadata to the underlying persistent storage, if any.
+  // Backends that cannot provide this operation must fail explicitly rather
+  // than reporting a successful sync that cannot persist namespace changes.
+  // Returns 0 on success or a negative error code.
+  virtual int flush() { return -ENOTSUP; }
+
   // Only backends that maintain file identity themselves (see below) need to
   // implement this.
   virtual std::string getName(std::shared_ptr<File> file) {
@@ -484,6 +490,8 @@ public:
 
   [[nodiscard]] ssize_t getNumEntries();
   [[nodiscard]] MaybeEntries getEntries();
+
+  [[nodiscard]] int flush() { return getDir()->flush(); }
 };
 
 inline File::Handle File::locked() { return Handle(shared_from_this()); }

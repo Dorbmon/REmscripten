@@ -90,6 +90,7 @@ protected:
   virtual MaybeEntries getEntries() override {
     return real->locked().getEntries();
   }
+  virtual int flush() override { return real->locked().flush(); }
   virtual std::string getName(std::shared_ptr<File> file) override {
     return real->locked().getName(file);
   }
