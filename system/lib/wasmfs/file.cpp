@@ -164,6 +164,12 @@ bool Directory::Handle::mountChild(const std::string& name,
   return true;
 }
 
+bool Directory::Handle::isMountChild(const std::string& name) {
+  auto& dcache = getDir()->dcache;
+  auto entry = dcache.find(name);
+  return entry != dcache.end() && entry->second.kind == DCacheKind::Mount;
+}
+
 std::shared_ptr<DataFile>
 Directory::Handle::insertDataFile(const std::string& name, mode_t mode) {
   // Cannot insert into an unlinked directory.
@@ -267,6 +273,10 @@ int Directory::Handle::removeChild(const std::string& name) {
   auto entry = dcache.find(name);
   // If this is a mount, we don't need to call into the backend.
   if (entry != dcache.end() && entry->second.kind == DCacheKind::Mount) {
+    // Mounts live only in the dcache, so removing the cache publication also
+    // unlinks the mounted root. Otherwise an fd retained across unmount could
+    // still look linked and accept operations into a detached namespace.
+    entry->second.file->locked().setParent(nullptr);
     dcache.erase(entry);
     return 0;
   }

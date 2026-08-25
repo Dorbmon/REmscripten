@@ -95,7 +95,7 @@ protected:
   }
   virtual int insertMove(const std::string& name,
                          std::shared_ptr<File> file) override {
-    return real->locked().insertMove(name, file);
+    return real->locked().insertMove(name, devirtualize(file));
   }
   virtual int removeChild(const std::string& name) override {
     return real->locked().removeChild(name);
@@ -141,7 +141,7 @@ inline std::shared_ptr<File> devirtualize(std::shared_ptr<File> file) {
   } else if (file->is<Directory>()) {
     return std::static_pointer_cast<VirtualDirectory>(file)->real;
   } else if (file->is<Symlink>()) {
-    return std::static_pointer_cast<VirtualDirectory>(file)->real;
+    return std::static_pointer_cast<VirtualSymlink>(file)->real;
   }
   WASMFS_UNREACHABLE("unexpected file kind");
 }

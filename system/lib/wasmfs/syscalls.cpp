@@ -1253,6 +1253,12 @@ doMkdir(path::ParsedParent parsed,
     return -EEXIST;
   }
 
+  // Match O_CREAT: a descriptor can retain an unlinked directory after its
+  // mount has been detached, but it cannot be used to create new children.
+  if (!lockedParent.getParent()) {
+    return -ENOENT;
+  }
+
   // Mask rwx permissions for user, group and others, and the sticky bit.
   // This prevents users from entering S_IFREG for example.
   // https://www.gnu.org/software/libc/manual/html_node/Permission-Bits.html
@@ -1837,6 +1843,14 @@ int __syscall_renameat(int olddirfd,
     return -EBUSY;
   }
 
+  // Mount children are cache-only publications owned by a different backend.
+  // Never hand either one to the destination backend's insertMove(), which
+  // would otherwise detach or overwrite an entry it does not own.
+  if (lockedOldParent.isMountChild(oldFileName) ||
+      (newFile && lockedNewParent.isMountChild(newFileName))) {
+    return -EBUSY;
+  }
+
   // Cannot modify either directory without write permissions.
   if (!(lockedOldParent.getMode() & WASMFS_PERM_WRITE) ||
       !(lockedNewParent.getMode() & WASMFS_PERM_WRITE)) {
@@ -1910,8 +1924,19 @@ int __syscall_symlinkat(intptr_t target, int newdirfd, intptr_t linkpath) {
     }
     return -EEXIST;
   }
+  // An fd can retain an unlinked directory after its mount was detached. It
+  // is still usable for existing files, but cannot create a new symlink.
+  if (!lockedParent.getParent()) {
+    return -ENOENT;
+  }
+  if (!(lockedParent.getMode() & WASMFS_PERM_WRITE)) {
+    return -EACCES;
+  }
   if (!lockedParent.insertSymlink(childName, (char*)target)) {
-    return -EPERM;
+    // The pointer-only backend insertion API cannot communicate a specific
+    // failure. Do not misreport this as a permission failure after the
+    // generic permission check above has already succeeded.
+    return -EIO;
   }
   return 0;
 }

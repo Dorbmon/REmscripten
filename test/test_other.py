@@ -13369,6 +13369,16 @@ Module.postRun = () => {{
     self.do_run_in_out_file_test(
         'wasmfs/wasmfs_directory_entry_error.cpp', cflags=args)
 
+  @parameterized({
+    '': ([],),
+    'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
+  def test_wasmfs_namespace_preconditions(self, args):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf(
+        'wasmfs/wasmfs_namespace_preconditions.cpp', 'ok', cflags=args)
+
   @requires_node
   @parameterized({
     '': ([],),

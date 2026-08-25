@@ -575,6 +575,12 @@ public:
   // exist. Return `true` on success and `false` otherwise.
   bool mountChild(const std::string& name, std::shared_ptr<File> file);
 
+  // Whether `name` is a cache-only mount child rather than an entry managed by
+  // this directory's backend. Callers that need to mutate a namespace must
+  // reject such entries instead of forwarding them to a backend that does not
+  // own them.
+  bool isMountChild(const std::string& name);
+
   // Insert a child of the given name, kind, and mode in the underlying backend,
   // which will allocate and return a corresponding `File` on success or return
   // nullptr otherwise. Assumes a child with this name does not already exist.
