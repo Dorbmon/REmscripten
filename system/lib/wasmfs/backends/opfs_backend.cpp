@@ -12,6 +12,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <errno.h>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -6232,6 +6233,64 @@ bool profileLogV4SameDescriptor(const ProfileLogV4Descriptor& lhs,
 // protocol.  Keep the store private to this translation unit: callers must
 // never be able to bypass their logical-format validation through this layer.
 class ProfileLogV4Store : public OPFSBackend {
+protected:
+  // A transaction reserves the next selected generation and its parity arena
+  // while ProfileLogV4Store holds its selector lock. Callers can append
+  // immutable records before producing the manifest that names them; the
+  // manifest remains unreachable until the existing descriptor and witness
+  // quorum is published.  It is intentionally available only to logical
+  // payload backends in this translation unit.
+  class Transaction {
+    ProfileLogV4Store& store;
+    uint64_t nextGeneration;
+    uint32_t nextArena;
+    std::array<uint64_t, 2> nextHighWater;
+
+    friend class ProfileLogV4Store;
+
+    Transaction(ProfileLogV4Store& store,
+                uint64_t generation,
+                std::array<uint64_t, 2> highWater)
+      : store(store),
+        nextGeneration(generation),
+        nextArena(generation & 1),
+        nextHighWater(highWater) {}
+
+  public:
+    uint64_t generation() const { return nextGeneration; }
+    uint32_t arena() const { return nextArena; }
+
+    // Append one immutable record to the selected parity arena and flush it
+    // before returning its physical offset. A later failed selector publish
+    // leaves this record unreachable; a retry may safely overwrite the tail
+    // because the selected descriptor still carries the old high-water mark.
+    int append(const uint8_t* data, size_t size, uint64_t* offset) {
+      if (!offset || (size && !data)) {
+        return -EINVAL;
+      }
+      const uint64_t start = nextHighWater[nextArena];
+      if (start > kProfileLogV4MaxSafeOffset ||
+          size > kProfileLogV4MaxSafeOffset - start ||
+          start > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+          size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
+                   start) {
+        return -EFBIG;
+      }
+      if (size) {
+        if (int error = store.writeBytesAndFlushLocked(
+              store.arenas[nextArena], start, data, size)) {
+          return error;
+        }
+      }
+      *offset = start;
+      nextHighWater[nextArena] = start + size;
+      return 0;
+    }
+  };
+
+  using TransactionBuilder =
+    std::function<int(Transaction&, std::vector<uint8_t>*)>;
+
   std::recursive_mutex storeMutex;
   std::shared_ptr<OPFSDirectory> physicalRoot;
   std::shared_ptr<OPFSFile> bootstrap;
@@ -6793,6 +6852,7 @@ class ProfileLogV4Store : public OPFSBackend {
   int writeGenerationLocked(uint64_t recordGeneration,
                             const uint8_t* data,
                             size_t size,
+                            const std::array<uint64_t, 2>& startHighWater,
                             ProfileLogV4Descriptor* result) {
     const uint64_t byteSize = size;
     if (!recordGeneration || (size && !data) ||
@@ -6801,7 +6861,7 @@ class ProfileLogV4Store : public OPFSBackend {
       return -EINVAL;
     }
     const uint32_t arena = recordGeneration & 1;
-    const uint64_t manifestOffset = highWater[arena];
+    const uint64_t manifestOffset = startHighWater[arena];
     const uint64_t payloadOffset =
       manifestOffset + kProfileLogV4ManifestHeaderSize;
     const uint64_t end = payloadOffset + byteSize;
@@ -6822,7 +6882,7 @@ class ProfileLogV4Store : public OPFSBackend {
           arenas[arena], manifestOffset, header.data(), header.size())) {
       return error;
     }
-    auto nextHighWater = highWater;
+    auto nextHighWater = startHighWater;
     nextHighWater[arena] = end;
     ProfileLogV4Descriptor descriptor = {recordGeneration,
                                          arena,
@@ -6854,6 +6914,14 @@ class ProfileLogV4Store : public OPFSBackend {
       *result = descriptor;
     }
     return 0;
+  }
+
+  int writeGenerationLocked(uint64_t recordGeneration,
+                            const uint8_t* data,
+                            size_t size,
+                            ProfileLogV4Descriptor* result) {
+    return writeGenerationLocked(
+      recordGeneration, data, size, highWater, result);
   }
 
   int validatePhaseManifestLocked(const ProfileLogV4Phase& phase,
@@ -7147,7 +7215,10 @@ protected:
   explicit ProfileLogV4Store(std::string storageTag = {})
     : storageTag(std::move(storageTag)) {}
 
-  int readManifest(uint8_t* buffer, size_t capacity, size_t* size) {
+  int readManifest(uint8_t* buffer,
+                   size_t capacity,
+                   size_t* size,
+                   uint64_t* manifestGeneration = nullptr) {
     ProfileLeaseState::InternalOperation operation(*profileLeaseState);
     if (!operation) {
       return operation.getError();
@@ -7168,6 +7239,9 @@ protected:
     }
     const size_t required = selectedDescriptor.manifestSize;
     *size = required;
+    if (manifestGeneration) {
+      *manifestGeneration = selectedDescriptor.generation;
+    }
     if (!buffer && !capacity) {
       return 0;
     }
@@ -7180,6 +7254,37 @@ protected:
       buffer,
       required);
     return read ? poisonLocked(read) : 0;
+  }
+
+  // Read a byte range named by the currently selected descriptor. This
+  // revalidates the V4 envelope on every call and never permits a logical
+  // payload parser to read an arena tail that has not reached witness quorum.
+  int readSelectedBytes(uint32_t arena,
+                        uint64_t offset,
+                        uint8_t* buffer,
+                        size_t size) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (!buffer && size) {
+      return -EINVAL;
+    }
+    if (int error = validateSelectedManifestLocked()) {
+      return poisonLocked(error);
+    }
+    if (arena >= arenas.size() || offset > selectedDescriptor.highWater[arena] ||
+        size > selectedDescriptor.highWater[arena] - offset) {
+      return -EIO;
+    }
+    if (int error = readBytesLocked(arenas[arena], offset, buffer, size)) {
+      return poisonLocked(error);
+    }
+    return 0;
   }
 
   int commitManifest(const uint8_t* data, size_t size) {
@@ -7205,6 +7310,49 @@ protected:
     }
     ProfileLogV4Descriptor next;
     if (int error = writeGenerationLocked(generation + 1, data, size, &next)) {
+      return poisonLocked(error);
+    }
+    generation = next.generation;
+    highWater = next.highWater;
+    selectedDescriptor = next;
+    hasSelectedDescriptor = true;
+    return 0;
+  }
+
+  // Execute one logical payload transaction. The callback can append
+  // immutable records to the selected arena and then must return the complete
+  // manifest post-image. Only this function advances the V4 generation and
+  // publishes its descriptor/witness quorum, so no manifest can reference an
+  // unflushed or unselected record.
+  int commitTransaction(const TransactionBuilder& builder) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (!builder) {
+      return -EINVAL;
+    }
+    if (int error = validateSelectedManifestLocked()) {
+      return poisonLocked(error);
+    }
+    if (generation == std::numeric_limits<uint64_t>::max()) {
+      return poisonLocked(-EOVERFLOW);
+    }
+    Transaction transaction(*this, generation + 1, highWater);
+    std::vector<uint8_t> manifest;
+    if (int error = builder(transaction, &manifest)) {
+      return poisonLocked(error);
+    }
+    ProfileLogV4Descriptor next;
+    if (int error = writeGenerationLocked(transaction.generation(),
+                                          manifest.data(),
+                                          manifest.size(),
+                                          transaction.nextHighWater,
+                                          &next)) {
       return poisonLocked(error);
     }
     generation = next.generation;
