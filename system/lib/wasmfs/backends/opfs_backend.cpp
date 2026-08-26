@@ -6225,7 +6225,13 @@ bool profileLogV4SameDescriptor(const ProfileLogV4Descriptor& lhs,
          lhs.recordChecksum == rhs.recordChecksum;
 }
 
-class ProfileLogV4ManifestBackend final : public OPFSBackend {
+// Own the fixed-file V4 envelope independently from the logical payload that
+// uses it.  The opaque manifest experiment below deliberately exposes only
+// this store, while the future profile filesystem composes its inode/extent
+// transaction on top of the exact same bootstrap, selector, and retirement
+// protocol.  Keep the store private to this translation unit: callers must
+// never be able to bypass their logical-format validation through this layer.
+class ProfileLogV4Store : public OPFSBackend {
   std::recursive_mutex storeMutex;
   std::shared_ptr<OPFSDirectory> physicalRoot;
   std::shared_ptr<OPFSFile> bootstrap;
@@ -6243,12 +6249,22 @@ class ProfileLogV4ManifestBackend final : public OPFSBackend {
   ProfileLogV4Descriptor selectedDescriptor = {};
   bool hasSelectedDescriptor = false;
   int fatalError = 0;
+  // An empty tag retains the names published by the V4 opaque-manifest
+  // experiment.  A logical filesystem must use a distinct tag so an opaque
+  // payload, including V4's initial zero-length manifest, can never be
+  // reinterpreted as a mounted profile.
+  std::string storageTag;
   std::string bootstrapName;
   std::string controlName;
   std::array<std::string, 2> arenaNames;
 
-  static std::string storageStem(std::string_view profileName) {
-    std::string result = ".wasmfs-profile-log-v4-";
+  std::string storageStem(std::string_view profileName) const {
+    std::string result = ".wasmfs-profile-log-v4";
+    if (!storageTag.empty()) {
+      result += '-';
+      result += storageTag;
+    }
+    result += '-';
     result += std::to_string(profileName.size());
     result += '-';
     result.append(profileName.data(), profileName.size());
@@ -7127,9 +7143,80 @@ class ProfileLogV4ManifestBackend final : public OPFSBackend {
                                                                       : -EIO;
   }
 
+protected:
+  explicit ProfileLogV4Store(std::string storageTag = {})
+    : storageTag(std::move(storageTag)) {}
+
+  int readManifest(uint8_t* buffer, size_t capacity, size_t* size) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (int error = validateSelectedManifestLocked()) {
+      return poisonLocked(error);
+    }
+    if (!size || (!buffer && capacity)) {
+      return -EINVAL;
+    }
+    if (selectedDescriptor.manifestSize >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const size_t required = selectedDescriptor.manifestSize;
+    *size = required;
+    if (!buffer && !capacity) {
+      return 0;
+    }
+    if (capacity < required) {
+      return -ENOBUFS;
+    }
+    const int read = readBytesLocked(
+      arenas[selectedDescriptor.arena],
+      selectedDescriptor.manifestOffset + kProfileLogV4ManifestHeaderSize,
+      buffer,
+      required);
+    return read ? poisonLocked(read) : 0;
+  }
+
+  int commitManifest(const uint8_t* data, size_t size) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (size && !data) {
+      return -EINVAL;
+    }
+    // Never replace a selected state that no longer validates. The opaque
+    // caller might otherwise make a new generation appear to heal a corrupt
+    // base without the future filesystem having had a chance to inspect it.
+    if (int error = validateSelectedManifestLocked()) {
+      return poisonLocked(error);
+    }
+    if (generation == std::numeric_limits<uint64_t>::max()) {
+      return poisonLocked(-EOVERFLOW);
+    }
+    ProfileLogV4Descriptor next;
+    if (int error = writeGenerationLocked(generation + 1, data, size, &next)) {
+      return poisonLocked(error);
+    }
+    generation = next.generation;
+    highWater = next.highWater;
+    selectedDescriptor = next;
+    hasSelectedDescriptor = true;
+    return 0;
+  }
+
 public:
-  // This primitive is intentionally not a filesystem. It must not inherit
-  // OPFSBackend's mountable direct-directory factory by accident.
+  // A store is deliberately non-mountable until a logical payload backend
+  // supplies the complete atomic namespace and metadata contracts.
   std::shared_ptr<DataFile> createFile(mode_t) override { return nullptr; }
   std::shared_ptr<Directory> createDirectory(mode_t) override {
     return nullptr;
@@ -7194,75 +7281,6 @@ public:
     return 0;
   }
 
-  int readOPFSProfileLogV4Manifest(uint8_t* buffer,
-                                   size_t capacity,
-                                   size_t* size) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
-    if (!operation) {
-      return operation.getError();
-    }
-    std::lock_guard<std::recursive_mutex> lock(storeMutex);
-    if (int error = operationErrorLocked()) {
-      return error;
-    }
-    if (int error = validateSelectedManifestLocked()) {
-      return poisonLocked(error);
-    }
-    if (!size || (!buffer && capacity)) {
-      return -EINVAL;
-    }
-    if (selectedDescriptor.manifestSize >
-        static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-      return -EOVERFLOW;
-    }
-    const size_t required = selectedDescriptor.manifestSize;
-    *size = required;
-    if (!buffer && !capacity) {
-      return 0;
-    }
-    if (capacity < required) {
-      return -ENOBUFS;
-    }
-    const int read = readBytesLocked(
-      arenas[selectedDescriptor.arena],
-      selectedDescriptor.manifestOffset + kProfileLogV4ManifestHeaderSize,
-      buffer,
-      required);
-    return read ? poisonLocked(read) : 0;
-  }
-
-  int commitOPFSProfileLogV4Manifest(const uint8_t* data, size_t size) override {
-    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
-    if (!operation) {
-      return operation.getError();
-    }
-    std::lock_guard<std::recursive_mutex> lock(storeMutex);
-    if (int error = operationErrorLocked()) {
-      return error;
-    }
-    if (size && !data) {
-      return -EINVAL;
-    }
-    // Never replace a selected state that no longer validates. The opaque
-    // caller might otherwise make a new generation appear to heal a corrupt
-    // base without the future filesystem having had a chance to inspect it.
-    if (int error = validateSelectedManifestLocked()) {
-      return poisonLocked(error);
-    }
-    if (generation == std::numeric_limits<uint64_t>::max()) {
-      return poisonLocked(-EOVERFLOW);
-    }
-    ProfileLogV4Descriptor next;
-    if (int error = writeGenerationLocked(generation + 1, data, size, &next)) {
-      return poisonLocked(error);
-    }
-    generation = next.generation;
-    highWater = next.highWater;
-    selectedDescriptor = next;
-    hasSelectedDescriptor = true;
-    return 0;
-  }
-
   int prepareOPFSProfileRetirement(bool checkResources) override {
     int firstError = 0;
     {
@@ -7317,6 +7335,24 @@ public:
     const int retirement = retireOPFSProfileBackend(
       preparation == 0 && finish == 0);
     return preparation == 0 && finish == 0 && retirement == 0;
+  }
+};
+
+// Preserve the intentionally narrow public V4 experiment.  In particular,
+// this class remains non-mountable and is the only one that implements the
+// opaque C ABI below.
+class ProfileLogV4ManifestBackend final : public ProfileLogV4Store {
+public:
+  ProfileLogV4ManifestBackend() = default;
+
+  int readOPFSProfileLogV4Manifest(uint8_t* buffer,
+                                   size_t capacity,
+                                   size_t* size) override {
+    return readManifest(buffer, capacity, size);
+  }
+
+  int commitOPFSProfileLogV4Manifest(const uint8_t* data, size_t size) override {
+    return commitManifest(data, size);
   }
 };
 
