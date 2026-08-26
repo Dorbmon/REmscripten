@@ -6041,6 +6041,1285 @@ std::shared_ptr<DataFile> ProfileLogV3DataBackend::createFile(mode_t mode) {
   return std::make_shared<ProfileLogV3DataFile>(this, snapshot.metadata);
 }
 
+// V4 is deliberately a non-mountable foundation for the scalable profile
+// filesystem. Unlike V3's fixed 16 KiB payload page, it commits an arbitrary
+// length immutable manifest record in one of two append-only arenas. The
+// descriptor records both arena high-water marks so a later inode/extent
+// implementation can reference immutable records from either arena without
+// relying on OPFS directory durability.
+constexpr size_t kProfileLogV4RecordSize = 128;
+constexpr size_t kProfileLogV4BootstrapSize = 2 * kProfileLogV4RecordSize;
+constexpr size_t kProfileLogV4ControlSize = 6 * kProfileLogV4RecordSize;
+constexpr size_t kProfileLogV4ManifestHeaderSize = 96;
+// Recovery must validate arbitrary manifest sizes without consuming a large
+// fraction of an Emscripten application worker's stack.
+constexpr size_t kProfileLogV4TransferSize = 16 * 1024;
+constexpr uint64_t kProfileLogV4MaxSafeOffset = UINT64_C(9007199254740991);
+constexpr uint32_t kProfileLogV4FormatVersion = 4;
+constexpr uint32_t kProfileLogV4BootstrapReady = 1;
+constexpr uint32_t kProfileLogV4PhaseClean = 1;
+constexpr uint32_t kProfileLogV4LayoutEpoch = 1;
+constexpr std::array<uint8_t, 8> kProfileLogV4BootstrapMagic = {
+  'W', 'F', 'S', 'L', 'G', '4', 'B', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV4DescriptorMagic = {
+  'W', 'F', 'S', 'L', 'G', '4', 'D', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV4PhaseMagic = {
+  'W', 'F', 'S', 'L', 'G', '4', 'P', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
+  'W', 'F', 'S', 'L', 'G', '4', 'M', '0'};
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT 0
+#endif
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION 0
+#endif
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION 0
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT > 1
+#error "invalid profile-log V4 interruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION > 4
+#error "invalid profile-log V4 selected corruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION > 2
+#error "invalid profile-log V4 live corruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+extern "C" void wasmfs_opfs_profile_log_v4_test_maybe_interrupt(
+  int checkpoint);
+#endif
+
+static_assert(kProfileLogV4BootstrapSize <= kProfileLogV4MaxSafeOffset);
+static_assert(kProfileLogV4ControlSize <= kProfileLogV4MaxSafeOffset);
+static_assert(kProfileLogV4ManifestHeaderSize <= kProfileLogV4MaxSafeOffset);
+
+uint64_t profileLogV4ChecksumUpdate(uint64_t result,
+                                    const uint8_t* data,
+                                    size_t size) {
+  for (size_t i = 0; i != size; ++i) {
+    result ^= data[i];
+    result *= UINT64_C(1099511628211);
+  }
+  return result;
+}
+
+uint64_t profileLogV4Checksum(const uint8_t* data, size_t size) {
+  return profileLogV4ChecksumUpdate(UINT64_C(1469598103934665603), data, size);
+}
+
+template <size_t Size>
+uint64_t profileLogV4ChecksumWithZeroedRange(
+  const std::array<uint8_t, Size>& data,
+  size_t offset,
+  size_t length) {
+  if (offset > Size || length > Size - offset) {
+    return 0;
+  }
+  uint64_t result = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i != Size; ++i) {
+    const uint8_t value = i >= offset && i < offset + length ? 0 : data[i];
+    result ^= value;
+    result *= UINT64_C(1099511628211);
+  }
+  return result;
+}
+
+template <size_t Size>
+bool profileLogV4HasZeroTail(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  return offset <= Size &&
+         std::all_of(data.begin() + offset,
+                     data.end(),
+                     [](uint8_t value) { return value == 0; });
+}
+
+template <size_t Size>
+bool profileLogV4HasZeroRange(const std::array<uint8_t, Size>& data,
+                              size_t offset,
+                              size_t length) {
+  return offset <= Size && length <= Size - offset &&
+         std::all_of(data.begin() + offset,
+                     data.begin() + offset + length,
+                     [](uint8_t value) { return value == 0; });
+}
+
+template <size_t Size>
+void writeProfileLogV4U32(std::array<uint8_t, Size>& data,
+                          size_t offset,
+                          uint32_t value) {
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+template <size_t Size>
+void writeProfileLogV4U64(std::array<uint8_t, Size>& data,
+                          size_t offset,
+                          uint64_t value) {
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+template <size_t Size>
+uint32_t readProfileLogV4U32(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  uint32_t value = 0;
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    value |= uint32_t(data[offset + i]) << (8 * i);
+  }
+  return value;
+}
+
+template <size_t Size>
+uint64_t readProfileLogV4U64(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  uint64_t value = 0;
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    value |= uint64_t(data[offset + i]) << (8 * i);
+  }
+  return value;
+}
+
+struct ProfileLogV4Descriptor {
+  uint64_t generation;
+  uint32_t arena;
+  uint64_t manifestOffset;
+  uint64_t manifestSize;
+  uint64_t manifestRecordChecksum;
+  std::array<uint64_t, 2> highWater;
+  uint64_t recordChecksum;
+};
+
+struct ProfileLogV4Phase {
+  uint64_t generation;
+  uint32_t arena;
+  uint64_t descriptorChecksum;
+};
+
+struct ProfileLogV4ManifestHeader {
+  uint64_t generation;
+  uint64_t size;
+  uint64_t payloadChecksum;
+  uint64_t recordChecksum;
+};
+
+bool profileLogV4SameDescriptor(const ProfileLogV4Descriptor& lhs,
+                                const ProfileLogV4Descriptor& rhs) {
+  return lhs.generation == rhs.generation && lhs.arena == rhs.arena &&
+         lhs.manifestOffset == rhs.manifestOffset &&
+         lhs.manifestSize == rhs.manifestSize &&
+         lhs.manifestRecordChecksum == rhs.manifestRecordChecksum &&
+         lhs.highWater == rhs.highWater &&
+         lhs.recordChecksum == rhs.recordChecksum;
+}
+
+class ProfileLogV4ManifestBackend final : public OPFSBackend {
+  std::recursive_mutex storeMutex;
+  std::shared_ptr<OPFSDirectory> physicalRoot;
+  std::shared_ptr<OPFSFile> bootstrap;
+  std::shared_ptr<OPFSFile> control;
+  std::array<std::shared_ptr<OPFSFile>, 2> arenas;
+  bool bootstrapOpen = false;
+  bool controlOpen = false;
+  std::array<bool, 2> arenasOpen = {};
+  bool initialisationAmbiguous = false;
+  bool bootstrapComplete = false;
+  uint64_t profileChecksum = 0;
+  uint32_t profileLength = 0;
+  uint64_t generation = 0;
+  std::array<uint64_t, 2> highWater = {};
+  ProfileLogV4Descriptor selectedDescriptor = {};
+  bool hasSelectedDescriptor = false;
+  int fatalError = 0;
+  std::string bootstrapName;
+  std::string controlName;
+  std::array<std::string, 2> arenaNames;
+
+  static std::string storageStem(std::string_view profileName) {
+    std::string result = ".wasmfs-profile-log-v4-";
+    result += std::to_string(profileName.size());
+    result += '-';
+    result.append(profileName.data(), profileName.size());
+    return result;
+  }
+
+  static uint64_t descriptorOffset(uint64_t recordGeneration,
+                                   uint64_t copy) {
+    return ((recordGeneration & 1) * 2 + copy) * kProfileLogV4RecordSize;
+  }
+
+  static uint64_t phaseOffset(uint64_t copy) {
+    return (4 + copy) * kProfileLogV4RecordSize;
+  }
+
+  int poisonLocked(int error) {
+    if (error >= 0) {
+      error = -EIO;
+    }
+    if (!fatalError) {
+      fatalError = error;
+    }
+    return fatalError;
+  }
+
+  int recordInitialisationProxyFailure() {
+    initialisationAmbiguous = true;
+    terminalCloseState->recordUnacknowledgedProxyCompletion();
+    return -EIO;
+  }
+
+  int admitBootstrapDirectoryOperationLocked() const {
+    return bootstrapComplete ? -ESHUTDOWN : 0;
+  }
+
+  std::shared_ptr<OPFSFile> makePhysicalFile(const std::string& name) {
+    auto file = std::make_shared<OPFSFile>(0600,
+                                           this,
+                                           kOPFSRootDirectoryID,
+                                           name,
+                                           proxy,
+                                           terminalCloseState,
+                                           profileLeaseState,
+                                           terminalCloseState);
+    file->locked().setParent(physicalRoot);
+    return file;
+  }
+
+  int initialisePhysicalRootLocked() {
+    if (int error = admitBootstrapDirectoryOperationLocked()) {
+      return error;
+    }
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    if (!proxy([](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); })) {
+      return recordInitialisationProxyFailure();
+    }
+    physicalRoot = std::make_shared<OPFSDirectory>(0700,
+                                                    this,
+                                                    kOPFSRootDirectoryID,
+                                                    proxy,
+                                                    terminalCloseState,
+                                                    profileLeaseState,
+                                                    terminalCloseState);
+    return 0;
+  }
+
+  int lookupPhysicalFileLocked(const std::string& name) {
+    if (int error = admitBootstrapDirectoryOperationLocked()) {
+      return error;
+    }
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    int childType = 0;
+    int childID = -EIO;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_get_child(
+            ctx.ctx, kOPFSRootDirectoryID, name.c_str(), &childType, &childID);
+        })) {
+      return recordInitialisationProxyFailure();
+    }
+    if (childID == -ENOENT) {
+      return -ENOENT;
+    }
+    return childType == 1 && childID == 0 ? 0
+                                          : childID < 0 ? childID : -EIO;
+  }
+
+  int insertPhysicalFileLocked(const std::string& name) {
+    if (int error = admitBootstrapDirectoryOperationLocked()) {
+      return error;
+    }
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    int childID = -EIO;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_insert_file(
+            ctx.ctx, kOPFSRootDirectoryID, name.c_str(), &childID);
+        })) {
+      return recordInitialisationProxyFailure();
+    }
+    return childID == 0 ? 0 : childID < 0 ? childID : -EIO;
+  }
+
+  int openFileLocked(const std::shared_ptr<OPFSFile>& file, bool* opened) {
+    if (!file || !opened) {
+      return -EIO;
+    }
+    int error = file->locked().open(O_RDWR);
+    if (!error) {
+      *opened = true;
+    }
+    return error;
+  }
+
+  int openAllFilesLocked() {
+    if (int error = openFileLocked(bootstrap, &bootstrapOpen)) {
+      return error;
+    }
+    if (int error = openFileLocked(control, &controlOpen)) {
+      return error;
+    }
+    for (size_t i = 0; i != arenas.size(); ++i) {
+      if (int error = openFileLocked(arenas[i], &arenasOpen[i])) {
+        return error;
+      }
+    }
+    return 0;
+  }
+
+  int closeFileForRetirementLocked(const std::shared_ptr<OPFSFile>& file,
+                                   bool* opened,
+                                   bool flushFirst) {
+    if (!opened || !*opened) {
+      return 0;
+    }
+    int firstError = flushFirst ? file->locked().flush() : 0;
+    int closeError = file->locked().close();
+    if (!closeError) {
+      *opened = false;
+    } else if (!firstError) {
+      firstError = closeError;
+    }
+    return firstError;
+  }
+
+  int closeAllFilesForRetirementLocked(bool flushFirst) {
+    int firstError = 0;
+    auto closeOne = [&](const std::shared_ptr<OPFSFile>& file, bool* opened) {
+      int error = closeFileForRetirementLocked(file, opened, flushFirst);
+      if (!firstError && error) {
+        firstError = error;
+      }
+      return terminalCloseState->getUnacknowledgedProxyError() == 0;
+    };
+    if (!closeOne(arenas[0], &arenasOpen[0]) ||
+        !closeOne(arenas[1], &arenasOpen[1]) ||
+        !closeOne(control, &controlOpen) ||
+        !closeOne(bootstrap, &bootstrapOpen)) {
+      return firstError ? firstError
+                        : terminalCloseState->getUnacknowledgedProxyError();
+    }
+    return firstError;
+  }
+
+  void abandonPhysicalFilesLocked() {
+    if (bootstrap) {
+      bootstrap->abandonForTerminalFailure();
+    }
+    if (control) {
+      control->abandonForTerminalFailure();
+    }
+    for (const auto& arena : arenas) {
+      if (arena) {
+        arena->abandonForTerminalFailure();
+      }
+    }
+  }
+
+  int stopAfterUnacknowledgedProxyLocked() {
+    const int error = terminalCloseState->getUnacknowledgedProxyError();
+    if (!error) {
+      return 0;
+    }
+    abandonPhysicalFilesLocked();
+    profileLeaseState->closeDestructorProxying();
+    return error;
+  }
+
+  int setFixedSizeLocked(const std::shared_ptr<OPFSFile>& file, size_t size) {
+    if (!file || size > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    if (int error = file->locked().setSize(size)) {
+      return error;
+    }
+    return file->locked().flush();
+  }
+
+  int requireFixedSizeLocked(const std::shared_ptr<OPFSFile>& file,
+                             size_t expectedSize) {
+    if (!file || expectedSize >
+                   static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const off_t size = file->locked().getSize();
+    if (size < 0) {
+      return size;
+    }
+    return size_t(size) == expectedSize ? 0 : -EIO;
+  }
+
+  int writeBytesAndFlushLocked(const std::shared_ptr<OPFSFile>& file,
+                               uint64_t offset,
+                               const uint8_t* data,
+                               size_t size) {
+    if (!file || (size && !data) ||
+        offset > kProfileLogV4MaxSafeOffset ||
+        offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+        size > kProfileLogV4MaxSafeOffset - offset ||
+        size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
+                 offset) {
+      return -EFBIG;
+    }
+    for (size_t cursor = 0; cursor != size;) {
+      const size_t count = std::min(kProfileLogV4TransferSize, size - cursor);
+      const ssize_t written = file->locked().write(
+        data + cursor, count, static_cast<off_t>(offset + cursor));
+      if (written < 0) {
+        return written;
+      }
+      if (size_t(written) != count) {
+        return -EIO;
+      }
+      cursor += count;
+    }
+    return file->locked().flush();
+  }
+
+  int readBytesLocked(const std::shared_ptr<OPFSFile>& file,
+                      uint64_t offset,
+                      uint8_t* data,
+                      size_t size) {
+    if (!file || (size && !data) ||
+        offset > kProfileLogV4MaxSafeOffset ||
+        offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
+        size > kProfileLogV4MaxSafeOffset - offset ||
+        size > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
+                 offset) {
+      return -EFBIG;
+    }
+    for (size_t cursor = 0; cursor != size;) {
+      const size_t count = std::min(kProfileLogV4TransferSize, size - cursor);
+      const ssize_t read = file->locked().read(
+        data + cursor, count, static_cast<off_t>(offset + cursor));
+      if (read < 0) {
+        return read;
+      }
+      if (size_t(read) != count) {
+        return -EIO;
+      }
+      cursor += count;
+    }
+    return 0;
+  }
+
+  int streamChecksumLocked(const std::shared_ptr<OPFSFile>& file,
+                           uint64_t offset,
+                           uint64_t size,
+                           uint64_t* result) {
+    if (!result || size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        offset > kProfileLogV4MaxSafeOffset ||
+        size > kProfileLogV4MaxSafeOffset - offset) {
+      return -EFBIG;
+    }
+    std::array<uint8_t, kProfileLogV4TransferSize> transfer;
+    uint64_t checksum = UINT64_C(1469598103934665603);
+    uint64_t cursor = 0;
+    while (cursor != size) {
+      const size_t count = static_cast<size_t>(
+        std::min<uint64_t>(transfer.size(), size - cursor));
+      if (int error = readBytesLocked(file, offset + cursor, transfer.data(), count)) {
+        return error;
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION == 4
+      if (cursor == 0 && count) {
+        transfer[0] ^= 1;
+      }
+#endif
+      checksum = profileLogV4ChecksumUpdate(checksum, transfer.data(), count);
+      cursor += count;
+    }
+    *result = checksum;
+    return 0;
+  }
+
+  int writeRecordLocked(
+    const std::shared_ptr<OPFSFile>& file,
+    uint64_t offset,
+    const std::array<uint8_t, kProfileLogV4RecordSize>& record) {
+    return writeBytesAndFlushLocked(file, offset, record.data(), record.size());
+  }
+
+  int readRecordLocked(
+    const std::shared_ptr<OPFSFile>& file,
+    uint64_t offset,
+    std::array<uint8_t, kProfileLogV4RecordSize>* record) {
+    if (!record) {
+      return -EINVAL;
+    }
+    return readBytesLocked(file, offset, record->data(), record->size());
+  }
+
+  std::array<uint8_t, kProfileLogV4RecordSize> makeBootstrapRecord() const {
+    std::array<uint8_t, kProfileLogV4RecordSize> record = {};
+    std::copy(kProfileLogV4BootstrapMagic.begin(),
+              kProfileLogV4BootstrapMagic.end(),
+              record.begin());
+    writeProfileLogV4U32(record, 8, kProfileLogV4FormatVersion);
+    writeProfileLogV4U32(record, 12, kProfileLogV4RecordSize);
+    writeProfileLogV4U64(record, 16, profileChecksum);
+    writeProfileLogV4U32(record, 24, profileLength);
+    writeProfileLogV4U32(record, 28, arenas.size());
+    writeProfileLogV4U32(record, 32, kProfileLogV4BootstrapReady);
+    writeProfileLogV4U32(record, 36, kProfileLogV4LayoutEpoch);
+    writeProfileLogV4U64(
+      record, 40, profileLogV4ChecksumWithZeroedRange(record, 40, 8));
+    return record;
+  }
+
+  bool parseBootstrapRecord(
+    const std::array<uint8_t, kProfileLogV4RecordSize>& record) const {
+    return std::equal(kProfileLogV4BootstrapMagic.begin(),
+                      kProfileLogV4BootstrapMagic.end(),
+                      record.begin()) &&
+           readProfileLogV4U32(record, 8) == kProfileLogV4FormatVersion &&
+           readProfileLogV4U32(record, 12) == kProfileLogV4RecordSize &&
+           readProfileLogV4U64(record, 16) == profileChecksum &&
+           readProfileLogV4U32(record, 24) == profileLength &&
+           readProfileLogV4U32(record, 28) == arenas.size() &&
+           readProfileLogV4U32(record, 32) == kProfileLogV4BootstrapReady &&
+           readProfileLogV4U32(record, 36) == kProfileLogV4LayoutEpoch &&
+           readProfileLogV4U64(record, 40) ==
+             profileLogV4ChecksumWithZeroedRange(record, 40, 8) &&
+           profileLogV4HasZeroTail(record, 48);
+  }
+
+  std::array<uint8_t, kProfileLogV4RecordSize> makeDescriptorRecord(
+    const ProfileLogV4Descriptor& descriptor) const {
+    std::array<uint8_t, kProfileLogV4RecordSize> record = {};
+    std::copy(kProfileLogV4DescriptorMagic.begin(),
+              kProfileLogV4DescriptorMagic.end(),
+              record.begin());
+    writeProfileLogV4U32(record, 8, kProfileLogV4FormatVersion);
+    writeProfileLogV4U32(record, 12, kProfileLogV4RecordSize);
+    writeProfileLogV4U64(record, 16, descriptor.generation);
+    writeProfileLogV4U32(record, 24, descriptor.arena);
+    writeProfileLogV4U64(record, 32, descriptor.manifestOffset);
+    writeProfileLogV4U64(record, 40, descriptor.manifestSize);
+    writeProfileLogV4U64(record, 48, descriptor.manifestRecordChecksum);
+    writeProfileLogV4U64(record, 56, descriptor.highWater[0]);
+    writeProfileLogV4U64(record, 64, descriptor.highWater[1]);
+    writeProfileLogV4U64(record, 72, profileChecksum);
+    writeProfileLogV4U64(record, 80, kProfileLogV4LayoutEpoch);
+    writeProfileLogV4U64(
+      record, 88, profileLogV4ChecksumWithZeroedRange(record, 88, 8));
+    return record;
+  }
+
+  std::optional<ProfileLogV4Descriptor> parseDescriptorRecord(
+    const std::array<uint8_t, kProfileLogV4RecordSize>& record) const {
+    if (!std::equal(kProfileLogV4DescriptorMagic.begin(),
+                    kProfileLogV4DescriptorMagic.end(),
+                    record.begin()) ||
+        readProfileLogV4U32(record, 8) != kProfileLogV4FormatVersion ||
+        readProfileLogV4U32(record, 12) != kProfileLogV4RecordSize ||
+        !profileLogV4HasZeroRange(record, 28, 4) ||
+        readProfileLogV4U64(record, 72) != profileChecksum ||
+        readProfileLogV4U64(record, 80) != kProfileLogV4LayoutEpoch ||
+        readProfileLogV4U64(record, 88) !=
+          profileLogV4ChecksumWithZeroedRange(record, 88, 8) ||
+        !profileLogV4HasZeroTail(record, 96)) {
+      return std::nullopt;
+    }
+    ProfileLogV4Descriptor descriptor = {
+      readProfileLogV4U64(record, 16),
+      readProfileLogV4U32(record, 24),
+      readProfileLogV4U64(record, 32),
+      readProfileLogV4U64(record, 40),
+      readProfileLogV4U64(record, 48),
+      {readProfileLogV4U64(record, 56), readProfileLogV4U64(record, 64)},
+      readProfileLogV4U64(record, 88),
+    };
+    if (!descriptor.generation || descriptor.arena >= arenas.size() ||
+        descriptor.manifestOffset > kProfileLogV4MaxSafeOffset ||
+        descriptor.manifestSize > kProfileLogV4MaxSafeOffset ||
+        descriptor.highWater[0] > kProfileLogV4MaxSafeOffset ||
+        descriptor.highWater[1] > kProfileLogV4MaxSafeOffset) {
+      return std::nullopt;
+    }
+    return descriptor;
+  }
+
+  std::array<uint8_t, kProfileLogV4RecordSize> makePhaseRecord(
+    uint64_t recordGeneration,
+    uint32_t arena,
+    uint64_t descriptorChecksum) const {
+    std::array<uint8_t, kProfileLogV4RecordSize> record = {};
+    std::copy(kProfileLogV4PhaseMagic.begin(),
+              kProfileLogV4PhaseMagic.end(),
+              record.begin());
+    writeProfileLogV4U32(record, 8, kProfileLogV4FormatVersion);
+    writeProfileLogV4U32(record, 12, kProfileLogV4RecordSize);
+    writeProfileLogV4U64(record, 16, recordGeneration);
+    writeProfileLogV4U32(record, 24, arena);
+    writeProfileLogV4U32(record, 28, kProfileLogV4PhaseClean);
+    writeProfileLogV4U64(record, 32, descriptorChecksum);
+    writeProfileLogV4U64(record, 40, profileChecksum);
+    writeProfileLogV4U64(
+      record, 48, profileLogV4ChecksumWithZeroedRange(record, 48, 8));
+    return record;
+  }
+
+  std::optional<ProfileLogV4Phase> parsePhaseRecord(
+    const std::array<uint8_t, kProfileLogV4RecordSize>& record) const {
+    if (!std::equal(kProfileLogV4PhaseMagic.begin(),
+                    kProfileLogV4PhaseMagic.end(),
+                    record.begin()) ||
+        readProfileLogV4U32(record, 8) != kProfileLogV4FormatVersion ||
+        readProfileLogV4U32(record, 12) != kProfileLogV4RecordSize ||
+        readProfileLogV4U32(record, 28) != kProfileLogV4PhaseClean ||
+        readProfileLogV4U64(record, 40) != profileChecksum ||
+        readProfileLogV4U64(record, 48) !=
+          profileLogV4ChecksumWithZeroedRange(record, 48, 8) ||
+        !profileLogV4HasZeroTail(record, 56)) {
+      return std::nullopt;
+    }
+    const uint64_t recordGeneration = readProfileLogV4U64(record, 16);
+    const uint32_t arena = readProfileLogV4U32(record, 24);
+    if (!recordGeneration || arena >= arenas.size()) {
+      return std::nullopt;
+    }
+    return ProfileLogV4Phase{recordGeneration,
+                             arena,
+                             readProfileLogV4U64(record, 32)};
+  }
+
+  std::array<uint8_t, kProfileLogV4ManifestHeaderSize> makeManifestHeader(
+    uint64_t recordGeneration,
+    const uint8_t* data,
+    size_t size) const {
+    std::array<uint8_t, kProfileLogV4ManifestHeaderSize> header = {};
+    std::copy(kProfileLogV4ManifestMagic.begin(),
+              kProfileLogV4ManifestMagic.end(),
+              header.begin());
+    writeProfileLogV4U32(header, 8, kProfileLogV4FormatVersion);
+    writeProfileLogV4U32(header, 12, kProfileLogV4ManifestHeaderSize);
+    writeProfileLogV4U64(header, 16, recordGeneration);
+    writeProfileLogV4U64(header, 24, size);
+    writeProfileLogV4U64(header, 32, profileLogV4Checksum(data, size));
+    writeProfileLogV4U64(header, 40, profileChecksum);
+    writeProfileLogV4U64(header, 48, kProfileLogV4LayoutEpoch);
+    writeProfileLogV4U64(
+      header, 56, profileLogV4ChecksumWithZeroedRange(header, 56, 8));
+    return header;
+  }
+
+  std::optional<ProfileLogV4ManifestHeader> parseManifestHeader(
+    const std::array<uint8_t, kProfileLogV4ManifestHeaderSize>& header) const {
+    if (!std::equal(kProfileLogV4ManifestMagic.begin(),
+                    kProfileLogV4ManifestMagic.end(),
+                    header.begin()) ||
+        readProfileLogV4U32(header, 8) != kProfileLogV4FormatVersion ||
+        readProfileLogV4U32(header, 12) != kProfileLogV4ManifestHeaderSize ||
+        readProfileLogV4U64(header, 40) != profileChecksum ||
+        readProfileLogV4U64(header, 48) != kProfileLogV4LayoutEpoch ||
+        readProfileLogV4U64(header, 56) !=
+          profileLogV4ChecksumWithZeroedRange(header, 56, 8) ||
+        !profileLogV4HasZeroTail(header, 64)) {
+      return std::nullopt;
+    }
+    const uint64_t recordGeneration = readProfileLogV4U64(header, 16);
+    const uint64_t size = readProfileLogV4U64(header, 24);
+    if (!recordGeneration || size > kProfileLogV4MaxSafeOffset -
+                                      kProfileLogV4ManifestHeaderSize) {
+      return std::nullopt;
+    }
+    return ProfileLogV4ManifestHeader{recordGeneration,
+                                      size,
+                                      readProfileLogV4U64(header, 32),
+                                      readProfileLogV4U64(header, 56)};
+  }
+
+  int writeDescriptorPairLocked(const ProfileLogV4Descriptor& descriptor,
+                                uint64_t* descriptorChecksum) {
+    const auto record = makeDescriptorRecord(descriptor);
+    if (descriptorChecksum) {
+      *descriptorChecksum = readProfileLogV4U64(record, 88);
+    }
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      if (int error = writeRecordLocked(
+            control, descriptorOffset(descriptor.generation, copy), record)) {
+        return error;
+      }
+    }
+    return 0;
+  }
+
+  int writePhaseWitnessLocked(uint64_t copy,
+                              uint64_t recordGeneration,
+                              uint32_t arena,
+                              uint64_t descriptorChecksum) {
+    return writeRecordLocked(control,
+                             phaseOffset(copy),
+                             makePhaseRecord(recordGeneration,
+                                             arena,
+                                             descriptorChecksum));
+  }
+
+  int writeGenerationLocked(uint64_t recordGeneration,
+                            const uint8_t* data,
+                            size_t size,
+                            ProfileLogV4Descriptor* result) {
+    const uint64_t byteSize = size;
+    if (!recordGeneration || (size && !data) ||
+        byteSize >
+          kProfileLogV4MaxSafeOffset - kProfileLogV4ManifestHeaderSize) {
+      return -EINVAL;
+    }
+    const uint32_t arena = recordGeneration & 1;
+    const uint64_t manifestOffset = highWater[arena];
+    const uint64_t payloadOffset =
+      manifestOffset + kProfileLogV4ManifestHeaderSize;
+    const uint64_t end = payloadOffset + byteSize;
+    if (manifestOffset > kProfileLogV4MaxSafeOffset -
+                           kProfileLogV4ManifestHeaderSize ||
+        payloadOffset > kProfileLogV4MaxSafeOffset - byteSize ||
+        end > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+      return -EFBIG;
+    }
+    const auto header = makeManifestHeader(recordGeneration, data, size);
+    if (size) {
+      if (int error = writeBytesAndFlushLocked(
+            arenas[arena], payloadOffset, data, size)) {
+        return error;
+      }
+    }
+    if (int error = writeBytesAndFlushLocked(
+          arenas[arena], manifestOffset, header.data(), header.size())) {
+      return error;
+    }
+    auto nextHighWater = highWater;
+    nextHighWater[arena] = end;
+    ProfileLogV4Descriptor descriptor = {recordGeneration,
+                                         arena,
+                                         manifestOffset,
+                                         byteSize,
+                                         readProfileLogV4U64(header, 56),
+                                         nextHighWater,
+                                         0};
+    uint64_t descriptorChecksum = 0;
+    if (int error = writeDescriptorPairLocked(descriptor, &descriptorChecksum)) {
+      return error;
+    }
+    if (int error = writePhaseWitnessLocked(
+          0, recordGeneration, arena, descriptorChecksum)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v4_test_maybe_interrupt(1);
+#endif
+    if (int error = writePhaseWitnessLocked(
+          1, recordGeneration, arena, descriptorChecksum)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v4_test_maybe_interrupt(2);
+#endif
+    descriptor.recordChecksum = descriptorChecksum;
+    if (result) {
+      *result = descriptor;
+    }
+    return 0;
+  }
+
+  int validatePhaseManifestLocked(const ProfileLogV4Phase& phase,
+                                  ProfileLogV4Descriptor* result) {
+    if (!result || phase.arena != (phase.generation & 1)) {
+      return -EIO;
+    }
+    std::array<std::optional<ProfileLogV4Descriptor>, 2> descriptors;
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      std::array<uint8_t, kProfileLogV4RecordSize> record;
+      if (int error = readRecordLocked(
+            control, descriptorOffset(phase.generation, copy), &record)) {
+        return error;
+      }
+      descriptors[copy] = parseDescriptorRecord(record);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION == 2
+    descriptors[0].reset();
+#endif
+    if (!descriptors[0] || !descriptors[1] ||
+        descriptors[0]->generation != phase.generation ||
+        descriptors[1]->generation != phase.generation ||
+        descriptors[0]->arena != phase.arena ||
+        descriptors[1]->arena != phase.arena ||
+        descriptors[0]->manifestOffset != descriptors[1]->manifestOffset ||
+        descriptors[0]->manifestSize != descriptors[1]->manifestSize ||
+        descriptors[0]->manifestRecordChecksum !=
+          descriptors[1]->manifestRecordChecksum ||
+        descriptors[0]->highWater != descriptors[1]->highWater ||
+        descriptors[0]->recordChecksum != phase.descriptorChecksum ||
+        descriptors[1]->recordChecksum != phase.descriptorChecksum) {
+      return -EIO;
+    }
+    const ProfileLogV4Descriptor& descriptor = *descriptors[0];
+    if (descriptor.manifestOffset > kProfileLogV4MaxSafeOffset -
+                                      kProfileLogV4ManifestHeaderSize ||
+        descriptor.manifestSize > kProfileLogV4MaxSafeOffset -
+                                      descriptor.manifestOffset -
+                                      kProfileLogV4ManifestHeaderSize ||
+        descriptor.highWater[descriptor.arena] <
+          descriptor.manifestOffset + kProfileLogV4ManifestHeaderSize +
+            descriptor.manifestSize) {
+      return -EIO;
+    }
+    for (size_t i = 0; i != arenas.size(); ++i) {
+      const off_t physicalSize = arenas[i]->locked().getSize();
+      if (physicalSize < 0) {
+        return physicalSize;
+      }
+      if (static_cast<uint64_t>(physicalSize) < descriptor.highWater[i]) {
+        return -EIO;
+      }
+    }
+    std::array<uint8_t, kProfileLogV4ManifestHeaderSize> header;
+    if (int error = readBytesLocked(arenas[descriptor.arena],
+                                    descriptor.manifestOffset,
+                                    header.data(),
+                                    header.size())) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION == 3
+    header[0] ^= 1;
+#endif
+    auto parsed = parseManifestHeader(header);
+    if (!parsed || parsed->generation != phase.generation ||
+        parsed->size != descriptor.manifestSize ||
+        parsed->recordChecksum != descriptor.manifestRecordChecksum) {
+      return -EIO;
+    }
+    uint64_t payloadChecksum = 0;
+    if (int error = streamChecksumLocked(
+          arenas[descriptor.arena],
+          descriptor.manifestOffset + kProfileLogV4ManifestHeaderSize,
+          descriptor.manifestSize,
+          &payloadChecksum)) {
+      return error;
+    }
+    if (payloadChecksum != parsed->payloadChecksum) {
+      return -EIO;
+    }
+    *result = descriptor;
+    return 0;
+  }
+
+  int recoverControlLocked() {
+    std::array<std::optional<ProfileLogV4Phase>, 2> phases;
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      std::array<uint8_t, kProfileLogV4RecordSize> record;
+      if (int error = readRecordLocked(control, phaseOffset(copy), &record)) {
+        return error;
+      }
+      phases[copy] = parsePhaseRecord(record);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION == 1
+    phases[0].reset();
+#endif
+    if (!phases[0] || !phases[1]) {
+      return -EIO;
+    }
+    ProfileLogV4Descriptor selected;
+    if (phases[0]->generation == phases[1]->generation) {
+      if (phases[0]->arena != phases[1]->arena ||
+          phases[0]->descriptorChecksum != phases[1]->descriptorChecksum) {
+        return -EIO;
+      }
+      if (int error = validatePhaseManifestLocked(*phases[0], &selected)) {
+        return error;
+      }
+    } else {
+      const uint64_t oldCopy = phases[0]->generation < phases[1]->generation
+                                 ? 0
+                                 : 1;
+      const uint64_t newCopy = oldCopy ^ 1;
+      const ProfileLogV4Phase& oldPhase = *phases[oldCopy];
+      const ProfileLogV4Phase& newPhase = *phases[newCopy];
+      if (oldPhase.generation == std::numeric_limits<uint64_t>::max() ||
+          newPhase.generation != oldPhase.generation + 1 ||
+          oldPhase.arena != (oldPhase.generation & 1) ||
+          newPhase.arena != (newPhase.generation & 1)) {
+        return -EIO;
+      }
+      if (int error = validatePhaseManifestLocked(oldPhase, &selected)) {
+        return error;
+      }
+      // A one-witness new generation is not exposed. Deliberately retain the
+      // g/g+1 split: rewriting the newer witness in place could itself tear
+      // and destroy the only durable old witness. The next commit reuses the
+      // unselected g+1 descriptor slots and publishes them normally.
+    }
+    generation = selected.generation;
+    highWater = selected.highWater;
+    selectedDescriptor = selected;
+    hasSelectedDescriptor = true;
+    return 0;
+  }
+
+  int verifyBootstrapLocked(bool liveValidation = false) {
+    std::array<uint8_t, kProfileLogV4RecordSize> first;
+    std::array<uint8_t, kProfileLogV4RecordSize> second;
+    if (int error = readRecordLocked(bootstrap, 0, &first)) {
+      return error;
+    }
+    if (int error = readRecordLocked(
+          bootstrap, kProfileLogV4RecordSize, &second)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION == 2
+    if (liveValidation) {
+      first[0] ^= 1;
+    }
+#else
+    (void)liveValidation;
+#endif
+    return parseBootstrapRecord(first) && parseBootstrapRecord(second) &&
+           first == second
+             ? 0
+             : -EIO;
+  }
+
+  int initialiseFreshLocked() {
+    for (const auto& name : {arenaNames[0], arenaNames[1], controlName,
+                             bootstrapName}) {
+      if (int error = insertPhysicalFileLocked(name)) {
+        return error;
+      }
+    }
+    bootstrap = makePhysicalFile(bootstrapName);
+    control = makePhysicalFile(controlName);
+    arenas[0] = makePhysicalFile(arenaNames[0]);
+    arenas[1] = makePhysicalFile(arenaNames[1]);
+    if (int error = openAllFilesLocked()) {
+      return error;
+    }
+    if (int error = setFixedSizeLocked(bootstrap, kProfileLogV4BootstrapSize)) {
+      return error;
+    }
+    if (int error = setFixedSizeLocked(control, kProfileLogV4ControlSize)) {
+      return error;
+    }
+    ProfileLogV4Descriptor initial;
+    if (int error = writeGenerationLocked(1, nullptr, 0, &initial)) {
+      return error;
+    }
+    const auto bootstrapRecord = makeBootstrapRecord();
+    if (int error = writeRecordLocked(bootstrap, 0, bootstrapRecord)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v4_test_maybe_interrupt(0);
+#endif
+    if (int error = writeRecordLocked(
+          bootstrap, kProfileLogV4RecordSize, bootstrapRecord)) {
+      return error;
+    }
+    generation = initial.generation;
+    highWater = initial.highWater;
+    selectedDescriptor = initial;
+    hasSelectedDescriptor = true;
+    return 0;
+  }
+
+  int openEstablishedLocked() {
+    bootstrap = makePhysicalFile(bootstrapName);
+    control = makePhysicalFile(controlName);
+    arenas[0] = makePhysicalFile(arenaNames[0]);
+    arenas[1] = makePhysicalFile(arenaNames[1]);
+    if (int error = openAllFilesLocked()) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(
+          bootstrap, kProfileLogV4BootstrapSize)) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(control, kProfileLogV4ControlSize)) {
+      return error;
+    }
+    if (int error = verifyBootstrapLocked()) {
+      return error;
+    }
+    return recoverControlLocked();
+  }
+
+  int operationErrorLocked() const {
+    return fatalError ? fatalError : hasSelectedDescriptor ? 0 : -ESHUTDOWN;
+  }
+
+  int validateSelectedManifestLocked() {
+    if (!hasSelectedDescriptor) {
+      return -ESHUTDOWN;
+    }
+    if (int error = requireFixedSizeLocked(
+          bootstrap, kProfileLogV4BootstrapSize)) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(control, kProfileLogV4ControlSize)) {
+      return error;
+    }
+    if (int error = verifyBootstrapLocked(true)) {
+      return error;
+    }
+    std::array<std::optional<ProfileLogV4Phase>, 2> phases;
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      std::array<uint8_t, kProfileLogV4RecordSize> record;
+      if (int error = readRecordLocked(control, phaseOffset(copy), &record)) {
+        return error;
+      }
+      phases[copy] = parsePhaseRecord(record);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION == 1
+    phases[0].reset();
+#endif
+    if (!phases[0] || !phases[1]) {
+      return -EIO;
+    }
+    const ProfileLogV4Phase* selectedPhase = nullptr;
+    if (phases[0]->generation == phases[1]->generation) {
+      if (phases[0]->arena != phases[1]->arena ||
+          phases[0]->descriptorChecksum != phases[1]->descriptorChecksum) {
+        return -EIO;
+      }
+      selectedPhase = &*phases[0];
+    } else {
+      const uint64_t oldCopy = phases[0]->generation < phases[1]->generation
+                                 ? 0
+                                 : 1;
+      const uint64_t newCopy = oldCopy ^ 1;
+      const ProfileLogV4Phase& oldPhase = *phases[oldCopy];
+      const ProfileLogV4Phase& newPhase = *phases[newCopy];
+      if (oldPhase.generation == std::numeric_limits<uint64_t>::max() ||
+          newPhase.generation != oldPhase.generation + 1 ||
+          oldPhase.arena != (oldPhase.generation & 1) ||
+          newPhase.arena != (newPhase.generation & 1)) {
+        return -EIO;
+      }
+      selectedPhase = &oldPhase;
+    }
+    if (selectedPhase->generation != selectedDescriptor.generation ||
+        selectedPhase->arena != selectedDescriptor.arena ||
+        selectedPhase->descriptorChecksum != selectedDescriptor.recordChecksum) {
+      return -EIO;
+    }
+    ProfileLogV4Descriptor validated;
+    if (int error = validatePhaseManifestLocked(*selectedPhase, &validated)) {
+      return error;
+    }
+    return profileLogV4SameDescriptor(validated, selectedDescriptor) ? 0
+                                                                      : -EIO;
+  }
+
+public:
+  // This primitive is intentionally not a filesystem. It must not inherit
+  // OPFSBackend's mountable direct-directory factory by accident.
+  std::shared_ptr<DataFile> createFile(mode_t) override { return nullptr; }
+  std::shared_ptr<Directory> createDirectory(mode_t) override {
+    return nullptr;
+  }
+  std::shared_ptr<Symlink> createSymlink(std::string) override {
+    return nullptr;
+  }
+  bool supportsExplicitMetadataMutation() const override { return false; }
+  bool supportsRecordLocks() const override { return false; }
+
+  int initialise(const char* profileName) {
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    if (!profileName) {
+      return -EINVAL;
+    }
+    const std::string_view profile(profileName);
+    const uint64_t profileSize = profile.size();
+    if (profileSize > std::numeric_limits<uint32_t>::max()) {
+      return -EOVERFLOW;
+    }
+    profileChecksum = profileLogV4Checksum(
+      reinterpret_cast<const uint8_t*>(profile.data()),
+      static_cast<size_t>(profileSize));
+    profileLength = static_cast<uint32_t>(profileSize);
+    const std::string stem = storageStem(profile);
+    bootstrapName = stem + "-bootstrap";
+    controlName = stem + "-control";
+    arenaNames[0] = stem + "-arena-0";
+    arenaNames[1] = stem + "-arena-1";
+
+    if (int error = initialisePhysicalRootLocked()) {
+      return error;
+    }
+    const int bootstrapStatus = lookupPhysicalFileLocked(bootstrapName);
+    if (bootstrapStatus == -ENOENT) {
+      for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
+        if (int status = lookupPhysicalFileLocked(name); status != -ENOENT) {
+          return status == 0 ? -EIO : status;
+        }
+      }
+      if (int error = initialiseFreshLocked()) {
+        return error;
+      }
+    } else {
+      if (bootstrapStatus) {
+        return bootstrapStatus;
+      }
+      for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
+        if (int status = lookupPhysicalFileLocked(name)) {
+          return status == -ENOENT ? -EIO : status;
+        }
+      }
+      if (int error = openEstablishedLocked()) {
+        return error;
+      }
+    }
+    bootstrapComplete = true;
+    return 0;
+  }
+
+  int readOPFSProfileLogV4Manifest(uint8_t* buffer,
+                                   size_t capacity,
+                                   size_t* size) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (int error = validateSelectedManifestLocked()) {
+      return poisonLocked(error);
+    }
+    if (!size || (!buffer && capacity)) {
+      return -EINVAL;
+    }
+    if (selectedDescriptor.manifestSize >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const size_t required = selectedDescriptor.manifestSize;
+    *size = required;
+    if (!buffer && !capacity) {
+      return 0;
+    }
+    if (capacity < required) {
+      return -ENOBUFS;
+    }
+    const int read = readBytesLocked(
+      arenas[selectedDescriptor.arena],
+      selectedDescriptor.manifestOffset + kProfileLogV4ManifestHeaderSize,
+      buffer,
+      required);
+    return read ? poisonLocked(read) : 0;
+  }
+
+  int commitOPFSProfileLogV4Manifest(const uint8_t* data, size_t size) override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (size && !data) {
+      return -EINVAL;
+    }
+    // Never replace a selected state that no longer validates. The opaque
+    // caller might otherwise make a new generation appear to heal a corrupt
+    // base without the future filesystem having had a chance to inspect it.
+    if (int error = validateSelectedManifestLocked()) {
+      return poisonLocked(error);
+    }
+    if (generation == std::numeric_limits<uint64_t>::max()) {
+      return poisonLocked(-EOVERFLOW);
+    }
+    ProfileLogV4Descriptor next;
+    if (int error = writeGenerationLocked(generation + 1, data, size, &next)) {
+      return poisonLocked(error);
+    }
+    generation = next.generation;
+    highWater = next.highWater;
+    selectedDescriptor = next;
+    hasSelectedDescriptor = true;
+    return 0;
+  }
+
+  int prepareOPFSProfileRetirement(bool checkResources) override {
+    int firstError = 0;
+    {
+      ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+      if (!operation) {
+        firstError = operation.getError();
+      } else {
+        std::lock_guard<std::recursive_mutex> lock(storeMutex);
+        if (int error = stopAfterUnacknowledgedProxyLocked()) {
+          return error;
+        }
+        firstError = closeAllFilesForRetirementLocked(!fatalError);
+        if (int error = stopAfterUnacknowledgedProxyLocked()) {
+          return error;
+        }
+        if (!firstError && fatalError) {
+          firstError = fatalError;
+        }
+      }
+    }
+    int inherited = OPFSBackend::prepareOPFSProfileRetirement(
+      checkResources && firstError == 0);
+    return firstError ? firstError : inherited;
+  }
+
+  bool abandonFailedInitialisation() {
+    if (initialisationAmbiguous || getOPFSProfilePriorCloseError()) {
+      {
+        std::lock_guard<std::recursive_mutex> lock(storeMutex);
+        abandonPhysicalFilesLocked();
+      }
+      profileLeaseState->closeDestructorProxying();
+      if (beginOPFSProfileDrain() == 0) {
+        bool leaseReleased = false;
+        (void)finishOPFSProfileDrain(false, &leaseReleased);
+        assert(!leaseReleased);
+      } else {
+        proxy.abandonScopedProfileWorker();
+      }
+      return false;
+    }
+    if (beginOPFSProfileDrain()) {
+      return false;
+    }
+    const int preparation = prepareOPFSProfileRetirement(true);
+    bool leaseReleased = false;
+    const int finish = finishOPFSProfileDrain(
+      preparation == 0, &leaseReleased);
+    if (!leaseReleased) {
+      return false;
+    }
+    const int retirement = retireOPFSProfileBackend(
+      preparation == 0 && finish == 0);
+    return preparation == 0 && finish == 0 && retirement == 0;
+  }
+};
+
 } // anonymous namespace
 
 extern "C" {
@@ -6315,6 +7594,62 @@ backend_t wasmfs_create_opfs_profile_log_v3_data_backend(
 #endif
 }
 
+backend_t wasmfs_create_opfs_profile_log_v4_manifest_backend(
+  const char* profile_name) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
+  if (!IsValidProfileLeaseName(profile_name)) {
+    errno = EINVAL;
+    return NullBackend;
+  }
+
+#ifndef __EMSCRIPTEN_PTHREADS__
+  // V4's fixed physical files and profile lease must stay in one dedicated
+  // worker for their full lifetime. Main-thread Asyncify/JSPI does not provide
+  // that ownership boundary.
+  errno = ENOTSUP;
+  return NullBackend;
+#else
+  if (!wasmFS.reserveTerminalLeaseOwner()) {
+    errno = EBUSY;
+    return NullBackend;
+  }
+  assert(!emscripten_is_main_browser_thread() &&
+         "Cannot safely create leased OPFS backend on main browser thread");
+
+  auto backend = std::make_unique<ProfileLogV4ManifestBackend>();
+  bool acquireProxyCompleted = false;
+  int error = backend->acquireProfileLease(
+    profile_name, &acquireProxyCompleted);
+  if (error) {
+    assert(error < 0);
+    if (acquireProxyCompleted) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+      backend->abandonUnacknowledgedProfileLeaseAcquire();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  error = backend->initialise(profile_name);
+  if (error) {
+    assert(error < 0);
+    if (backend->abandonFailedInitialisation()) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  return wasmFS.addBackend(std::move(backend));
+#endif
+}
+
 int wasmfs_opfs_profile_log_v2_read_root(backend_t backend,
                                          uint64_t* value) {
   WasmFS::Operation operation(wasmFS);
@@ -6345,6 +7680,41 @@ int wasmfs_opfs_profile_log_v2_commit_root(backend_t backend,
     return error;
   }
   return internal->commitOPFSProfileLogV2Root(value);
+}
+
+int wasmfs_opfs_profile_log_v4_read_manifest(backend_t backend,
+                                             uint8_t* buffer,
+                                             size_t capacity,
+                                             size_t* size) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    return -operation.getError();
+  }
+  auto internal = reinterpret_cast<wasmfs::backend_t>(backend);
+  if (!size || !wasmFS.ownsBackend(internal)) {
+    return -EINVAL;
+  }
+  if (int error = operation.admitBackend(internal)) {
+    return error;
+  }
+  return internal->readOPFSProfileLogV4Manifest(buffer, capacity, size);
+}
+
+int wasmfs_opfs_profile_log_v4_commit_manifest(backend_t backend,
+                                               const uint8_t* data,
+                                               size_t size) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    return -operation.getError();
+  }
+  auto internal = reinterpret_cast<wasmfs::backend_t>(backend);
+  if (!wasmFS.ownsBackend(internal)) {
+    return -EINVAL;
+  }
+  if (int error = operation.admitBackend(internal)) {
+    return error;
+  }
+  return internal->commitOPFSProfileLogV4Manifest(data, size);
 }
 
 void EMSCRIPTEN_KEEPALIVE _wasmfs_opfs_record_entry(

@@ -1921,6 +1921,25 @@ var WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR = 0;
 
+// Test-only selectors for the deliberately non-mountable V4 manifest-store
+// foundation. The interruption hook pauses after bootstrap witness zero or
+// either flushed CLEAN phase witness. The corruption selector discards a
+// selected phase (1) or descriptor (2), or corrupts the selected manifest
+// header (3) or payload stream (4) after native reads. They control code
+// emitted at link time only and expose no host JavaScript OPFS access.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT = 0;
+
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION = 0;
+
+// Test-only selector that faults live V4 integrity revalidation after a
+// factory has accepted its on-disk state: phase quorum (1) or bootstrap
+// quorum (2). It is compiled into a system-library variation and never
+// mutates OPFS or exposes a host JavaScript route.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION = 0;
+
 // Test-only selector that makes the first OPFS SyncAccessHandle close fail.
 // This controls code emitted at link time only; it intentionally provides no
 // runtime configuration or recovery API.

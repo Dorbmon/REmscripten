@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <emscripten/wasmfs_terminal_drain.h>
@@ -195,6 +196,39 @@ int wasmfs_opfs_profile_log_v2_read_root(backend_t backend,
                                          uint64_t* _Nonnull value);
 int wasmfs_opfs_profile_log_v2_commit_root(backend_t backend,
                                            uint64_t value);
+
+// Creates the experimental V4 manifest-store primitive. It is deliberately
+// not a mountable filesystem backend. V4 uses four fixed OPFS files (a
+// duplicated bootstrap, selector control, and two append-only arenas) to
+// commit a variable-length immutable manifest. Each selected descriptor
+// records both arena high-water marks, and two clean phase witnesses publish
+// it only after the manifest is flushed. A fresh factory selects the old
+// manifest for a valid g/g+1 witness split and safely leaves that split for a
+// later retry of the unselected generation. Malformed bootstrap or selected
+// control, descriptor, or manifest state fails the factory.
+//
+// This is the control/data-plane foundation for a future logical-inode profile
+// filesystem, not evidence of directory, metadata, record-lock, database, or
+// Chrome-profile semantics. It has the same pthread-only leased-OPFS and
+// explicit-drain requirements as the V2/V3 experiments. On failure it returns
+// NULL and sets errno.
+backend_t wasmfs_create_opfs_profile_log_v4_manifest_backend(
+  const char* profile_name);
+
+// Read or replace the selected V4 manifest. A NULL `buffer` with zero
+// `capacity` queries the exact manifest size through `size`. Supplying a
+// non-NULL buffer smaller than the selected size returns -ENOBUFS and still
+// writes the required size. The input and output bytes are opaque to this
+// primitive; the future filesystem will encode its root/inode/extent manifest
+// there. Owned non-V4 backends return -ENOTSUP; invalid or unowned handles
+// return -EINVAL.
+int wasmfs_opfs_profile_log_v4_read_manifest(backend_t backend,
+                                             uint8_t* buffer,
+                                             size_t capacity,
+                                             size_t* size);
+int wasmfs_opfs_profile_log_v4_commit_manifest(backend_t backend,
+                                               const uint8_t* data,
+                                               size_t size);
 
 // Creates the experimental V3 fixed-file payload projection. This is
 // deliberately not a mountable filesystem backend: it creates no directories

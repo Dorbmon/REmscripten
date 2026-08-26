@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <errno.h>
 
@@ -120,6 +121,21 @@ public:
     return -ENOTSUP;
   }
   virtual int commitOPFSProfileLogV2Root(uint64_t value) {
+    return -ENOTSUP;
+  }
+
+  // Experimental V4 manifest-store interface. This is deliberately narrower
+  // than a filesystem: it proves the variable-length immutable manifest and
+  // selector protocol that a later logical-inode backend will use. Keeping
+  // the dispatch here lets its C ABI validate an opaque backend pointer
+  // through WasmFS before it reaches the profile-specific implementation.
+  // Non-V4 backends reject both calls explicitly.
+  virtual int readOPFSProfileLogV4Manifest(uint8_t*,
+                                           size_t,
+                                           size_t*) {
+    return -ENOTSUP;
+  }
+  virtual int commitOPFSProfileLogV4Manifest(const uint8_t*, size_t) {
     return -ENOTSUP;
   }
 

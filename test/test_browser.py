@@ -8099,6 +8099,343 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_manifest(self):
+    # V4 remains a non-mountable opaque-manifest control primitive. These
+    # fresh-iframe tests use >128 KiB deterministic blobs, including embedded
+    # test root/high-water fields, to prove normal persistence; old selection
+    # before the mirrored phase witness; new selection after it; and a later
+    # mutation after each recovered state. A real first-bootstrap interruption
+    # and post-native-read selected-record fault variants fail factory creation
+    # closed. Live phase/bootstrap validation faults also poison an open
+    # primitive before a subsequent commit. They do not claim a filesystem,
+    # directory, database, physical crash, power-loss, or Chromium-profile
+    # recovery proof.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_manifest.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    normal_profile = f'wasmfs_profile_log_v4_normal_{random.getrandbits(64):016x}'
+    before_profile = f'wasmfs_profile_log_v4_before_{random.getrandbits(64):016x}'
+    after_profile = f'wasmfs_profile_log_v4_after_{random.getrandbits(64):016x}'
+    bootstrap_profile = f'wasmfs_profile_log_v4_bootstrap_{random.getrandbits(64):016x}'
+    corrupt_profile = f'wasmfs_profile_log_v4_corrupt_{random.getrandbits(64):016x}'
+    live_profile = f'wasmfs_profile_log_v4_live_{random.getrandbits(64):016x}'
+
+    def profile_arg(profile):
+      return '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_PROFILE_NAME=' + profile
+
+    def compile_role(output, profile, role_args, extra_args=None):
+      self.compile_btest(
+        test,
+        common_args + [profile_arg(profile)] + role_args +
+          (extra_args or []) + ['-o', output],
+        reporting=Reporting.NONE)
+
+    compile_role('v4-normal-owner.html', normal_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_OWNER'])
+    compile_role('v4-normal-mutator.html', normal_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_MUTATOR'])
+    compile_role('v4-normal-verifier.html', normal_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=1',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_POST_RECOVERY_MUTATION'])
+    compile_role('v4-normal-post-verifier.html', normal_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=2'])
+
+    compile_role('v4-before-owner.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_OWNER'])
+    compile_role('v4-before-interruptor.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPTOR',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT_PHASE=1'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1'])
+    compile_role('v4-before-recovery-verifier.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=0'])
+    compile_role('v4-before-verifier.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=0',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_POST_RECOVERY_MUTATION'])
+    compile_role('v4-before-post-verifier.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=2'])
+
+    compile_role('v4-after-owner.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_OWNER'])
+    compile_role('v4-after-interruptor.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPTOR',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT_PHASE=2'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1'])
+    compile_role('v4-after-recovery-verifier.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=1'])
+    compile_role('v4-after-verifier.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=1',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_POST_RECOVERY_MUTATION'])
+    compile_role('v4-after-post-verifier.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=2'])
+
+    compile_role('v4-bootstrap-owner.html', bootstrap_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_OWNER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT_PHASE=0'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1'])
+    compile_role('v4-bootstrap-corruptor.html', bootstrap_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_CORRUPTOR'])
+
+    compile_role('v4-corrupt-owner.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_OWNER'])
+    compile_role('v4-corrupt-mutator.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_MUTATOR'])
+    for selector, name in ((1, 'phase'), (2, 'descriptor'),
+                           (3, 'header'), (4, 'payload')):
+      compile_role(f'v4-corrupt-{name}.html', corrupt_profile,
+                   ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_CORRUPTOR'],
+                   ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION=' +
+                    str(selector)])
+    compile_role('v4-corrupt-verifier.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=1'])
+
+    compile_role('v4-live-owner.html', live_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_OWNER'])
+    compile_role('v4-live-mutator.html', live_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_MUTATOR'])
+    for selector, name in ((1, 'phase'), (2, 'bootstrap')):
+      compile_role(f'v4-live-{name}.html', live_profile,
+                   ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTOR'],
+                   ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION=' +
+                    str(selector)])
+    compile_role('v4-live-verifier.html', live_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EXPECTED_MANIFEST=1'])
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kOwner = 0;
+        const kMutator = 1;
+        const kVerifier = 2;
+        const kInterruptor = 3;
+        const kCorruptor = 4;
+        const kLiveCorruptor = 5;
+        const kReady = 0;
+        const kCorruptionRejected = 1;
+        const kBusy = 16;
+        const kWitnessType = 'wasmfs-opfs-profile-log-v4-manifest';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, predicate, description) {
+          const index = module.events.findIndex(predicate);
+          if (index >= 0) {
+            return Promise.resolve(module.events.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const waiter = module.waiters.findIndex(
+                (candidate) => candidate.resolve === resolve);
+              if (waiter >= 0) {
+                module.waiters.splice(waiter, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({predicate, resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          const waiter = module.waiters.findIndex(
+            (candidate) => candidate.predicate(event.data));
+          if (waiter >= 0) {
+            const candidate = module.waiters.splice(waiter, 1)[0];
+            clearTimeout(candidate.timeout);
+            candidate.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runResult(path, role, description) {
+          const module = launchModule(path);
+          try {
+            const message = await waitFor(
+              module, (event) => event.event === 'result', description);
+            if (message.role !== role || message.result !== kReady ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error);
+            }
+          } finally {
+            disposeModule(module);
+          }
+        }
+
+        async function runAfterLeaseRelease(path, role, result, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(
+                module, (event) => event.event === 'result', description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.result !== result ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function runVerifierAfterRelease(path, description) {
+          await runAfterLeaseRelease(path, kVerifier, kReady, description);
+        }
+
+        async function runInterruptedScenario(owner, interruptor,
+                                               recoveryVerifier, verifier,
+                                               postVerifier, phase,
+                                               description) {
+          await runResult(owner, kOwner, description + ' owner');
+          const module = launchModule(interruptor);
+          try {
+            const interruption = await waitFor(
+              module,
+              (event) => event.event === 'interrupt' && event.phase === phase,
+              description + ' interruption');
+            if (interruption.phase !== phase) {
+              throw new Error(description + ' reported wrong witness');
+            }
+          } finally {
+            // This controlled fresh-document disposal is the interruption;
+            // the parent neither reads nor writes OPFS.
+            disposeModule(module);
+          }
+          await runVerifierAfterRelease(
+            recoveryVerifier,
+            description + ' fresh selection before retry mutation');
+          await runVerifierAfterRelease(verifier,
+                                        description + ' recovery mutation');
+          await runVerifierAfterRelease(postVerifier,
+                                        description + ' fresh post mutation');
+        }
+
+        async function runBootstrapInterruption(owner, corruptor) {
+          const module = launchModule(owner);
+          try {
+            const interruption = await waitFor(
+              module,
+              (event) => event.event === 'interrupt' && event.phase === 0,
+              'partial bootstrap interruption');
+            if (interruption.phase !== 0) {
+              throw new Error('partial bootstrap reported wrong witness');
+            }
+          } finally {
+            // The only partial physical state comes from the V4 factory;
+            // this page neither reads nor writes OPFS.
+            disposeModule(module);
+          }
+          await runAfterLeaseRelease(
+            corruptor, kCorruptor, kCorruptionRejected,
+            'partial bootstrap factory rejection');
+        }
+
+        (async () => {
+          await runResult('v4-normal-owner.html', kOwner, 'normal owner');
+          await runResult('v4-normal-mutator.html', kMutator,
+                          'normal 192 KiB manifest update');
+          await runVerifierAfterRelease('v4-normal-verifier.html',
+                                        'normal fresh verifier and mutation');
+          await runVerifierAfterRelease('v4-normal-post-verifier.html',
+                                        'normal fresh post mutation');
+          await runInterruptedScenario(
+            'v4-before-owner.html', 'v4-before-interruptor.html',
+            'v4-before-recovery-verifier.html', 'v4-before-verifier.html',
+            'v4-before-post-verifier.html', 1,
+            'old manifest before mirrored witness');
+          await runInterruptedScenario(
+            'v4-after-owner.html', 'v4-after-interruptor.html',
+            'v4-after-recovery-verifier.html', 'v4-after-verifier.html',
+            'v4-after-post-verifier.html', 2,
+            'new manifest after mirrored witness');
+          await runBootstrapInterruption(
+            'v4-bootstrap-owner.html', 'v4-bootstrap-corruptor.html');
+          await runResult('v4-corrupt-owner.html', kOwner,
+                          'selected-record owner');
+          await runResult('v4-corrupt-mutator.html', kMutator,
+                          'selected-record update');
+          for (const name of ['phase', 'descriptor', 'header', 'payload']) {
+            await runAfterLeaseRelease(
+              'v4-corrupt-' + name + '.html', kCorruptor,
+              kCorruptionRejected,
+              'selected ' + name + ' corruption rejection');
+          }
+          await runVerifierAfterRelease(
+            'v4-corrupt-verifier.html',
+            'normal verifier after selected corruption tests');
+          await runResult('v4-live-owner.html', kOwner,
+                          'live-record owner');
+          await runResult('v4-live-mutator.html', kMutator,
+                          'live-record update');
+          for (const name of ['phase', 'bootstrap']) {
+            await runAfterLeaseRelease(
+              'v4-live-' + name + '.html', kLiveCorruptor,
+              kCorruptionRejected,
+              'live ' + name + ' corruption rejection and poison');
+          }
+          await runVerifierAfterRelease(
+            'v4-live-verifier.html',
+            'normal verifier after live corruption tests');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=240)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v2_proxy_completion_failure(self):
     # A test-only terminal latch after a successfully flushed inactive V2 root
     # must make the explicit failed drain issue no later Worker proxy. It
