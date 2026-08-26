@@ -1940,6 +1940,13 @@ var WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION = 0;
 
+// Test-only selector that publishes a selected outer V4 generation 2 with an
+// empty logical filesystem payload after root creation. It proves reload
+// rejects a corrupt post-root empty manifest instead of replacing the root.
+// This controls code emitted at link time only and exposes no runtime API.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST = 0;
+
 // Test-only selector that makes the first OPFS SyncAccessHandle close fail.
 // This controls code emitted at link time only; it intentionally provides no
 // runtime configuration or recovery API.

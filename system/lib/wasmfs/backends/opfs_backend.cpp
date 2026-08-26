@@ -20,6 +20,7 @@
 #include <optional>
 #include <stdlib.h>
 
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -6058,6 +6059,14 @@ constexpr size_t kProfileLogV4TransferSize = 16 * 1024;
 constexpr uint64_t kProfileLogV4MaxSafeOffset = UINT64_C(9007199254740991);
 constexpr uint32_t kProfileLogV4FormatVersion = 4;
 constexpr uint32_t kProfileLogV4BootstrapReady = 1;
+// The mountable filesystem uses a durable PREPARED bootstrap witness before
+// it creates the remaining fixed physical files. The opaque V4 experiment
+// retains its original READY-only bootstrap protocol for compatibility with
+// its deliberately fail-closed recovery boundary.
+constexpr uint32_t kProfileLogV4BootstrapPrepared = 2;
+constexpr uint64_t kProfileLogV4BootstrapPreparedGeneration = 1;
+constexpr uint64_t kProfileLogV4BootstrapReadyFirstGeneration = 2;
+constexpr uint64_t kProfileLogV4BootstrapReadySecondGeneration = 3;
 constexpr uint32_t kProfileLogV4PhaseClean = 1;
 constexpr uint32_t kProfileLogV4LayoutEpoch = 1;
 constexpr std::array<uint8_t, 8> kProfileLogV4BootstrapMagic = {
@@ -6081,6 +6090,10 @@ constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
 #define WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION 0
 #endif
 
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST 0
+#endif
+
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT < 0 || \
   WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT > 1
 #error "invalid profile-log V4 interruption selector"
@@ -6094,6 +6107,11 @@ constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION < 0 || \
   WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION > 2
 #error "invalid profile-log V4 live corruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST > 1
+#error "invalid profile-log V4 empty post-root manifest selector"
 #endif
 
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
@@ -6209,6 +6227,25 @@ struct ProfileLogV4Phase {
   uint64_t descriptorChecksum;
 };
 
+enum class ProfileLogV4BootstrapState : uint32_t {
+  Ready = kProfileLogV4BootstrapReady,
+  Prepared = kProfileLogV4BootstrapPrepared,
+};
+
+struct ProfileLogV4BootstrapRecord {
+  ProfileLogV4BootstrapState state;
+  uint64_t generation;
+  bool legacy;
+};
+
+enum class ProfileLogV4BootstrapDisposition {
+  Established,
+  Prepared,
+  InitialGeneration,
+  Empty,
+  Invalid,
+};
+
 struct ProfileLogV4ManifestHeader {
   uint64_t generation;
   uint64_t size;
@@ -6313,9 +6350,34 @@ protected:
   // payload, including V4's initial zero-length manifest, can never be
   // reinterpreted as a mounted profile.
   std::string storageTag;
+  // Only the mountable filesystem has an explicit pre-exposure reset
+  // protocol. Keep the original opaque manifest primitive fail-closed on a
+  // partial first bootstrap so its narrow experiment retains its published
+  // recovery contract.
+  bool recoverInitialBootstrap = false;
   std::string bootstrapName;
   std::string controlName;
   std::array<std::string, 2> arenaNames;
+
+  int removeRecoverableBootstrapPhysicalFileLocked(const std::string& name) {
+    if (int error = admitBootstrapDirectoryOperationLocked()) {
+      return error;
+    }
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    // _wasmfs_opfs_remove_child leaves its out parameter untouched on
+    // success, so success must start at zero rather than an error sentinel.
+    int error = 0;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_remove_child(
+            ctx.ctx, kOPFSRootDirectoryID, name.c_str(), &error);
+        })) {
+      return recordInitialisationProxyFailure();
+    }
+    return error;
+  }
 
   std::string storageStem(std::string_view profileName) const {
     std::string result = ".wasmfs-profile-log-v4";
@@ -6643,7 +6705,9 @@ protected:
     return readBytesLocked(file, offset, record->data(), record->size());
   }
 
-  std::array<uint8_t, kProfileLogV4RecordSize> makeBootstrapRecord() const {
+  std::array<uint8_t, kProfileLogV4RecordSize> makeBootstrapRecord(
+    ProfileLogV4BootstrapState state = ProfileLogV4BootstrapState::Ready,
+    uint64_t bootstrapGeneration = 0) const {
     std::array<uint8_t, kProfileLogV4RecordSize> record = {};
     std::copy(kProfileLogV4BootstrapMagic.begin(),
               kProfileLogV4BootstrapMagic.end(),
@@ -6653,28 +6717,120 @@ protected:
     writeProfileLogV4U64(record, 16, profileChecksum);
     writeProfileLogV4U32(record, 24, profileLength);
     writeProfileLogV4U32(record, 28, arenas.size());
-    writeProfileLogV4U32(record, 32, kProfileLogV4BootstrapReady);
+    writeProfileLogV4U32(record, 32, static_cast<uint32_t>(state));
     writeProfileLogV4U32(record, 36, kProfileLogV4LayoutEpoch);
+    writeProfileLogV4U64(record, 48, bootstrapGeneration);
     writeProfileLogV4U64(
       record, 40, profileLogV4ChecksumWithZeroedRange(record, 40, 8));
     return record;
   }
 
-  bool parseBootstrapRecord(
+  std::optional<ProfileLogV4BootstrapRecord> parseBootstrapRecord(
     const std::array<uint8_t, kProfileLogV4RecordSize>& record) const {
-    return std::equal(kProfileLogV4BootstrapMagic.begin(),
-                      kProfileLogV4BootstrapMagic.end(),
-                      record.begin()) &&
-           readProfileLogV4U32(record, 8) == kProfileLogV4FormatVersion &&
-           readProfileLogV4U32(record, 12) == kProfileLogV4RecordSize &&
-           readProfileLogV4U64(record, 16) == profileChecksum &&
-           readProfileLogV4U32(record, 24) == profileLength &&
-           readProfileLogV4U32(record, 28) == arenas.size() &&
-           readProfileLogV4U32(record, 32) == kProfileLogV4BootstrapReady &&
-           readProfileLogV4U32(record, 36) == kProfileLogV4LayoutEpoch &&
-           readProfileLogV4U64(record, 40) ==
-             profileLogV4ChecksumWithZeroedRange(record, 40, 8) &&
-           profileLogV4HasZeroTail(record, 48);
+    if (!std::equal(kProfileLogV4BootstrapMagic.begin(),
+                    kProfileLogV4BootstrapMagic.end(),
+                    record.begin()) ||
+        readProfileLogV4U32(record, 8) != kProfileLogV4FormatVersion ||
+        readProfileLogV4U32(record, 12) != kProfileLogV4RecordSize ||
+        readProfileLogV4U64(record, 16) != profileChecksum ||
+        readProfileLogV4U32(record, 24) != profileLength ||
+        readProfileLogV4U32(record, 28) != arenas.size() ||
+        readProfileLogV4U32(record, 36) != kProfileLogV4LayoutEpoch ||
+        readProfileLogV4U64(record, 40) !=
+          profileLogV4ChecksumWithZeroedRange(record, 40, 8)) {
+      return std::nullopt;
+    }
+    const uint32_t rawState = readProfileLogV4U32(record, 32);
+    const uint64_t bootstrapGeneration = readProfileLogV4U64(record, 48);
+    if (!bootstrapGeneration) {
+      // The original V4 opaque-manifest experiment has a READY-only pair
+      // with a zero tail. Preserve it as an established legacy layout.
+      if (rawState != kProfileLogV4BootstrapReady ||
+          !profileLogV4HasZeroTail(record, 48)) {
+        return std::nullopt;
+      }
+      return ProfileLogV4BootstrapRecord{
+        ProfileLogV4BootstrapState::Ready, 0, true};
+    }
+    if (!profileLogV4HasZeroTail(record, 56)) {
+      return std::nullopt;
+    }
+    if (rawState == kProfileLogV4BootstrapPrepared &&
+        bootstrapGeneration == kProfileLogV4BootstrapPreparedGeneration) {
+      return ProfileLogV4BootstrapRecord{
+        ProfileLogV4BootstrapState::Prepared, bootstrapGeneration, false};
+    }
+    if (rawState == kProfileLogV4BootstrapReady &&
+        (bootstrapGeneration == kProfileLogV4BootstrapReadyFirstGeneration ||
+         bootstrapGeneration ==
+           kProfileLogV4BootstrapReadySecondGeneration)) {
+      return ProfileLogV4BootstrapRecord{
+        ProfileLogV4BootstrapState::Ready, bootstrapGeneration, false};
+    }
+    return std::nullopt;
+  }
+
+  ProfileLogV4BootstrapDisposition classifyBootstrapLocked(
+    bool liveValidation = false) {
+    std::array<uint8_t, kProfileLogV4RecordSize> first;
+    std::array<uint8_t, kProfileLogV4RecordSize> second;
+    if (readRecordLocked(bootstrap, 0, &first)) {
+      return ProfileLogV4BootstrapDisposition::Invalid;
+    }
+    if (readRecordLocked(bootstrap, kProfileLogV4RecordSize, &second)) {
+      return ProfileLogV4BootstrapDisposition::Invalid;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION == 2
+    if (liveValidation) {
+      first[0] ^= 1;
+    }
+#else
+    (void)liveValidation;
+#endif
+    const auto firstRecord = parseBootstrapRecord(first);
+    const auto secondRecord = parseBootstrapRecord(second);
+    const bool firstEmpty = std::all_of(
+      first.begin(), first.end(), [](uint8_t value) { return value == 0; });
+    const bool secondEmpty = std::all_of(
+      second.begin(), second.end(), [](uint8_t value) { return value == 0; });
+    if (firstEmpty && secondEmpty) {
+      return ProfileLogV4BootstrapDisposition::Empty;
+    }
+    if (firstRecord && secondRecord && firstRecord->legacy &&
+        secondRecord->legacy && first == second) {
+      return ProfileLogV4BootstrapDisposition::Established;
+    }
+    if (firstRecord && secondRecord && !firstRecord->legacy &&
+        !secondRecord->legacy &&
+        firstRecord->state == ProfileLogV4BootstrapState::Prepared &&
+        firstRecord->generation ==
+          kProfileLogV4BootstrapPreparedGeneration &&
+        secondRecord->state == ProfileLogV4BootstrapState::Prepared &&
+        secondRecord->generation ==
+          kProfileLogV4BootstrapPreparedGeneration) {
+      return ProfileLogV4BootstrapDisposition::Prepared;
+    }
+    if (firstRecord && secondRecord && !firstRecord->legacy &&
+        !secondRecord->legacy &&
+        firstRecord->state == ProfileLogV4BootstrapState::Ready &&
+        firstRecord->generation ==
+          kProfileLogV4BootstrapReadyFirstGeneration &&
+        secondRecord->state == ProfileLogV4BootstrapState::Prepared &&
+        secondRecord->generation ==
+          kProfileLogV4BootstrapPreparedGeneration) {
+      return ProfileLogV4BootstrapDisposition::InitialGeneration;
+    }
+    if (firstRecord && secondRecord && !firstRecord->legacy &&
+        !secondRecord->legacy &&
+        firstRecord->state == ProfileLogV4BootstrapState::Ready &&
+        firstRecord->generation ==
+          kProfileLogV4BootstrapReadyFirstGeneration &&
+        secondRecord->state == ProfileLogV4BootstrapState::Ready &&
+        secondRecord->generation ==
+          kProfileLogV4BootstrapReadySecondGeneration) {
+      return ProfileLogV4BootstrapDisposition::Established;
+    }
+    return ProfileLogV4BootstrapDisposition::Invalid;
   }
 
   std::array<uint8_t, kProfileLogV4RecordSize> makeDescriptorRecord(
@@ -7059,29 +7215,206 @@ protected:
   }
 
   int verifyBootstrapLocked(bool liveValidation = false) {
-    std::array<uint8_t, kProfileLogV4RecordSize> first;
-    std::array<uint8_t, kProfileLogV4RecordSize> second;
-    if (int error = readRecordLocked(bootstrap, 0, &first)) {
-      return error;
-    }
-    if (int error = readRecordLocked(
-          bootstrap, kProfileLogV4RecordSize, &second)) {
-      return error;
-    }
-#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION == 2
-    if (liveValidation) {
-      first[0] ^= 1;
-    }
-#else
-    (void)liveValidation;
-#endif
-    return parseBootstrapRecord(first) && parseBootstrapRecord(second) &&
-           first == second
+    return classifyBootstrapLocked(liveValidation) ==
+             ProfileLogV4BootstrapDisposition::Established
              ? 0
              : -EIO;
   }
 
+  void resetInitialBootstrapFileStateLocked() {
+    bootstrap.reset();
+    control.reset();
+    arenas = {};
+    bootstrapOpen = false;
+    controlOpen = false;
+    arenasOpen = {};
+    generation = 0;
+    highWater = {};
+    selectedDescriptor = {};
+    hasSelectedDescriptor = false;
+  }
+
+  int closeInitialBootstrapInspectionLocked() {
+    if (int error = closeAllFilesForRetirementLocked(false)) {
+      return error;
+    }
+    resetInitialBootstrapFileStateLocked();
+    return 0;
+  }
+
+  int discardPreparedInitialBootstrapLocked() {
+    // Both PREPARED witnesses were made durable before any sibling could be
+    // created and before a caller could receive this backend. Keep that pair
+    // until the sibling names have gone, then delete bootstrap last. If the
+    // document stops during cleanup, the next fresh factory sees the same
+    // PREPARED authority and repeats this idempotent sequence.
+    if (int error = closeInitialBootstrapInspectionLocked()) {
+      return error;
+    }
+    const std::array<std::string, 4> names = {
+      arenaNames[0], arenaNames[1], controlName, bootstrapName};
+    for (size_t index = 0; index != names.size(); ++index) {
+      const std::string& name = names[index];
+      const int status = lookupPhysicalFileLocked(name);
+      if (status == -ENOENT) {
+        continue;
+      }
+      if (status) {
+        return status;
+      }
+      if (int error = removeRecoverableBootstrapPhysicalFileLocked(name)) {
+        return error;
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+      wasmfs_opfs_profile_log_v4_test_maybe_interrupt(
+        5 + static_cast<int>(index));
+#endif
+    }
+    return 0;
+  }
+
+  int openInitialGenerationLocked() {
+    // R1/P1 is recoverable only when the envelope proves that it is exactly
+    // the unexposed, empty g=1 filesystem state. A damaged established
+    // profile may never be reclassified as resettable just because one
+    // bootstrap record happens to parse.
+    bootstrap = makePhysicalFile(bootstrapName);
+    control = makePhysicalFile(controlName);
+    arenas[0] = makePhysicalFile(arenaNames[0]);
+    arenas[1] = makePhysicalFile(arenaNames[1]);
+    if (int error = openAllFilesLocked()) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(
+          bootstrap, kProfileLogV4BootstrapSize)) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(control, kProfileLogV4ControlSize)) {
+      return error;
+    }
+    if (int error = recoverControlLocked()) {
+      return error;
+    }
+    const std::array<uint64_t, 2> initialHighWater = {
+      0, kProfileLogV4ManifestHeaderSize};
+    if (generation != 1 || !hasSelectedDescriptor ||
+        selectedDescriptor.generation != 1 || selectedDescriptor.arena != 1 ||
+        selectedDescriptor.manifestOffset != 0 ||
+        selectedDescriptor.manifestSize != 0 ||
+        selectedDescriptor.highWater != initialHighWater) {
+      return -EIO;
+    }
+    for (size_t index = 0; index != arenas.size(); ++index) {
+      const off_t size = arenas[index]->locked().getSize();
+      if (size < 0) {
+        return size;
+      }
+      if (static_cast<uint64_t>(size) != initialHighWater[index]) {
+        return -EIO;
+      }
+    }
+    return 0;
+  }
+
+  int completeInitialBootstrapLocked() {
+    const auto secondReady = makeBootstrapRecord(
+      ProfileLogV4BootstrapState::Ready,
+      kProfileLogV4BootstrapReadySecondGeneration);
+    if (int error = writeRecordLocked(
+          bootstrap, kProfileLogV4RecordSize, secondReady)) {
+      return error;
+    }
+    return verifyBootstrapLocked();
+  }
+
   int initialiseFreshLocked() {
+    if (recoverInitialBootstrap) {
+      // The filesystem is the only V4 client with an explicit first-creation
+      // recovery protocol. Its mirrored PREPARED pair is durable before any
+      // sibling name exists and before this factory can return a mountable
+      // root. The opaque V4 manifest primitive keeps the legacy READY-only
+      // sequence below and remains deliberately fail-closed on interruption.
+      if (int error = insertPhysicalFileLocked(bootstrapName)) {
+        return error;
+      }
+      bootstrap = makePhysicalFile(bootstrapName);
+      if (int error = openFileLocked(bootstrap, &bootstrapOpen)) {
+        return error;
+      }
+      if (int error = setFixedSizeLocked(
+            bootstrap, kProfileLogV4BootstrapSize)) {
+        return error;
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+      wasmfs_opfs_profile_log_v4_test_maybe_interrupt(-2);
+#endif
+      const auto prepared = makeBootstrapRecord(
+        ProfileLogV4BootstrapState::Prepared,
+        kProfileLogV4BootstrapPreparedGeneration);
+      if (int error = writeRecordLocked(bootstrap, 0, prepared)) {
+        return error;
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+      wasmfs_opfs_profile_log_v4_test_maybe_interrupt(-1);
+#endif
+      if (int error = writeRecordLocked(
+            bootstrap, kProfileLogV4RecordSize, prepared)) {
+        return error;
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+      wasmfs_opfs_profile_log_v4_test_maybe_interrupt(0);
+#endif
+
+      for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
+        if (int error = insertPhysicalFileLocked(name)) {
+          return error;
+        }
+      }
+      control = makePhysicalFile(controlName);
+      arenas[0] = makePhysicalFile(arenaNames[0]);
+      arenas[1] = makePhysicalFile(arenaNames[1]);
+      if (int error = openFileLocked(control, &controlOpen)) {
+        return error;
+      }
+      if (int error = openFileLocked(arenas[0], &arenasOpen[0])) {
+        return error;
+      }
+      if (int error = openFileLocked(arenas[1], &arenasOpen[1])) {
+        return error;
+      }
+      if (int error = setFixedSizeLocked(control, kProfileLogV4ControlSize)) {
+        return error;
+      }
+      ProfileLogV4Descriptor initial;
+      if (int error = writeGenerationLocked(1, nullptr, 0, &initial)) {
+        return error;
+      }
+      const auto firstReady = makeBootstrapRecord(
+        ProfileLogV4BootstrapState::Ready,
+        kProfileLogV4BootstrapReadyFirstGeneration);
+      if (int error = writeRecordLocked(bootstrap, 0, firstReady)) {
+        return error;
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+      wasmfs_opfs_profile_log_v4_test_maybe_interrupt(3);
+#endif
+      const auto secondReady = makeBootstrapRecord(
+        ProfileLogV4BootstrapState::Ready,
+        kProfileLogV4BootstrapReadySecondGeneration);
+      if (int error = writeRecordLocked(
+            bootstrap, kProfileLogV4RecordSize, secondReady)) {
+        return error;
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+      wasmfs_opfs_profile_log_v4_test_maybe_interrupt(4);
+#endif
+      generation = initial.generation;
+      highWater = initial.highWater;
+      selectedDescriptor = initial;
+      hasSelectedDescriptor = true;
+      return 0;
+    }
+
     for (const auto& name : {arenaNames[0], arenaNames[1], controlName,
                              bootstrapName}) {
       if (int error = insertPhysicalFileLocked(name)) {
@@ -7212,8 +7545,10 @@ protected:
   }
 
 protected:
-  explicit ProfileLogV4Store(std::string storageTag = {})
-    : storageTag(std::move(storageTag)) {}
+  explicit ProfileLogV4Store(std::string storageTag = {},
+                             bool recoverInitialBootstrap = false)
+    : storageTag(std::move(storageTag)),
+      recoverInitialBootstrap(recoverInitialBootstrap) {}
 
   int readManifest(uint8_t* buffer,
                    size_t capacity,
@@ -7403,7 +7738,59 @@ public:
       return error;
     }
     const int bootstrapStatus = lookupPhysicalFileLocked(bootstrapName);
-    if (bootstrapStatus == -ENOENT) {
+    if (recoverInitialBootstrap && bootstrapStatus == 0) {
+      // Inspect first while bootstrap is the only opened handle. Do not infer
+      // recoverability from a missing name, an empty file, or a malformed
+      // record: only the exact mirrored PREPARED pair, or R1/P1 with a fully
+      // verified empty g=1 envelope, receives special treatment.
+      bootstrap = makePhysicalFile(bootstrapName);
+      if (int error = openFileLocked(bootstrap, &bootstrapOpen)) {
+        return error;
+      }
+      if (int error = requireFixedSizeLocked(
+            bootstrap, kProfileLogV4BootstrapSize)) {
+        return error;
+      }
+      const auto disposition = classifyBootstrapLocked();
+      if (disposition == ProfileLogV4BootstrapDisposition::Prepared) {
+        if (int error = discardPreparedInitialBootstrapLocked()) {
+          return error;
+        }
+        if (int error = initialiseFreshLocked()) {
+          return error;
+        }
+      } else if (disposition ==
+                 ProfileLogV4BootstrapDisposition::InitialGeneration) {
+        for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
+          if (int status = lookupPhysicalFileLocked(name)) {
+            return status == -ENOENT ? -EIO : status;
+          }
+        }
+        if (int error = closeInitialBootstrapInspectionLocked()) {
+          return error;
+        }
+        if (int error = openInitialGenerationLocked()) {
+          return error;
+        }
+        if (int error = completeInitialBootstrapLocked()) {
+          return error;
+        }
+      } else if (disposition == ProfileLogV4BootstrapDisposition::Established) {
+        for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
+          if (int status = lookupPhysicalFileLocked(name)) {
+            return status == -ENOENT ? -EIO : status;
+          }
+        }
+        if (int error = closeInitialBootstrapInspectionLocked()) {
+          return error;
+        }
+        if (int error = openEstablishedLocked()) {
+          return error;
+        }
+      } else {
+        return -EIO;
+      }
+    } else if (bootstrapStatus == -ENOENT) {
       for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
         if (int status = lookupPhysicalFileLocked(name); status != -ENOENT) {
           return status == 0 ? -EIO : status;
@@ -7503,6 +7890,2284 @@ public:
     return commitManifest(data, size);
   }
 };
+
+// The mountable V4 filesystem has a distinct physical stem from the opaque
+// manifest experiment above. Its logical state is one strictly validated
+// inode manifest, while regular-file data lives in immutable copy-on-write
+// chunk records appended through ProfileLogV4Store::Transaction.
+constexpr uint32_t kProfileLogV4FilesystemSchema = 1;
+constexpr uint32_t kProfileLogV4FilesystemChunkShift = 16;
+constexpr size_t kProfileLogV4FilesystemChunkSize =
+  size_t(1) << kProfileLogV4FilesystemChunkShift;
+constexpr size_t kProfileLogV4FilesystemHeaderSize = 128;
+constexpr size_t kProfileLogV4FilesystemInodeSize = 112;
+constexpr size_t kProfileLogV4FilesystemDirectoryEntrySize = 40;
+constexpr size_t kProfileLogV4FilesystemExtentSize = 48;
+constexpr size_t kProfileLogV4FilesystemDataHeaderSize = 96;
+constexpr size_t kProfileLogV4FilesystemNameMax = 255;
+constexpr std::array<uint8_t, 8> kProfileLogV4FilesystemMagic = {
+  'W', 'F', 'S', 'V', '4', 'F', 'S', '1'};
+constexpr std::array<uint8_t, 8> kProfileLogV4FilesystemDataMagic = {
+  'W', 'F', 'S', 'V', '4', 'D', 'A', '1'};
+
+enum class ProfileLogV4FilesystemInodeKind : uint32_t {
+  Regular = 1,
+  Directory = 2,
+  Symlink = 3,
+};
+
+struct ProfileLogV4FilesystemExtent {
+  uint64_t chunk = 0;
+  uint32_t arena = 0;
+  uint32_t payloadSize = 0;
+  uint64_t offset = 0;
+  uint64_t checksum = 0;
+};
+
+struct ProfileLogV4FilesystemInode {
+  uint64_t id = 0;
+  ProfileLogV4FilesystemInodeKind kind =
+    ProfileLogV4FilesystemInodeKind::Regular;
+  File::Metadata metadata = {};
+  uint64_t size = 0;
+  std::map<std::string, uint64_t> entries;
+  std::map<uint64_t, ProfileLogV4FilesystemExtent> extents;
+  std::string target;
+  // This is runtime-only state for a file retained by an open descriptor
+  // after unlink. It is deliberately not serialized, so a fresh profile
+  // cannot resurrect a deleted path even if that descriptor later mutates it.
+  std::map<uint64_t, std::vector<uint8_t>> volatileChunks;
+};
+
+struct ProfileLogV4FilesystemState {
+  uint64_t generation = 0;
+  uint64_t root = 0;
+  uint64_t nextInode = 1;
+  std::map<uint64_t, ProfileLogV4FilesystemInode> inodes;
+};
+
+bool profileLogV4FilesystemCheckedAdd(size_t lhs, size_t rhs, size_t* result) {
+  if (!result || lhs > std::numeric_limits<size_t>::max() - rhs) {
+    return false;
+  }
+  *result = lhs + rhs;
+  return true;
+}
+
+bool profileLogV4FilesystemCheckedMultiply(size_t lhs,
+                                           size_t rhs,
+                                           size_t* result) {
+  if (!result || (lhs && rhs > std::numeric_limits<size_t>::max() / lhs)) {
+    return false;
+  }
+  *result = lhs * rhs;
+  return true;
+}
+
+bool profileLogV4FilesystemRange(size_t size,
+                                 uint64_t offset,
+                                 uint64_t length,
+                                 size_t* resultOffset = nullptr,
+                                 size_t* resultLength = nullptr) {
+  if (offset > size || length > size - offset ||
+      offset > std::numeric_limits<size_t>::max() ||
+      length > std::numeric_limits<size_t>::max()) {
+    return false;
+  }
+  if (resultOffset) {
+    *resultOffset = static_cast<size_t>(offset);
+  }
+  if (resultLength) {
+    *resultLength = static_cast<size_t>(length);
+  }
+  return true;
+}
+
+void profileLogV4FilesystemWriteU32(std::vector<uint8_t>& data,
+                                    size_t offset,
+                                    uint32_t value) {
+  assert(offset <= data.size() && sizeof(value) <= data.size() - offset);
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+void profileLogV4FilesystemWriteU64(std::vector<uint8_t>& data,
+                                    size_t offset,
+                                    uint64_t value) {
+  assert(offset <= data.size() && sizeof(value) <= data.size() - offset);
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+bool profileLogV4FilesystemReadU32(const uint8_t* data,
+                                   size_t size,
+                                   size_t offset,
+                                   uint32_t* value) {
+  if (!data || !value || offset > size || sizeof(*value) > size - offset) {
+    return false;
+  }
+  *value = 0;
+  for (size_t i = 0; i != sizeof(*value); ++i) {
+    *value |= uint32_t(data[offset + i]) << (8 * i);
+  }
+  return true;
+}
+
+bool profileLogV4FilesystemReadU64(const uint8_t* data,
+                                   size_t size,
+                                   size_t offset,
+                                   uint64_t* value) {
+  if (!data || !value || offset > size || sizeof(*value) > size - offset) {
+    return false;
+  }
+  *value = 0;
+  for (size_t i = 0; i != sizeof(*value); ++i) {
+    *value |= uint64_t(data[offset + i]) << (8 * i);
+  }
+  return true;
+}
+
+uint64_t profileLogV4FilesystemDoubleBits(double value) {
+  uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value));
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+double profileLogV4FilesystemDoubleFromBits(uint64_t bits) {
+  double value = 0;
+  static_assert(sizeof(bits) == sizeof(value));
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+bool profileLogV4FilesystemValidName(const std::string& name) {
+  return !name.empty() && name != "." && name != ".." &&
+         name.size() <= kProfileLogV4FilesystemNameMax &&
+         name.find('/') == std::string::npos &&
+         name.find('\0') == std::string::npos;
+}
+
+class ProfileLogV4FilesystemBackend;
+class ProfileLogV4FilesystemDataFile;
+class ProfileLogV4FilesystemDirectory;
+class ProfileLogV4FilesystemSymlink;
+
+class ProfileLogV4FilesystemBackend final : public ProfileLogV4Store {
+  struct PendingChunk {
+    uint64_t inode = 0;
+    uint64_t chunk = 0;
+    std::vector<uint8_t> bytes;
+  };
+
+  std::recursive_mutex filesystemMutex;
+  ProfileLogV4FilesystemState state;
+  std::map<uint64_t, ProfileLogV4FilesystemInode> orphans;
+  // Linked children use WasmFS's ordinary dcache for object identity. An
+  // unlinked object is retained only while an fd, CWD, or syscall-local
+  // shared_ptr keeps its weak witness alive; this prevents journal/temp-file
+  // churn from turning the backend's identity table into an unbounded heap.
+  std::unordered_map<uint64_t, std::weak_ptr<File>> orphanFiles;
+  bool rootExposed = false;
+  bool logicalStateLoaded = false;
+  int filesystemFatal = 0;
+
+  int poisonFilesystemLocked(int error);
+  int operationErrorLocked() const;
+  int validateCurrentStateLocked();
+  void reapOrphansLocked();
+  int loadLogicalStateLocked();
+  int parseLogicalStateLocked(const std::vector<uint8_t>& manifest,
+                              uint64_t generation,
+                              ProfileLogV4FilesystemState* result);
+  int validateLogicalStateLocked(const ProfileLogV4FilesystemState& value,
+                                 uint64_t generation,
+                                 bool validateExtents);
+  int serializeLogicalStateLocked(const ProfileLogV4FilesystemState& value,
+                                  uint64_t generation,
+                                  std::vector<uint8_t>* manifest);
+  int commitLogicalStateLocked(ProfileLogV4FilesystemState value,
+                               std::vector<PendingChunk> pending);
+  int readExtentLocked(const ProfileLogV4FilesystemExtent& extent,
+                       uint64_t inode,
+                       uint64_t chunk,
+                       uint64_t generation,
+                       std::vector<uint8_t>* bytes);
+  int readChunkLocked(const ProfileLogV4FilesystemInode& inode,
+                      uint64_t chunk,
+                      uint64_t generation,
+                      std::vector<uint8_t>* bytes);
+  int getChunkForWriteLocked(const ProfileLogV4FilesystemInode& inode,
+                             uint64_t chunk,
+                             std::vector<uint8_t>* bytes);
+  ProfileLogV4FilesystemInode* findInodeLocked(uint64_t id);
+  const ProfileLogV4FilesystemInode* findInodeLocked(uint64_t id) const;
+  std::shared_ptr<File> makeFileLocked(uint64_t id);
+  int flushLocked();
+  int commitMetadataLocked(uint64_t id, const File::Metadata& metadata);
+  ssize_t writeFileLocked(uint64_t id,
+                          const uint8_t* buffer,
+                          size_t length,
+                          off_t offset,
+                          const File::Metadata& metadata);
+  int resizeFileLocked(uint64_t id,
+                       off_t size,
+                       const File::Metadata& metadata);
+  int commitNamespaceMutationLocked(
+    const Directory::NamespaceMutation& mutation);
+
+  friend class ProfileLogV4FilesystemDataFile;
+  friend class ProfileLogV4FilesystemDirectory;
+  friend class ProfileLogV4FilesystemSymlink;
+
+public:
+  ProfileLogV4FilesystemBackend() : ProfileLogV4Store("fs", true) {}
+
+  bool supportsExplicitMetadataMutation() const override { return true; }
+  bool requiresAtomicMetadataMutations() const override { return true; }
+  bool requiresAtomicNamespaceMutations() const override { return true; }
+  bool supportsRecordLocks() const override {
+    // Chromium's database locks are process-owned fcntl locks. The browser
+    // Web Lock lease excludes every other WasmFS profile instance, so the
+    // single-process WasmFS implementation can provide their normal range,
+    // any-descriptor-close, and F_GETLK semantics without pretending to lock
+    // unleased or cross-origin OPFS writers.
+    return profileLeaseState->supportsRecordLocks();
+  }
+
+  int validateOperation() override {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+    return validateCurrentStateLocked();
+  }
+
+  int initialiseFilesystem(const char* profileName);
+  std::shared_ptr<DataFile> createFile(mode_t mode) override;
+  std::shared_ptr<Directory> createDirectory(mode_t mode) override;
+  std::shared_ptr<Directory> createMountRootDirectory(mode_t mode) override;
+  std::shared_ptr<Symlink> createSymlink(std::string target) override;
+  int prepareOPFSProfileRetirement(bool checkResources) override;
+  bool abandonFailedInitialisation() {
+    return ProfileLogV4Store::abandonFailedInitialisation();
+  }
+};
+
+class ProfileLogV4FilesystemDataFile final : public DataFile {
+  ProfileLogV4FilesystemBackend* const filesystem;
+  uint64_t inode = 0;
+
+  void setInitialMetadata(const File::Metadata& metadata) {
+    mode = metadata.mode;
+    atime = metadata.atime;
+    mtime = metadata.mtime;
+    ctime = metadata.ctime;
+  }
+
+  off_t getSize() override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return error;
+    }
+    const auto* value = filesystem->findInodeLocked(inode);
+    if (!value || value->kind != ProfileLogV4FilesystemInodeKind::Regular) {
+      return -ENOENT;
+    }
+    if (value->size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    return static_cast<off_t>(value->size);
+  }
+
+  int open(oflags_t flags) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return error;
+    }
+    const auto* value = filesystem->findInodeLocked(inode);
+    if (!value || value->kind != ProfileLogV4FilesystemInodeKind::Regular ||
+        (flags != O_RDONLY && flags != O_WRONLY && flags != O_RDWR)) {
+      return -ENOENT;
+    }
+    return 0;
+  }
+
+  int close() override { return 0; }
+
+  ssize_t read(uint8_t* buffer, size_t length, off_t offset) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return error;
+    }
+    if (offset < 0 || (!buffer && length)) {
+      return -EINVAL;
+    }
+    const auto* value = filesystem->findInodeLocked(inode);
+    if (!value || value->kind != ProfileLogV4FilesystemInodeKind::Regular) {
+      return -ENOENT;
+    }
+    const uint64_t start = static_cast<uint64_t>(offset);
+    if (start >= value->size || !length) {
+      return 0;
+    }
+    const uint64_t available = value->size - start;
+    const size_t count = static_cast<size_t>(
+      std::min<uint64_t>(length, available));
+    if (count > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+      return -EFBIG;
+    }
+    size_t cursor = 0;
+    while (cursor != count) {
+      const uint64_t position = start + cursor;
+      const uint64_t chunk = position >> kProfileLogV4FilesystemChunkShift;
+      const size_t within = static_cast<size_t>(
+        position & (kProfileLogV4FilesystemChunkSize - 1));
+      const size_t bytes = std::min(
+        kProfileLogV4FilesystemChunkSize - within, count - cursor);
+      std::vector<uint8_t> chunkBytes;
+      if (int error = filesystem->readChunkLocked(
+            *value, chunk, filesystem->state.generation, &chunkBytes)) {
+        return filesystem->poisonFilesystemLocked(error);
+      }
+      memcpy(buffer + cursor, chunkBytes.data() + within, bytes);
+      cursor += bytes;
+    }
+    return static_cast<ssize_t>(count);
+  }
+
+  ssize_t write(const uint8_t*, size_t, off_t) override { return -ENOTSUP; }
+
+  ssize_t writeWithMetadata(const uint8_t* buffer,
+                            size_t length,
+                            off_t offset,
+                            const File::Metadata& metadata) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->writeFileLocked(inode, buffer, length, offset, metadata);
+  }
+
+  int setSize(off_t) override { return -ENOTSUP; }
+
+  int setSizeWithMetadata(off_t size, const File::Metadata& metadata) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->resizeFileLocked(inode, size, metadata);
+  }
+
+  int flush() override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->flushLocked();
+  }
+
+  int persistMetadata(const File::Metadata& metadata) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->commitMetadataLocked(inode, metadata);
+  }
+
+  friend class ProfileLogV4FilesystemBackend;
+
+  ProfileLogV4FilesystemDataFile(ProfileLogV4FilesystemBackend* filesystem,
+                                 uint64_t inode,
+                                 const File::Metadata& metadata)
+    : DataFile(metadata.mode, filesystem), filesystem(filesystem), inode(inode) {
+    setInitialMetadata(metadata);
+  }
+
+  ProfileLogV4FilesystemDataFile(ProfileLogV4FilesystemBackend* filesystem,
+                                 mode_t mode)
+    : DataFile(mode, filesystem), filesystem(filesystem) {}
+
+  void adopt(uint64_t value) {
+    assert(!inode && value);
+    inode = value;
+  }
+
+public:
+  ino_t getIno() override {
+    return inode ? static_cast<ino_t>(inode) : File::getIno();
+  }
+
+  uint64_t getInode() const { return inode; }
+  bool isCandidate() const { return !inode; }
+};
+
+class ProfileLogV4FilesystemDirectory final : public Directory {
+  ProfileLogV4FilesystemBackend* const filesystem;
+  uint64_t inode = 0;
+
+  void setInitialMetadata(const File::Metadata& metadata) {
+    mode = metadata.mode;
+    atime = metadata.atime;
+    mtime = metadata.mtime;
+    ctime = metadata.ctime;
+  }
+
+  MaybeFile getChildWithError(const std::string& name) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return MaybeFile(operation.getError());
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return MaybeFile(error);
+    }
+    const auto* directory = filesystem->findInodeLocked(inode);
+    if (!directory || directory->kind !=
+                        ProfileLogV4FilesystemInodeKind::Directory ||
+        !profileLogV4FilesystemValidName(name)) {
+      return MaybeFile(-ENOENT);
+    }
+    const auto child = directory->entries.find(name);
+    if (child == directory->entries.end()) {
+      return MaybeFile(std::shared_ptr<File>());
+    }
+    auto file = filesystem->makeFileLocked(child->second);
+    return file ? MaybeFile(std::move(file)) : MaybeFile(-EIO);
+  }
+
+  std::shared_ptr<File> getChild(const std::string& name) override {
+    auto result = getChildWithError(name);
+    return result.getError() ? nullptr : result.getFile();
+  }
+
+  std::shared_ptr<DataFile> insertDataFile(const std::string&, mode_t) override {
+    return nullptr;
+  }
+  std::shared_ptr<Directory> insertDirectory(const std::string&, mode_t) override {
+    return nullptr;
+  }
+  std::shared_ptr<Symlink> insertSymlink(const std::string&,
+                                         const std::string&) override {
+    return nullptr;
+  }
+  int insertMove(const std::string&, std::shared_ptr<File>) override {
+    return -ENOTSUP;
+  }
+  int removeChild(const std::string&) override { return -ENOTSUP; }
+
+  int commitNamespaceMutation(const NamespaceMutation& mutation) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->commitNamespaceMutationLocked(mutation);
+  }
+
+  ssize_t getNumEntries() override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return error;
+    }
+    const auto* directory = filesystem->findInodeLocked(inode);
+    if (!directory || directory->kind !=
+                        ProfileLogV4FilesystemInodeKind::Directory) {
+      return -ENOENT;
+    }
+    return directory->entries.size() >
+             static_cast<size_t>(std::numeric_limits<ssize_t>::max())
+           ? -EOVERFLOW
+           : static_cast<ssize_t>(directory->entries.size());
+  }
+
+  MaybeEntries getEntries() override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return {operation.getError()};
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return {error};
+    }
+    const auto* directory = filesystem->findInodeLocked(inode);
+    if (!directory || directory->kind !=
+                        ProfileLogV4FilesystemInodeKind::Directory) {
+      return {-ENOENT};
+    }
+    std::vector<Entry> entries;
+    entries.reserve(directory->entries.size());
+    for (const auto& [name, childID] : directory->entries) {
+      const auto* child = filesystem->findInodeLocked(childID);
+      if (!child) {
+        return {-EIO};
+      }
+      FileKind kind = UnknownKind;
+      switch (child->kind) {
+        case ProfileLogV4FilesystemInodeKind::Regular:
+          kind = DataFileKind;
+          break;
+        case ProfileLogV4FilesystemInodeKind::Directory:
+          kind = DirectoryKind;
+          break;
+        case ProfileLogV4FilesystemInodeKind::Symlink:
+          kind = SymlinkKind;
+          break;
+      }
+      entries.push_back({name, kind, static_cast<ino_t>(childID)});
+    }
+    return {std::move(entries)};
+  }
+
+  int flush() override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->flushLocked();
+  }
+
+  int persistMetadata(const File::Metadata& metadata) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->commitMetadataLocked(inode, metadata);
+  }
+
+  off_t getSize() override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return error;
+    }
+    const auto* directory = filesystem->findInodeLocked(inode);
+    return directory && directory->kind ==
+                          ProfileLogV4FilesystemInodeKind::Directory
+             ? 4096
+             : -ENOENT;
+  }
+
+  std::string getName(std::shared_ptr<File> file) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return "";
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    const auto* directory = filesystem->findInodeLocked(inode);
+    if (!directory || directory->kind !=
+                        ProfileLogV4FilesystemInodeKind::Directory ||
+        !file) {
+      return "";
+    }
+    const uint64_t childID = static_cast<uint64_t>(file->getIno());
+    for (const auto& [name, candidate] : directory->entries) {
+      if (candidate == childID) {
+        return name;
+      }
+    }
+    return "";
+  }
+
+  bool maintainsFileIdentity() override { return false; }
+
+  friend class ProfileLogV4FilesystemBackend;
+
+  ProfileLogV4FilesystemDirectory(ProfileLogV4FilesystemBackend* filesystem,
+                                  uint64_t inode,
+                                  const File::Metadata& metadata)
+    : Directory(metadata.mode, filesystem), filesystem(filesystem), inode(inode) {
+    setInitialMetadata(metadata);
+  }
+
+  ProfileLogV4FilesystemDirectory(ProfileLogV4FilesystemBackend* filesystem,
+                                  mode_t mode)
+    : Directory(mode, filesystem), filesystem(filesystem) {}
+
+  void adopt(uint64_t value) {
+    assert(!inode && value);
+    inode = value;
+  }
+
+public:
+  ino_t getIno() override {
+    return inode ? static_cast<ino_t>(inode) : File::getIno();
+  }
+
+  uint64_t getInode() const { return inode; }
+  bool isCandidate() const { return !inode; }
+};
+
+class ProfileLogV4FilesystemSymlink final : public Symlink {
+  ProfileLogV4FilesystemBackend* const filesystem;
+  uint64_t inode = 0;
+  std::string target;
+
+  void setInitialMetadata(const File::Metadata& metadata) {
+    mode = metadata.mode;
+    atime = metadata.atime;
+    mtime = metadata.mtime;
+    ctime = metadata.ctime;
+  }
+
+  int persistMetadata(const File::Metadata& metadata) override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    return filesystem->commitMetadataLocked(inode, metadata);
+  }
+
+  off_t getSize() override {
+    ProfileLeaseState::InternalOperation operation(*filesystem->profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(filesystem->filesystemMutex);
+    if (int error = filesystem->validateCurrentStateLocked()) {
+      return error;
+    }
+    const auto* symlink = filesystem->findInodeLocked(inode);
+    if (!symlink || symlink->kind !=
+                      ProfileLogV4FilesystemInodeKind::Symlink ||
+        symlink->target.size() >
+          static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+      return -ENOENT;
+    }
+    return static_cast<off_t>(symlink->target.size());
+  }
+
+  friend class ProfileLogV4FilesystemBackend;
+
+  ProfileLogV4FilesystemSymlink(ProfileLogV4FilesystemBackend* filesystem,
+                                uint64_t inode,
+                                std::string target,
+                                const File::Metadata& metadata)
+    : Symlink(filesystem),
+      filesystem(filesystem),
+      inode(inode),
+      target(std::move(target)) {
+    setInitialMetadata(metadata);
+  }
+
+  ProfileLogV4FilesystemSymlink(ProfileLogV4FilesystemBackend* filesystem,
+                                std::string target)
+    : Symlink(filesystem), filesystem(filesystem), target(std::move(target)) {}
+
+  void adopt(uint64_t value) {
+    assert(!inode && value);
+    inode = value;
+  }
+
+public:
+  std::string getTarget() const override { return target; }
+  ino_t getIno() override {
+    return inode ? static_cast<ino_t>(inode) : File::getIno();
+  }
+
+  uint64_t getInode() const { return inode; }
+  bool isCandidate() const { return !inode; }
+};
+
+int ProfileLogV4FilesystemBackend::poisonFilesystemLocked(int error) {
+  if (error >= 0) {
+    error = -EIO;
+  }
+  if (!filesystemFatal) {
+    filesystemFatal = error;
+  }
+  return filesystemFatal;
+}
+
+int ProfileLogV4FilesystemBackend::operationErrorLocked() const {
+  return filesystemFatal ? filesystemFatal : logicalStateLoaded ? 0 : -ESHUTDOWN;
+}
+
+void ProfileLogV4FilesystemBackend::reapOrphansLocked() {
+  for (auto it = orphans.begin(); it != orphans.end();) {
+    const auto witness = orphanFiles.find(it->first);
+    if (witness != orphanFiles.end() && !witness->second.expired()) {
+      ++it;
+      continue;
+    }
+    if (witness != orphanFiles.end()) {
+      orphanFiles.erase(witness);
+    }
+    it = orphans.erase(it);
+  }
+}
+
+int ProfileLogV4FilesystemBackend::validateCurrentStateLocked() {
+  if (int error = operationErrorLocked()) {
+    return error;
+  }
+  reapOrphansLocked();
+  size_t manifestSize = 0;
+  uint64_t manifestGeneration = 0;
+  // A cached inode tree must not answer a stat, readdir, synthetic sparse
+  // read, or mutation after the V4 envelope that selected it no longer
+  // validates. This experimental profile backend deliberately pays the
+  // validation cost on every visible filesystem operation.
+  if (int error = readManifest(
+        nullptr, 0, &manifestSize, &manifestGeneration)) {
+    return poisonFilesystemLocked(error);
+  }
+  if (manifestGeneration != state.generation) {
+    return poisonFilesystemLocked(-EIO);
+  }
+  if (!manifestSize) {
+    return !state.root && state.nextInode == 1 && state.inodes.empty() &&
+           orphans.empty() && orphanFiles.empty()
+             ? 0
+             : poisonFilesystemLocked(-EIO);
+  }
+  if (int error = validateLogicalStateLocked(
+        state, manifestGeneration, false)) {
+    return poisonFilesystemLocked(error);
+  }
+  return 0;
+}
+
+ProfileLogV4FilesystemInode*
+ProfileLogV4FilesystemBackend::findInodeLocked(uint64_t id) {
+  if (auto found = state.inodes.find(id); found != state.inodes.end()) {
+    return &found->second;
+  }
+  if (auto found = orphans.find(id); found != orphans.end()) {
+    return &found->second;
+  }
+  return nullptr;
+}
+
+const ProfileLogV4FilesystemInode*
+ProfileLogV4FilesystemBackend::findInodeLocked(uint64_t id) const {
+  if (auto found = state.inodes.find(id); found != state.inodes.end()) {
+    return &found->second;
+  }
+  if (auto found = orphans.find(id); found != orphans.end()) {
+    return &found->second;
+  }
+  return nullptr;
+}
+
+std::shared_ptr<File> ProfileLogV4FilesystemBackend::makeFileLocked(
+  uint64_t id) {
+  if (!id || id > static_cast<uint64_t>(std::numeric_limits<ino_t>::max())) {
+    return nullptr;
+  }
+  const auto* inode = findInodeLocked(id);
+  if (!inode) {
+    return nullptr;
+  }
+  std::shared_ptr<File> file;
+  switch (inode->kind) {
+    case ProfileLogV4FilesystemInodeKind::Regular:
+      file = std::shared_ptr<ProfileLogV4FilesystemDataFile>(
+        new ProfileLogV4FilesystemDataFile(this, id, inode->metadata));
+      break;
+    case ProfileLogV4FilesystemInodeKind::Directory:
+      file = std::shared_ptr<ProfileLogV4FilesystemDirectory>(
+        new ProfileLogV4FilesystemDirectory(this, id, inode->metadata));
+      break;
+    case ProfileLogV4FilesystemInodeKind::Symlink:
+      file = std::shared_ptr<ProfileLogV4FilesystemSymlink>(
+        new ProfileLogV4FilesystemSymlink(
+          this, id, inode->target, inode->metadata));
+      break;
+  }
+  return file;
+}
+
+int ProfileLogV4FilesystemBackend::initialiseFilesystem(const char* profileName) {
+  if (int error = initialise(profileName)) {
+    return error;
+  }
+  ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+  if (!operation) {
+    return operation.getError();
+  }
+  std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+  return loadLogicalStateLocked();
+}
+
+std::shared_ptr<DataFile> ProfileLogV4FilesystemBackend::createFile(mode_t mode) {
+  ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+  if (!operation) {
+    return nullptr;
+  }
+  std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+  if (validateCurrentStateLocked()) {
+    return nullptr;
+  }
+  return std::shared_ptr<ProfileLogV4FilesystemDataFile>(
+    new ProfileLogV4FilesystemDataFile(this, mode));
+}
+
+std::shared_ptr<Symlink> ProfileLogV4FilesystemBackend::createSymlink(
+  std::string target) {
+  ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+  if (!operation) {
+    return nullptr;
+  }
+  std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+  if (validateCurrentStateLocked() || target.find('\0') != std::string::npos) {
+    return nullptr;
+  }
+  return std::shared_ptr<ProfileLogV4FilesystemSymlink>(
+    new ProfileLogV4FilesystemSymlink(this, std::move(target)));
+}
+
+std::shared_ptr<Directory> ProfileLogV4FilesystemBackend::createDirectory(
+  mode_t mode) {
+  ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+  if (!operation) {
+    return nullptr;
+  }
+  std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+  if (validateCurrentStateLocked()) {
+    return nullptr;
+  }
+
+  // Generic atomic namespace creation asks for a private candidate only after
+  // the one mount root has been exposed. Do not let that candidate factory
+  // double as the public mount-root path.
+  if (!rootExposed || !state.root) {
+    return nullptr;
+  }
+  return std::shared_ptr<ProfileLogV4FilesystemDirectory>(
+    new ProfileLogV4FilesystemDirectory(this, mode));
+}
+
+std::shared_ptr<Directory>
+ProfileLogV4FilesystemBackend::createMountRootDirectory(mode_t mode) {
+  ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+  if (!operation) {
+    return nullptr;
+  }
+  std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+  if (validateCurrentStateLocked() || rootExposed) {
+    return nullptr;
+  }
+
+  if (!state.root) {
+    auto root = std::shared_ptr<ProfileLogV4FilesystemDirectory>(
+      new ProfileLogV4FilesystemDirectory(this, mode));
+    auto metadata = root->locked().getMetadata();
+    ProfileLogV4FilesystemState next;
+    next.root = 1;
+    next.nextInode = 2;
+    next.inodes.emplace(
+      1,
+      ProfileLogV4FilesystemInode{1,
+                                   ProfileLogV4FilesystemInodeKind::Directory,
+                                   metadata,
+                                   0,
+                                   {},
+                                   {},
+                                   {},
+                                   {}});
+    if (commitLogicalStateLocked(std::move(next), {})) {
+      return nullptr;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST && \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v4_test_maybe_interrupt(9);
+#endif
+    root->adopt(1);
+    rootExposed = true;
+    return root;
+  }
+  auto root = makeFileLocked(state.root);
+  if (!root || !root->is<ProfileLogV4FilesystemDirectory>()) {
+    poisonFilesystemLocked(-EIO);
+    return nullptr;
+  }
+  rootExposed = true;
+  return root->cast<Directory>();
+}
+
+mode_t profileLogV4FilesystemExpectedMode(
+  ProfileLogV4FilesystemInodeKind kind) {
+  switch (kind) {
+    case ProfileLogV4FilesystemInodeKind::Regular:
+      return S_IFREG;
+    case ProfileLogV4FilesystemInodeKind::Directory:
+      return S_IFDIR;
+    case ProfileLogV4FilesystemInodeKind::Symlink:
+      return S_IFLNK;
+  }
+  return 0;
+}
+
+bool profileLogV4FilesystemValidMetadata(
+  const File::Metadata& metadata,
+  ProfileLogV4FilesystemInodeKind kind) {
+  return (metadata.mode & S_IFMT) == profileLogV4FilesystemExpectedMode(kind) &&
+         std::isfinite(metadata.atime) && std::isfinite(metadata.mtime) &&
+         std::isfinite(metadata.ctime);
+}
+
+std::array<uint8_t, kProfileLogV4FilesystemDataHeaderSize>
+profileLogV4FilesystemMakeDataHeader(uint64_t generation,
+                                     uint64_t inode,
+                                     uint64_t chunk,
+                                     const uint8_t* payload,
+                                     size_t size) {
+  std::array<uint8_t, kProfileLogV4FilesystemDataHeaderSize> header = {};
+  std::copy(kProfileLogV4FilesystemDataMagic.begin(),
+            kProfileLogV4FilesystemDataMagic.end(),
+            header.begin());
+  writeProfileLogV4U32(header, 8, kProfileLogV4FilesystemSchema);
+  writeProfileLogV4U32(header, 12, kProfileLogV4FilesystemDataHeaderSize);
+  writeProfileLogV4U64(header, 16, generation);
+  writeProfileLogV4U64(header, 24, inode);
+  writeProfileLogV4U64(header, 32, chunk);
+  writeProfileLogV4U32(header, 40, size);
+  writeProfileLogV4U32(header, 44, 0);
+  writeProfileLogV4U64(header, 48, profileLogV4Checksum(payload, size));
+  writeProfileLogV4U64(
+    header, 56, profileLogV4ChecksumWithZeroedRange(header, 56, 8));
+  return header;
+}
+
+bool profileLogV4FilesystemParseDataHeader(
+  const std::array<uint8_t, kProfileLogV4FilesystemDataHeaderSize>& header,
+  uint64_t* generation,
+  uint64_t* inode,
+  uint64_t* chunk,
+  uint32_t* payloadSize,
+  uint64_t* payloadChecksum) {
+  if (!generation || !inode || !chunk || !payloadSize || !payloadChecksum ||
+      !std::equal(kProfileLogV4FilesystemDataMagic.begin(),
+                  kProfileLogV4FilesystemDataMagic.end(),
+                  header.begin()) ||
+      readProfileLogV4U32(header, 8) != kProfileLogV4FilesystemSchema ||
+      readProfileLogV4U32(header, 12) !=
+        kProfileLogV4FilesystemDataHeaderSize ||
+      readProfileLogV4U32(header, 44) != 0 ||
+      readProfileLogV4U64(header, 56) !=
+        profileLogV4ChecksumWithZeroedRange(header, 56, 8) ||
+      !profileLogV4HasZeroTail(header, 64)) {
+    return false;
+  }
+  *generation = readProfileLogV4U64(header, 16);
+  *inode = readProfileLogV4U64(header, 24);
+  *chunk = readProfileLogV4U64(header, 32);
+  *payloadSize = readProfileLogV4U32(header, 40);
+  *payloadChecksum = readProfileLogV4U64(header, 48);
+  return *generation != 0;
+}
+
+int ProfileLogV4FilesystemBackend::serializeLogicalStateLocked(
+  const ProfileLogV4FilesystemState& value,
+  uint64_t generation,
+  std::vector<uint8_t>* manifest) {
+  if (!manifest) {
+    return -EINVAL;
+  }
+  if (int error = validateLogicalStateLocked(value, generation, false)) {
+    return error;
+  }
+
+  struct InodeOffsets {
+    uint64_t entryFirst = 0;
+    uint64_t entryCount = 0;
+    uint64_t extentFirst = 0;
+    uint64_t extentCount = 0;
+    uint64_t targetOffset = 0;
+    uint64_t targetLength = 0;
+  };
+  struct EntryOutput {
+    uint64_t parent;
+    uint64_t child;
+    uint64_t nameOffset;
+    uint32_t nameLength;
+  };
+
+  std::map<uint64_t, InodeOffsets> offsets;
+  std::vector<EntryOutput> entries;
+  std::vector<ProfileLogV4FilesystemExtent> extents;
+  std::vector<uint64_t> extentInodes;
+  std::vector<uint8_t> strings;
+  for (const auto& [id, inode] : value.inodes) {
+    auto& inodeOffsets = offsets[id];
+    if (inode.kind == ProfileLogV4FilesystemInodeKind::Directory) {
+      inodeOffsets.entryFirst = entries.size();
+      inodeOffsets.entryCount = inode.entries.size();
+      for (const auto& [name, child] : inode.entries) {
+        if (name.size() > std::numeric_limits<uint32_t>::max() ||
+            strings.size() > kProfileLogV4MaxSafeOffset - name.size()) {
+          return -EFBIG;
+        }
+        entries.push_back({id,
+                           child,
+                           static_cast<uint64_t>(strings.size()),
+                           static_cast<uint32_t>(name.size())});
+        strings.insert(strings.end(), name.begin(), name.end());
+      }
+    }
+    if (inode.kind == ProfileLogV4FilesystemInodeKind::Regular) {
+      inodeOffsets.extentFirst = extents.size();
+      inodeOffsets.extentCount = inode.extents.size();
+      for (const auto& [_, extent] : inode.extents) {
+        extents.push_back(extent);
+        extentInodes.push_back(id);
+      }
+    }
+    if (inode.kind == ProfileLogV4FilesystemInodeKind::Symlink) {
+      if (strings.size() > kProfileLogV4MaxSafeOffset - inode.target.size()) {
+        return -EFBIG;
+      }
+      inodeOffsets.targetOffset = strings.size();
+      inodeOffsets.targetLength = inode.target.size();
+      strings.insert(strings.end(), inode.target.begin(), inode.target.end());
+    }
+  }
+
+  size_t inodeBytes = 0;
+  size_t entryBytes = 0;
+  size_t extentBytes = 0;
+  size_t entryOffset = 0;
+  size_t extentOffset = 0;
+  size_t stringOffset = 0;
+  size_t totalSize = 0;
+  if (!profileLogV4FilesystemCheckedMultiply(
+        value.inodes.size(), kProfileLogV4FilesystemInodeSize, &inodeBytes) ||
+      !profileLogV4FilesystemCheckedMultiply(
+        entries.size(), kProfileLogV4FilesystemDirectoryEntrySize, &entryBytes) ||
+      !profileLogV4FilesystemCheckedMultiply(
+        extents.size(), kProfileLogV4FilesystemExtentSize, &extentBytes) ||
+      !profileLogV4FilesystemCheckedAdd(
+        kProfileLogV4FilesystemHeaderSize, inodeBytes, &entryOffset) ||
+      !profileLogV4FilesystemCheckedAdd(entryOffset, entryBytes, &extentOffset) ||
+      !profileLogV4FilesystemCheckedAdd(extentOffset, extentBytes, &stringOffset) ||
+      !profileLogV4FilesystemCheckedAdd(stringOffset, strings.size(), &totalSize)) {
+    return -EFBIG;
+  }
+
+  manifest->assign(totalSize, 0);
+  std::copy(kProfileLogV4FilesystemMagic.begin(),
+            kProfileLogV4FilesystemMagic.end(),
+            manifest->begin());
+  profileLogV4FilesystemWriteU32(
+    *manifest, 8, kProfileLogV4FilesystemSchema);
+  profileLogV4FilesystemWriteU32(
+    *manifest, 12, kProfileLogV4FilesystemHeaderSize);
+  profileLogV4FilesystemWriteU64(*manifest, 16, generation);
+  profileLogV4FilesystemWriteU64(*manifest, 24, value.root);
+  profileLogV4FilesystemWriteU64(*manifest, 32, value.nextInode);
+  profileLogV4FilesystemWriteU32(
+    *manifest, 40, kProfileLogV4FilesystemChunkShift);
+  profileLogV4FilesystemWriteU32(*manifest, 44, 0);
+  profileLogV4FilesystemWriteU64(
+    *manifest, 48, kProfileLogV4FilesystemHeaderSize);
+  profileLogV4FilesystemWriteU64(*manifest, 56, value.inodes.size());
+  profileLogV4FilesystemWriteU64(*manifest, 64, entryOffset);
+  profileLogV4FilesystemWriteU64(*manifest, 72, entries.size());
+  profileLogV4FilesystemWriteU64(*manifest, 80, extentOffset);
+  profileLogV4FilesystemWriteU64(*manifest, 88, extents.size());
+  profileLogV4FilesystemWriteU64(*manifest, 96, stringOffset);
+  profileLogV4FilesystemWriteU64(*manifest, 104, strings.size());
+
+  size_t inodeCursor = kProfileLogV4FilesystemHeaderSize;
+  for (const auto& [id, inode] : value.inodes) {
+    const auto& inodeOffsets = offsets[id];
+    profileLogV4FilesystemWriteU64(*manifest, inodeCursor, id);
+    profileLogV4FilesystemWriteU32(
+      *manifest, inodeCursor + 8, static_cast<uint32_t>(inode.kind));
+    profileLogV4FilesystemWriteU32(
+      *manifest, inodeCursor + 16, inode.metadata.mode);
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 24,
+      profileLogV4FilesystemDoubleBits(inode.metadata.atime));
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 32,
+      profileLogV4FilesystemDoubleBits(inode.metadata.mtime));
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 40,
+      profileLogV4FilesystemDoubleBits(inode.metadata.ctime));
+    profileLogV4FilesystemWriteU64(*manifest, inodeCursor + 48, inode.size);
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 56, inodeOffsets.entryFirst);
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 64, inodeOffsets.entryCount);
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 72, inodeOffsets.extentFirst);
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 80, inodeOffsets.extentCount);
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 88, inodeOffsets.targetOffset);
+    profileLogV4FilesystemWriteU64(
+      *manifest, inodeCursor + 96, inodeOffsets.targetLength);
+    inodeCursor += kProfileLogV4FilesystemInodeSize;
+  }
+
+  size_t entryCursor = entryOffset;
+  for (const auto& entry : entries) {
+    profileLogV4FilesystemWriteU64(*manifest, entryCursor, entry.parent);
+    profileLogV4FilesystemWriteU64(*manifest, entryCursor + 8, entry.child);
+    profileLogV4FilesystemWriteU64(*manifest, entryCursor + 16, entry.nameOffset);
+    profileLogV4FilesystemWriteU32(*manifest, entryCursor + 24, entry.nameLength);
+    entryCursor += kProfileLogV4FilesystemDirectoryEntrySize;
+  }
+
+  size_t extentCursor = extentOffset;
+  for (size_t i = 0; i != extents.size(); ++i) {
+    const auto& extent = extents[i];
+    profileLogV4FilesystemWriteU64(
+      *manifest, extentCursor, extentInodes[i]);
+    profileLogV4FilesystemWriteU64(
+      *manifest, extentCursor + 8, extent.chunk);
+    profileLogV4FilesystemWriteU32(
+      *manifest, extentCursor + 16, extent.arena);
+    profileLogV4FilesystemWriteU32(
+      *manifest, extentCursor + 20, extent.payloadSize);
+    profileLogV4FilesystemWriteU64(
+      *manifest, extentCursor + 24, extent.offset);
+    profileLogV4FilesystemWriteU64(
+      *manifest, extentCursor + 32, extent.checksum);
+    extentCursor += kProfileLogV4FilesystemExtentSize;
+  }
+  if (!strings.empty()) {
+    memcpy(manifest->data() + stringOffset, strings.data(), strings.size());
+  }
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::parseLogicalStateLocked(
+  const std::vector<uint8_t>& manifest,
+  uint64_t generation,
+  ProfileLogV4FilesystemState* result) {
+  if (!result || manifest.size() < kProfileLogV4FilesystemHeaderSize ||
+      !std::equal(kProfileLogV4FilesystemMagic.begin(),
+                  kProfileLogV4FilesystemMagic.end(),
+                  manifest.begin())) {
+    return -EIO;
+  }
+  const auto read32 = [&](size_t offset, uint32_t* value) {
+    return profileLogV4FilesystemReadU32(
+      manifest.data(), manifest.size(), offset, value);
+  };
+  const auto read64 = [&](size_t offset, uint64_t* value) {
+    return profileLogV4FilesystemReadU64(
+      manifest.data(), manifest.size(), offset, value);
+  };
+  uint32_t schema = 0;
+  uint32_t headerSize = 0;
+  uint64_t encodedGeneration = 0;
+  uint64_t root = 0;
+  uint64_t nextInode = 0;
+  uint32_t chunkShift = 0;
+  uint32_t flags = 0;
+  uint64_t inodeOffset = 0;
+  uint64_t inodeCount64 = 0;
+  uint64_t directoryOffset = 0;
+  uint64_t directoryCount64 = 0;
+  uint64_t extentOffset = 0;
+  uint64_t extentCount64 = 0;
+  uint64_t stringOffset64 = 0;
+  uint64_t stringSize64 = 0;
+  uint64_t reserved112 = 0;
+  uint64_t reserved120 = 0;
+  if (!read32(8, &schema) || !read32(12, &headerSize) ||
+      !read64(16, &encodedGeneration) || !read64(24, &root) ||
+      !read64(32, &nextInode) || !read32(40, &chunkShift) ||
+      !read32(44, &flags) || !read64(48, &inodeOffset) ||
+      !read64(56, &inodeCount64) || !read64(64, &directoryOffset) ||
+      !read64(72, &directoryCount64) || !read64(80, &extentOffset) ||
+      !read64(88, &extentCount64) || !read64(96, &stringOffset64) ||
+      !read64(104, &stringSize64) || !read64(112, &reserved112) ||
+      !read64(120, &reserved120) || schema != kProfileLogV4FilesystemSchema ||
+      headerSize != kProfileLogV4FilesystemHeaderSize ||
+      encodedGeneration != generation || !generation || root != 1 ||
+      !nextInode || chunkShift != kProfileLogV4FilesystemChunkShift || flags ||
+      reserved112 || reserved120 || inodeCount64 >
+        std::numeric_limits<size_t>::max() || directoryCount64 >
+        std::numeric_limits<size_t>::max() || extentCount64 >
+        std::numeric_limits<size_t>::max()) {
+    return -EIO;
+  }
+  const size_t inodeCount = static_cast<size_t>(inodeCount64);
+  const size_t directoryCount = static_cast<size_t>(directoryCount64);
+  const size_t extentCount = static_cast<size_t>(extentCount64);
+  size_t inodeBytes = 0;
+  size_t directoryBytes = 0;
+  size_t extentBytes = 0;
+  size_t expectedDirectoryOffset = 0;
+  size_t expectedExtentOffset = 0;
+  size_t expectedStringOffset = 0;
+  size_t expectedSize = 0;
+  if (!inodeCount || !profileLogV4FilesystemCheckedMultiply(
+        inodeCount, kProfileLogV4FilesystemInodeSize, &inodeBytes) ||
+      !profileLogV4FilesystemCheckedMultiply(
+        directoryCount, kProfileLogV4FilesystemDirectoryEntrySize,
+        &directoryBytes) ||
+      !profileLogV4FilesystemCheckedMultiply(
+        extentCount, kProfileLogV4FilesystemExtentSize, &extentBytes) ||
+      !profileLogV4FilesystemCheckedAdd(
+        kProfileLogV4FilesystemHeaderSize, inodeBytes,
+        &expectedDirectoryOffset) ||
+      !profileLogV4FilesystemCheckedAdd(
+        expectedDirectoryOffset, directoryBytes, &expectedExtentOffset) ||
+      !profileLogV4FilesystemCheckedAdd(
+        expectedExtentOffset, extentBytes, &expectedStringOffset) ||
+      stringSize64 > std::numeric_limits<size_t>::max() ||
+      !profileLogV4FilesystemCheckedAdd(
+        expectedStringOffset,
+        static_cast<size_t>(stringSize64),
+        &expectedSize) ||
+      inodeOffset != kProfileLogV4FilesystemHeaderSize ||
+      directoryOffset != expectedDirectoryOffset ||
+      extentOffset != expectedExtentOffset ||
+      stringOffset64 != expectedStringOffset || expectedSize != manifest.size()) {
+    return -EIO;
+  }
+  size_t stringOffset = 0;
+  size_t stringSize = 0;
+  if (!profileLogV4FilesystemRange(
+        manifest.size(), stringOffset64, stringSize64, &stringOffset,
+        &stringSize) || stringOffset + stringSize != manifest.size()) {
+    return -EIO;
+  }
+
+  struct InodeAux {
+    uint64_t entryFirst;
+    uint64_t entryCount;
+    uint64_t extentFirst;
+    uint64_t extentCount;
+    uint64_t targetOffset;
+    uint64_t targetLength;
+  };
+  struct DirectoryEntry {
+    uint64_t parent;
+    uint64_t child;
+    std::string name;
+  };
+  struct ExtentEntry {
+    uint64_t inode;
+    ProfileLogV4FilesystemExtent extent;
+  };
+  ProfileLogV4FilesystemState value;
+  value.generation = generation;
+  value.root = root;
+  value.nextInode = nextInode;
+  std::map<uint64_t, InodeAux> inodeAux;
+  uint64_t previousInode = 0;
+  for (size_t index = 0; index != inodeCount; ++index) {
+    const size_t offset = kProfileLogV4FilesystemHeaderSize +
+                          index * kProfileLogV4FilesystemInodeSize;
+    uint64_t id = 0;
+    uint32_t kindRaw = 0;
+    uint32_t reserved12 = 0;
+    uint32_t mode = 0;
+    uint32_t reserved20 = 0;
+    uint64_t atime = 0;
+    uint64_t mtime = 0;
+    uint64_t ctime = 0;
+    uint64_t size = 0;
+    InodeAux aux = {};
+    uint64_t reserved104 = 0;
+    if (!read64(offset, &id) || !read32(offset + 8, &kindRaw) ||
+        !read32(offset + 12, &reserved12) || !read32(offset + 16, &mode) ||
+        !read32(offset + 20, &reserved20) || !read64(offset + 24, &atime) ||
+        !read64(offset + 32, &mtime) || !read64(offset + 40, &ctime) ||
+        !read64(offset + 48, &size) || !read64(offset + 56, &aux.entryFirst) ||
+        !read64(offset + 64, &aux.entryCount) ||
+        !read64(offset + 72, &aux.extentFirst) ||
+        !read64(offset + 80, &aux.extentCount) ||
+        !read64(offset + 88, &aux.targetOffset) ||
+        !read64(offset + 96, &aux.targetLength) ||
+        !read64(offset + 104, &reserved104) || !id || id <= previousInode ||
+        id > static_cast<uint64_t>(std::numeric_limits<ino_t>::max()) ||
+        reserved12 || reserved20 || reserved104) {
+      return -EIO;
+    }
+    ProfileLogV4FilesystemInodeKind kind;
+    switch (kindRaw) {
+      case static_cast<uint32_t>(ProfileLogV4FilesystemInodeKind::Regular):
+        kind = ProfileLogV4FilesystemInodeKind::Regular;
+        break;
+      case static_cast<uint32_t>(ProfileLogV4FilesystemInodeKind::Directory):
+        kind = ProfileLogV4FilesystemInodeKind::Directory;
+        break;
+      case static_cast<uint32_t>(ProfileLogV4FilesystemInodeKind::Symlink):
+        kind = ProfileLogV4FilesystemInodeKind::Symlink;
+        break;
+      default:
+        return -EIO;
+    }
+    File::Metadata metadata = {static_cast<mode_t>(mode),
+                               profileLogV4FilesystemDoubleFromBits(atime),
+                               profileLogV4FilesystemDoubleFromBits(mtime),
+                               profileLogV4FilesystemDoubleFromBits(ctime)};
+    if (!profileLogV4FilesystemValidMetadata(metadata, kind) ||
+        size > kProfileLogV4MaxSafeOffset) {
+      return -EIO;
+    }
+    ProfileLogV4FilesystemInode inode;
+    inode.id = id;
+    inode.kind = kind;
+    inode.metadata = metadata;
+    inode.size = size;
+    if (kind == ProfileLogV4FilesystemInodeKind::Symlink) {
+      size_t targetOffset = 0;
+      size_t targetLength = 0;
+      if (!profileLogV4FilesystemRange(
+            stringSize, aux.targetOffset, aux.targetLength, &targetOffset,
+            &targetLength)) {
+        return -EIO;
+      }
+      inode.target.assign(reinterpret_cast<const char*>(
+                            manifest.data() + stringOffset + targetOffset),
+                          targetLength);
+      if (inode.target.find('\0') != std::string::npos ||
+          aux.entryFirst || aux.entryCount || aux.extentFirst ||
+          aux.extentCount || size) {
+        return -EIO;
+      }
+    } else if (aux.targetOffset || aux.targetLength ||
+               (kind == ProfileLogV4FilesystemInodeKind::Directory &&
+                (aux.extentFirst || aux.extentCount || size)) ||
+               (kind == ProfileLogV4FilesystemInodeKind::Regular &&
+                (aux.entryFirst || aux.entryCount))) {
+      return -EIO;
+    }
+    value.inodes.emplace(id, std::move(inode));
+    inodeAux.emplace(id, aux);
+    previousInode = id;
+  }
+  if (value.inodes.find(root) == value.inodes.end() ||
+      value.inodes.at(root).kind != ProfileLogV4FilesystemInodeKind::Directory ||
+      nextInode <= previousInode) {
+    return -EIO;
+  }
+
+  std::vector<DirectoryEntry> entries;
+  entries.reserve(directoryCount);
+  uint64_t previousParent = 0;
+  std::string previousName;
+  for (size_t index = 0; index != directoryCount; ++index) {
+    const size_t offset = expectedDirectoryOffset +
+                          index * kProfileLogV4FilesystemDirectoryEntrySize;
+    uint64_t parent = 0;
+    uint64_t child = 0;
+    uint64_t nameOffset = 0;
+    uint32_t nameLength = 0;
+    uint32_t reserved28 = 0;
+    uint64_t reserved32 = 0;
+    size_t checkedNameOffset = 0;
+    size_t checkedNameLength = 0;
+    if (!read64(offset, &parent) || !read64(offset + 8, &child) ||
+        !read64(offset + 16, &nameOffset) || !read32(offset + 24, &nameLength) ||
+        !read32(offset + 28, &reserved28) || !read64(offset + 32, &reserved32) ||
+        reserved28 || reserved32 || !profileLogV4FilesystemRange(
+          stringSize, nameOffset, nameLength, &checkedNameOffset,
+          &checkedNameLength)) {
+      return -EIO;
+    }
+    std::string name(reinterpret_cast<const char*>(
+                       manifest.data() + stringOffset + checkedNameOffset),
+                     checkedNameLength);
+    if (!profileLogV4FilesystemValidName(name) ||
+        (index && (parent < previousParent ||
+                   (parent == previousParent && !(previousName < name))))) {
+      return -EIO;
+    }
+    entries.push_back({parent, child, std::move(name)});
+    previousParent = parent;
+    previousName = entries.back().name;
+  }
+
+  std::vector<ExtentEntry> extents;
+  extents.reserve(extentCount);
+  uint64_t previousExtentInode = 0;
+  uint64_t previousChunk = 0;
+  for (size_t index = 0; index != extentCount; ++index) {
+    const size_t offset = expectedExtentOffset +
+                          index * kProfileLogV4FilesystemExtentSize;
+    ExtentEntry entry = {};
+    uint32_t reserved40 = 0;
+    uint64_t reserved40high = 0;
+    if (!read64(offset, &entry.inode) ||
+        !read64(offset + 8, &entry.extent.chunk) ||
+        !read32(offset + 16, &entry.extent.arena) ||
+        !read32(offset + 20, &entry.extent.payloadSize) ||
+        !read64(offset + 24, &entry.extent.offset) ||
+        !read64(offset + 32, &entry.extent.checksum) ||
+        !read64(offset + 40, &reserved40high) || reserved40 || reserved40high ||
+        entry.extent.arena >= 2 ||
+        entry.extent.payloadSize != kProfileLogV4FilesystemChunkSize ||
+        (index && (entry.inode < previousExtentInode ||
+                   (entry.inode == previousExtentInode &&
+                    entry.extent.chunk <= previousChunk)))) {
+      return -EIO;
+    }
+    extents.push_back(entry);
+    previousExtentInode = entry.inode;
+    previousChunk = entry.extent.chunk;
+  }
+
+  std::map<uint64_t, size_t> parentCounts;
+  size_t entryCursor = 0;
+  for (auto& [id, inode] : value.inodes) {
+    const auto& aux = inodeAux.at(id);
+    if (inode.kind != ProfileLogV4FilesystemInodeKind::Directory) {
+      continue;
+    }
+    const size_t first = entryCursor;
+    while (entryCursor < entries.size() && entries[entryCursor].parent == id) {
+      const auto& entry = entries[entryCursor++];
+      const auto parent = value.inodes.find(entry.parent);
+      const auto child = value.inodes.find(entry.child);
+      if (parent == value.inodes.end() || child == value.inodes.end() ||
+          parent->second.kind != ProfileLogV4FilesystemInodeKind::Directory ||
+          !inode.entries.emplace(entry.name, entry.child).second) {
+        return -EIO;
+      }
+      ++parentCounts[entry.child];
+    }
+    if (aux.entryFirst != first || aux.entryCount != entryCursor - first) {
+      return -EIO;
+    }
+  }
+  if (entryCursor != entries.size()) {
+    return -EIO;
+  }
+
+  size_t extentCursor = 0;
+  for (auto& [id, inode] : value.inodes) {
+    const auto& aux = inodeAux.at(id);
+    if (inode.kind != ProfileLogV4FilesystemInodeKind::Regular) {
+      continue;
+    }
+    const size_t first = extentCursor;
+    while (extentCursor < extents.size() && extents[extentCursor].inode == id) {
+      const auto& entry = extents[extentCursor++];
+      if (entry.extent.chunk >
+            (inode.size ? (inode.size - 1) >> kProfileLogV4FilesystemChunkShift
+                        : 0) ||
+          !inode.extents.emplace(entry.extent.chunk, entry.extent).second) {
+        return -EIO;
+      }
+    }
+    if (aux.extentFirst != first || aux.extentCount != extentCursor - first) {
+      return -EIO;
+    }
+  }
+  if (extentCursor != extents.size()) {
+    return -EIO;
+  }
+  for (const auto& [id, _] : value.inodes) {
+    if (id == root) {
+      if (parentCounts[id]) {
+        return -EIO;
+      }
+      continue;
+    }
+    if (parentCounts[id] != 1) {
+      return -EIO;
+    }
+  }
+  for (const auto& [id, _] : value.inodes) {
+    std::unordered_set<uint64_t> seen;
+    uint64_t current = id;
+    while (current != root) {
+      if (!seen.insert(current).second) {
+        return -EIO;
+      }
+      bool found = false;
+      for (const auto& [parentID, parent] : value.inodes) {
+        if (parent.kind != ProfileLogV4FilesystemInodeKind::Directory) {
+          continue;
+        }
+        for (const auto& [_, child] : parent.entries) {
+          if (child == current) {
+            current = parentID;
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          break;
+        }
+      }
+      if (!found) {
+        return -EIO;
+      }
+    }
+  }
+  if (int error = validateLogicalStateLocked(value, generation, true)) {
+    return error;
+  }
+  *result = std::move(value);
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::readExtentLocked(
+  const ProfileLogV4FilesystemExtent& extent,
+  uint64_t inode,
+  uint64_t chunk,
+  uint64_t generation,
+  std::vector<uint8_t>* bytes) {
+  if (!bytes || !inode || extent.arena >= 2 ||
+      extent.payloadSize != kProfileLogV4FilesystemChunkSize ||
+      extent.offset > kProfileLogV4MaxSafeOffset -
+                        kProfileLogV4FilesystemDataHeaderSize ||
+      extent.payloadSize > kProfileLogV4MaxSafeOffset - extent.offset -
+                             kProfileLogV4FilesystemDataHeaderSize) {
+    return -EIO;
+  }
+  std::array<uint8_t, kProfileLogV4FilesystemDataHeaderSize> header;
+  if (int error = readSelectedBytes(
+        extent.arena, extent.offset, header.data(), header.size())) {
+    return error;
+  }
+  uint64_t recordGeneration = 0;
+  uint64_t recordInode = 0;
+  uint64_t recordChunk = 0;
+  uint32_t payloadSize = 0;
+  uint64_t payloadChecksum = 0;
+  if (!profileLogV4FilesystemParseDataHeader(header,
+                                              &recordGeneration,
+                                              &recordInode,
+                                              &recordChunk,
+                                              &payloadSize,
+                                              &payloadChecksum) ||
+      recordGeneration > generation ||
+      static_cast<uint32_t>(recordGeneration & 1) != extent.arena ||
+      recordInode != inode || recordChunk != chunk ||
+      payloadSize != extent.payloadSize || payloadChecksum != extent.checksum) {
+    return -EIO;
+  }
+  bytes->resize(payloadSize);
+  if (int error = readSelectedBytes(extent.arena,
+                                    extent.offset + header.size(),
+                                    bytes->data(),
+                                    bytes->size())) {
+    return error;
+  }
+  return profileLogV4Checksum(bytes->data(), bytes->size()) == payloadChecksum
+           ? 0
+           : -EIO;
+}
+
+int ProfileLogV4FilesystemBackend::readChunkLocked(
+  const ProfileLogV4FilesystemInode& inode,
+  uint64_t chunk,
+  uint64_t generation,
+  std::vector<uint8_t>* bytes) {
+  if (!bytes || inode.kind != ProfileLogV4FilesystemInodeKind::Regular) {
+    return -EINVAL;
+  }
+  if (auto volatileChunk = inode.volatileChunks.find(chunk);
+      volatileChunk != inode.volatileChunks.end()) {
+    if (volatileChunk->second.size() != kProfileLogV4FilesystemChunkSize) {
+      return -EIO;
+    }
+    *bytes = volatileChunk->second;
+    return 0;
+  }
+  if (auto extent = inode.extents.find(chunk); extent != inode.extents.end()) {
+    return readExtentLocked(extent->second, inode.id, chunk, generation, bytes);
+  }
+  bytes->assign(kProfileLogV4FilesystemChunkSize, 0);
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::getChunkForWriteLocked(
+  const ProfileLogV4FilesystemInode& inode,
+  uint64_t chunk,
+  std::vector<uint8_t>* bytes) {
+  return readChunkLocked(inode, chunk, state.generation, bytes);
+}
+
+int ProfileLogV4FilesystemBackend::validateLogicalStateLocked(
+  const ProfileLogV4FilesystemState& value,
+  uint64_t generation,
+  bool validateExtents) {
+  if (!generation || value.generation != generation || value.root != 1 ||
+      value.nextInode <= value.root || value.inodes.empty() ||
+      value.inodes.find(value.root) == value.inodes.end() ||
+      value.inodes.at(value.root).kind !=
+        ProfileLogV4FilesystemInodeKind::Directory) {
+    return -EIO;
+  }
+  std::map<uint64_t, size_t> parents;
+  uint64_t previousID = 0;
+  for (const auto& [id, inode] : value.inodes) {
+    if (!id || id <= previousID ||
+        id > static_cast<uint64_t>(std::numeric_limits<ino_t>::max()) ||
+        id >= value.nextInode || inode.id != id ||
+        !profileLogV4FilesystemValidMetadata(inode.metadata, inode.kind)) {
+      return -EIO;
+    }
+    if (inode.kind == ProfileLogV4FilesystemInodeKind::Directory) {
+      if (inode.size || !inode.extents.empty() || !inode.target.empty() ||
+          !inode.volatileChunks.empty()) {
+        return -EIO;
+      }
+      for (const auto& [name, child] : inode.entries) {
+        if (!profileLogV4FilesystemValidName(name) ||
+            value.inodes.find(child) == value.inodes.end() ||
+            ++parents[child] > 1) {
+          return -EIO;
+        }
+      }
+    } else if (inode.kind == ProfileLogV4FilesystemInodeKind::Regular) {
+      if (!inode.entries.empty() || !inode.target.empty() ||
+          inode.size > kProfileLogV4MaxSafeOffset ||
+          !inode.volatileChunks.empty()) {
+        return -EIO;
+      }
+      uint64_t previousChunk = 0;
+      bool haveChunk = false;
+      for (const auto& [chunk, extent] : inode.extents) {
+        if ((haveChunk && chunk <= previousChunk) || extent.chunk != chunk ||
+            extent.arena >= 2 ||
+            extent.payloadSize != kProfileLogV4FilesystemChunkSize ||
+            !inode.size ||
+            chunk > ((inode.size - 1) >> kProfileLogV4FilesystemChunkShift)) {
+          return -EIO;
+        }
+        if (validateExtents) {
+          std::vector<uint8_t> bytes;
+          if (int error = readExtentLocked(extent, id, chunk, generation, &bytes)) {
+            return error;
+          }
+        }
+        previousChunk = chunk;
+        haveChunk = true;
+      }
+    } else if (inode.kind == ProfileLogV4FilesystemInodeKind::Symlink) {
+      if (inode.size || !inode.entries.empty() || !inode.extents.empty() ||
+          !inode.volatileChunks.empty() ||
+          inode.target.find('\0') != std::string::npos) {
+        return -EIO;
+      }
+    } else {
+      return -EIO;
+    }
+    previousID = id;
+  }
+  for (const auto& [id, _] : value.inodes) {
+    if (id == value.root) {
+      if (parents[id]) {
+        return -EIO;
+      }
+    } else if (parents[id] != 1) {
+      return -EIO;
+    }
+  }
+  for (const auto& [id, _] : value.inodes) {
+    std::unordered_set<uint64_t> seen;
+    uint64_t current = id;
+    while (current != value.root) {
+      if (!seen.insert(current).second) {
+        return -EIO;
+      }
+      bool found = false;
+      for (const auto& [parentID, parent] : value.inodes) {
+        if (parent.kind != ProfileLogV4FilesystemInodeKind::Directory) {
+          continue;
+        }
+        for (const auto& [_, child] : parent.entries) {
+          if (child == current) {
+            current = parentID;
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          break;
+        }
+      }
+      if (!found) {
+        return -EIO;
+      }
+    }
+  }
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::loadLogicalStateLocked() {
+  size_t size = 0;
+  uint64_t generation = 0;
+  if (int error = readManifest(nullptr, 0, &size, &generation)) {
+    return error;
+  }
+  if (!generation) {
+    return -EIO;
+  }
+  // The only root-less filesystem state is the unexposed g=1 bootstrap.
+  // A selected empty manifest at any later generation must never be treated
+  // as a fresh root: doing so would let corruption turn a reload into a
+  // successful replacement of an established profile tree.
+  if ((generation == 1) != (size == 0)) {
+    return -EIO;
+  }
+  if (!size) {
+    state = {};
+    state.generation = generation;
+    state.nextInode = 1;
+    logicalStateLoaded = true;
+    return 0;
+  }
+  std::vector<uint8_t> manifest(size);
+  uint64_t payloadGeneration = 0;
+  if (int error = readManifest(
+        manifest.data(), manifest.size(), &size, &payloadGeneration)) {
+    return error;
+  }
+  if (size != manifest.size() || payloadGeneration != generation) {
+    return -EIO;
+  }
+  ProfileLogV4FilesystemState loaded;
+  if (int error = parseLogicalStateLocked(manifest, generation, &loaded)) {
+    return error;
+  }
+  state = std::move(loaded);
+  logicalStateLoaded = true;
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::flushLocked() {
+  if (int error = validateCurrentStateLocked()) {
+    return error;
+  }
+  if (!state.root) {
+    return 0;
+  }
+  if (int error = validateLogicalStateLocked(
+        state, state.generation, true)) {
+    return poisonFilesystemLocked(error);
+  }
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::commitMetadataLocked(
+  uint64_t id,
+  const File::Metadata& metadata) {
+  if (int error = validateCurrentStateLocked()) {
+    return error;
+  }
+  if (auto orphan = orphans.find(id); orphan != orphans.end()) {
+    if (!profileLogV4FilesystemValidMetadata(metadata, orphan->second.kind)) {
+      return -EINVAL;
+    }
+    orphan->second.metadata = metadata;
+    return 0;
+  }
+  const auto found = state.inodes.find(id);
+  if (found == state.inodes.end() ||
+      !profileLogV4FilesystemValidMetadata(metadata, found->second.kind)) {
+    return -ENOENT;
+  }
+  auto next = state;
+  next.inodes.at(id).metadata = metadata;
+  return commitLogicalStateLocked(std::move(next), {});
+}
+
+int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
+  ProfileLogV4FilesystemState value,
+  std::vector<PendingChunk> pending) {
+  if (int error = validateCurrentStateLocked()) {
+    return error;
+  }
+  std::set<std::pair<uint64_t, uint64_t>> writtenChunks;
+  const int result = commitTransaction(
+    [&](Transaction& transaction, std::vector<uint8_t>* manifest) {
+      value.generation = transaction.generation();
+      for (const auto& pendingChunk : pending) {
+        if (!pendingChunk.inode ||
+            pendingChunk.bytes.size() != kProfileLogV4FilesystemChunkSize ||
+            !writtenChunks.emplace(pendingChunk.inode, pendingChunk.chunk).second) {
+          return -EIO;
+        }
+        auto inode = value.inodes.find(pendingChunk.inode);
+        if (inode == value.inodes.end() ||
+            inode->second.kind != ProfileLogV4FilesystemInodeKind::Regular ||
+            pendingChunk.chunk >
+              ((inode->second.size - 1) >> kProfileLogV4FilesystemChunkShift)) {
+          return -EIO;
+        }
+        const auto header = profileLogV4FilesystemMakeDataHeader(
+          transaction.generation(),
+          pendingChunk.inode,
+          pendingChunk.chunk,
+          pendingChunk.bytes.data(),
+          pendingChunk.bytes.size());
+        std::vector<uint8_t> record;
+        record.reserve(header.size() + pendingChunk.bytes.size());
+        record.insert(record.end(), header.begin(), header.end());
+        record.insert(
+          record.end(), pendingChunk.bytes.begin(), pendingChunk.bytes.end());
+        uint64_t offset = 0;
+        if (int error = transaction.append(record.data(), record.size(), &offset)) {
+          return error;
+        }
+        inode->second.extents[pendingChunk.chunk] = {
+          pendingChunk.chunk,
+          transaction.arena(),
+          static_cast<uint32_t>(pendingChunk.bytes.size()),
+          offset,
+          profileLogV4Checksum(
+            pendingChunk.bytes.data(), pendingChunk.bytes.size()),
+        };
+      }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST
+      // Controlled selected-record fault for the reload guard below. It
+      // publishes an otherwise valid outer g=2 envelope with an empty logical
+      // payload; no production path can serialize that state.
+      if (transaction.generation() == 2) {
+        manifest->clear();
+        return 0;
+      }
+#endif
+      return serializeLogicalStateLocked(value, transaction.generation(), manifest);
+    });
+  if (result) {
+    return poisonFilesystemLocked(result);
+  }
+  state = std::move(value);
+  return 0;
+}
+
+ssize_t ProfileLogV4FilesystemBackend::writeFileLocked(
+  uint64_t id,
+  const uint8_t* buffer,
+  size_t length,
+  off_t offset,
+  const File::Metadata& metadata) {
+  if (int error = validateCurrentStateLocked()) {
+    return error;
+  }
+  if (offset < 0 || (!buffer && length)) {
+    return -EINVAL;
+  }
+  if (!length) {
+    return 0;
+  }
+  if (length > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+    return -EFBIG;
+  }
+  const uint64_t start = static_cast<uint64_t>(offset);
+  if (start > kProfileLogV4MaxSafeOffset ||
+      length > kProfileLogV4MaxSafeOffset - start) {
+    return -EFBIG;
+  }
+  const uint64_t end = start + length;
+  auto writeChunks = [&](ProfileLogV4FilesystemInode& inode,
+                         std::vector<PendingChunk>* pending,
+                         bool durable) -> int {
+    size_t cursor = 0;
+    while (cursor != length) {
+      const uint64_t position = start + cursor;
+      const uint64_t chunk = position >> kProfileLogV4FilesystemChunkShift;
+      const size_t within = static_cast<size_t>(
+        position & (kProfileLogV4FilesystemChunkSize - 1));
+      const size_t bytes = std::min(
+        kProfileLogV4FilesystemChunkSize - within, length - cursor);
+      std::vector<uint8_t> chunkBytes;
+      if (int error = getChunkForWriteLocked(inode, chunk, &chunkBytes)) {
+        return error;
+      }
+      memcpy(chunkBytes.data() + within, buffer + cursor, bytes);
+      if (durable) {
+        inode.extents.erase(chunk);
+        pending->push_back({id, chunk, std::move(chunkBytes)});
+      } else {
+        inode.volatileChunks[chunk] = std::move(chunkBytes);
+        inode.extents.erase(chunk);
+      }
+      cursor += bytes;
+    }
+    inode.size = std::max(inode.size, end);
+    inode.metadata = metadata;
+    return 0;
+  };
+  if (auto orphan = orphans.find(id); orphan != orphans.end()) {
+    if (orphan->second.kind != ProfileLogV4FilesystemInodeKind::Regular ||
+        !profileLogV4FilesystemValidMetadata(metadata, orphan->second.kind)) {
+      return -ENOENT;
+    }
+    if (int error = writeChunks(orphan->second, nullptr, false)) {
+      return poisonFilesystemLocked(error);
+    }
+    return static_cast<ssize_t>(length);
+  }
+  const auto found = state.inodes.find(id);
+  if (found == state.inodes.end() ||
+      found->second.kind != ProfileLogV4FilesystemInodeKind::Regular ||
+      !profileLogV4FilesystemValidMetadata(metadata, found->second.kind)) {
+    return -ENOENT;
+  }
+  auto next = state;
+  std::vector<PendingChunk> pending;
+  if (int error = writeChunks(next.inodes.at(id), &pending, true)) {
+    return poisonFilesystemLocked(error);
+  }
+  if (int error = commitLogicalStateLocked(std::move(next), std::move(pending))) {
+    return error;
+  }
+  return static_cast<ssize_t>(length);
+}
+
+int ProfileLogV4FilesystemBackend::resizeFileLocked(
+  uint64_t id,
+  off_t size,
+  const File::Metadata& metadata) {
+  if (int error = validateCurrentStateLocked()) {
+    return error;
+  }
+  if (size < 0 || static_cast<uint64_t>(size) > kProfileLogV4MaxSafeOffset) {
+    return -EINVAL;
+  }
+  const uint64_t newSize = static_cast<uint64_t>(size);
+  const auto resize = [&](ProfileLogV4FilesystemInode& inode,
+                          std::vector<PendingChunk>* pending,
+                          bool durable) -> int {
+    if (inode.kind != ProfileLogV4FilesystemInodeKind::Regular ||
+        !profileLogV4FilesystemValidMetadata(metadata, inode.kind)) {
+      return -ENOENT;
+    }
+    if (newSize < inode.size) {
+      if (!newSize) {
+        inode.extents.clear();
+        inode.volatileChunks.clear();
+      } else {
+        const uint64_t lastChunk =
+          (newSize - 1) >> kProfileLogV4FilesystemChunkShift;
+        for (auto it = inode.extents.begin(); it != inode.extents.end();) {
+          if (it->first > lastChunk) {
+            it = inode.extents.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        for (auto it = inode.volatileChunks.begin();
+             it != inode.volatileChunks.end();) {
+          if (it->first > lastChunk) {
+            it = inode.volatileChunks.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        const size_t tail = static_cast<size_t>(
+          newSize & (kProfileLogV4FilesystemChunkSize - 1));
+        if (tail) {
+          std::vector<uint8_t> chunkBytes;
+          if (int error = getChunkForWriteLocked(inode, lastChunk, &chunkBytes)) {
+            return error;
+          }
+          std::fill(chunkBytes.begin() + tail, chunkBytes.end(), 0);
+          if (durable) {
+            inode.extents.erase(lastChunk);
+            pending->push_back({id, lastChunk, std::move(chunkBytes)});
+          } else {
+            inode.extents.erase(lastChunk);
+            inode.volatileChunks[lastChunk] = std::move(chunkBytes);
+          }
+        }
+      }
+    }
+    inode.size = newSize;
+    inode.metadata = metadata;
+    return 0;
+  };
+  if (auto orphan = orphans.find(id); orphan != orphans.end()) {
+    if (int error = resize(orphan->second, nullptr, false)) {
+      return error;
+    }
+    return 0;
+  }
+  if (state.inodes.find(id) == state.inodes.end()) {
+    return -ENOENT;
+  }
+  auto next = state;
+  std::vector<PendingChunk> pending;
+  if (int error = resize(next.inodes.at(id), &pending, true)) {
+    return poisonFilesystemLocked(error);
+  }
+  return commitLogicalStateLocked(std::move(next), std::move(pending));
+}
+
+int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
+  const Directory::NamespaceMutation& mutation) {
+  if (int error = validateCurrentStateLocked()) {
+    return error;
+  }
+  const auto directoryID = [&](const std::shared_ptr<Directory>& directory) {
+    if (!directory || directory->getBackend() != this ||
+        !directory->is<ProfileLogV4FilesystemDirectory>()) {
+      return uint64_t(0);
+    }
+    return std::static_pointer_cast<ProfileLogV4FilesystemDirectory>(directory)
+      ->getInode();
+  };
+  const auto inodeID = [&](const std::shared_ptr<File>& file) {
+    if (!file || file->getBackend() != this) {
+      return uint64_t(0);
+    }
+    if (file->is<ProfileLogV4FilesystemDataFile>()) {
+      return std::static_pointer_cast<ProfileLogV4FilesystemDataFile>(file)
+        ->getInode();
+    }
+    if (file->is<ProfileLogV4FilesystemDirectory>()) {
+      return std::static_pointer_cast<ProfileLogV4FilesystemDirectory>(file)
+        ->getInode();
+    }
+    if (file->is<ProfileLogV4FilesystemSymlink>()) {
+      return std::static_pointer_cast<ProfileLogV4FilesystemSymlink>(file)
+        ->getInode();
+    }
+    return uint64_t(0);
+  };
+  const auto validPostImage = [&](const std::optional<File::Metadata>& image,
+                                  ProfileLogV4FilesystemInodeKind kind) {
+    return image && profileLogV4FilesystemValidMetadata(*image, kind);
+  };
+  const auto sourceID = directoryID(mutation.sourceParent);
+  const auto destinationID = directoryID(mutation.destinationParent);
+  const auto subjectID = inodeID(mutation.subject);
+  const auto replacementID = inodeID(mutation.replacement);
+
+  switch (mutation.kind) {
+    case Directory::NamespaceMutation::Kind::CreateDataFile:
+    case Directory::NamespaceMutation::Kind::CreateDirectory:
+    case Directory::NamespaceMutation::Kind::CreateSymlink: {
+      if (!destinationID || !profileLogV4FilesystemValidName(
+                              mutation.destinationName) ||
+          !mutation.subject || subjectID || !validPostImage(
+            mutation.destinationParentPostImage,
+            ProfileLogV4FilesystemInodeKind::Directory) ||
+          !mutation.subjectPostImage ||
+          state.inodes.find(destinationID) == state.inodes.end() ||
+          state.inodes.at(destinationID).kind !=
+            ProfileLogV4FilesystemInodeKind::Directory ||
+          state.inodes.at(destinationID).entries.count(mutation.destinationName) ||
+          state.nextInode == std::numeric_limits<uint64_t>::max()) {
+        return -EIO;
+      }
+      ProfileLogV4FilesystemInodeKind kind;
+      std::string target;
+      if (mutation.kind == Directory::NamespaceMutation::Kind::CreateDataFile &&
+          mutation.subject->is<ProfileLogV4FilesystemDataFile>()) {
+        kind = ProfileLogV4FilesystemInodeKind::Regular;
+      } else if (mutation.kind ==
+                   Directory::NamespaceMutation::Kind::CreateDirectory &&
+                 mutation.subject->is<ProfileLogV4FilesystemDirectory>()) {
+        kind = ProfileLogV4FilesystemInodeKind::Directory;
+      } else if (mutation.kind ==
+                   Directory::NamespaceMutation::Kind::CreateSymlink &&
+                 mutation.subject->is<ProfileLogV4FilesystemSymlink>()) {
+        kind = ProfileLogV4FilesystemInodeKind::Symlink;
+        target = std::static_pointer_cast<ProfileLogV4FilesystemSymlink>(
+                   mutation.subject)->getTarget();
+        if (target.find('\0') != std::string::npos) {
+          return -EINVAL;
+        }
+      } else {
+        return -EIO;
+      }
+      if (!profileLogV4FilesystemValidMetadata(*mutation.subjectPostImage, kind)) {
+        return -EIO;
+      }
+      auto next = state;
+      const uint64_t newID = next.nextInode++;
+      ProfileLogV4FilesystemInode inode;
+      inode.id = newID;
+      inode.kind = kind;
+      inode.metadata = *mutation.subjectPostImage;
+      inode.target = std::move(target);
+      next.inodes.emplace(newID, std::move(inode));
+      next.inodes.at(destinationID).entries.emplace(mutation.destinationName,
+                                                     newID);
+      next.inodes.at(destinationID).metadata =
+        *mutation.destinationParentPostImage;
+      if (int error = commitLogicalStateLocked(std::move(next), {})) {
+        return error;
+      }
+      if (kind == ProfileLogV4FilesystemInodeKind::Regular) {
+        std::static_pointer_cast<ProfileLogV4FilesystemDataFile>(
+          mutation.subject)->adopt(newID);
+      } else if (kind == ProfileLogV4FilesystemInodeKind::Directory) {
+        std::static_pointer_cast<ProfileLogV4FilesystemDirectory>(
+          mutation.subject)->adopt(newID);
+      } else {
+        std::static_pointer_cast<ProfileLogV4FilesystemSymlink>(
+          mutation.subject)->adopt(newID);
+      }
+      return 0;
+    }
+
+    case Directory::NamespaceMutation::Kind::Unlink:
+    case Directory::NamespaceMutation::Kind::RemoveDirectory: {
+      if (!sourceID || !subjectID || !profileLogV4FilesystemValidName(
+                                       mutation.sourceName) ||
+          !validPostImage(mutation.sourceParentPostImage,
+                          ProfileLogV4FilesystemInodeKind::Directory) ||
+          !mutation.subjectPostImage || state.inodes.find(sourceID) ==
+            state.inodes.end() || state.inodes.find(subjectID) ==
+            state.inodes.end()) {
+        return -EIO;
+      }
+      const auto& source = state.inodes.at(sourceID);
+      const auto& subject = state.inodes.at(subjectID);
+      if (source.kind != ProfileLogV4FilesystemInodeKind::Directory ||
+          source.entries.find(mutation.sourceName) == source.entries.end() ||
+          source.entries.at(mutation.sourceName) != subjectID ||
+          subjectID == state.root ||
+          !profileLogV4FilesystemValidMetadata(
+            *mutation.subjectPostImage, subject.kind) ||
+          (mutation.kind == Directory::NamespaceMutation::Kind::Unlink &&
+           subject.kind == ProfileLogV4FilesystemInodeKind::Directory) ||
+          (mutation.kind == Directory::NamespaceMutation::Kind::RemoveDirectory &&
+           (subject.kind != ProfileLogV4FilesystemInodeKind::Directory ||
+            !subject.entries.empty()))) {
+        return -EIO;
+      }
+      auto removed = subject;
+      removed.metadata = *mutation.subjectPostImage;
+      auto next = state;
+      next.inodes.at(sourceID).entries.erase(mutation.sourceName);
+      next.inodes.at(sourceID).metadata = *mutation.sourceParentPostImage;
+      next.inodes.erase(subjectID);
+      if (int error = commitLogicalStateLocked(std::move(next), {})) {
+        return error;
+      }
+      orphans.emplace(subjectID, std::move(removed));
+      orphanFiles[subjectID] = mutation.subject;
+      return 0;
+    }
+
+    case Directory::NamespaceMutation::Kind::Rename: {
+      if (!sourceID || !destinationID || !subjectID ||
+          !profileLogV4FilesystemValidName(mutation.sourceName) ||
+          !profileLogV4FilesystemValidName(mutation.destinationName) ||
+          !validPostImage(mutation.sourceParentPostImage,
+                          ProfileLogV4FilesystemInodeKind::Directory) ||
+          !mutation.subjectPostImage || state.inodes.find(sourceID) ==
+            state.inodes.end() || state.inodes.find(destinationID) ==
+            state.inodes.end() || state.inodes.find(subjectID) ==
+            state.inodes.end()) {
+        return -EIO;
+      }
+      const auto& source = state.inodes.at(sourceID);
+      const auto& destination = state.inodes.at(destinationID);
+      const auto& subject = state.inodes.at(subjectID);
+      if (source.kind != ProfileLogV4FilesystemInodeKind::Directory ||
+          destination.kind != ProfileLogV4FilesystemInodeKind::Directory ||
+          source.entries.find(mutation.sourceName) == source.entries.end() ||
+          source.entries.at(mutation.sourceName) != subjectID ||
+          subjectID == state.root ||
+          !profileLogV4FilesystemValidMetadata(
+            *mutation.subjectPostImage, subject.kind) ||
+          (sourceID != destinationID &&
+           !validPostImage(mutation.destinationParentPostImage,
+                           ProfileLogV4FilesystemInodeKind::Directory))) {
+        return -EIO;
+      }
+      const auto destinationEntry = destination.entries.find(mutation.destinationName);
+      uint64_t removedID = 0;
+      std::optional<ProfileLogV4FilesystemInode> removed;
+      if (destinationEntry != destination.entries.end() &&
+          destinationEntry->second != subjectID) {
+        removedID = destinationEntry->second;
+        const auto replacement = state.inodes.find(removedID);
+        if (replacement == state.inodes.end() || replacementID != removedID ||
+            !mutation.replacementPostImage ||
+            !profileLogV4FilesystemValidMetadata(
+              *mutation.replacementPostImage, replacement->second.kind) ||
+            (replacement->second.kind ==
+               ProfileLogV4FilesystemInodeKind::Directory &&
+             !replacement->second.entries.empty())) {
+          return -EIO;
+        }
+        removed = replacement->second;
+        removed->metadata = *mutation.replacementPostImage;
+      } else if (mutation.replacement || replacementID) {
+        return -EIO;
+      }
+      auto next = state;
+      next.inodes.at(sourceID).entries.erase(mutation.sourceName);
+      next.inodes.at(destinationID).entries.erase(mutation.destinationName);
+      next.inodes.at(destinationID).entries.emplace(mutation.destinationName,
+                                                     subjectID);
+      next.inodes.at(sourceID).metadata = *mutation.sourceParentPostImage;
+      if (sourceID != destinationID) {
+        next.inodes.at(destinationID).metadata =
+          *mutation.destinationParentPostImage;
+      }
+      next.inodes.at(subjectID).metadata = *mutation.subjectPostImage;
+      if (removedID) {
+        next.inodes.erase(removedID);
+      }
+      if (int error = commitLogicalStateLocked(std::move(next), {})) {
+        return error;
+      }
+      if (removedID) {
+        orphans.emplace(removedID, std::move(*removed));
+        orphanFiles[removedID] = mutation.replacement;
+      }
+      return 0;
+    }
+  }
+  return -EIO;
+}
+
+int ProfileLogV4FilesystemBackend::prepareOPFSProfileRetirement(
+  bool checkResources) {
+  int firstError = 0;
+  {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      firstError = operation.getError();
+    } else {
+      std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+      if (filesystemFatal) {
+        // An inner logical manifest or chunk validation error is not recorded
+        // by the outer V4 store, but it is still a profile-integrity failure.
+        // Never turn it into a clean lease handoff merely because the envelope
+        // itself remains readable.
+        firstError = filesystemFatal;
+      } else if (logicalStateLoaded) {
+        firstError = flushLocked();
+      }
+    }
+  }
+  const int inherited = ProfileLogV4Store::prepareOPFSProfileRetirement(
+    checkResources && firstError == 0);
+  return firstError ? firstError : inherited;
+}
 
 } // anonymous namespace
 
@@ -7820,6 +10485,62 @@ backend_t wasmfs_create_opfs_profile_log_v4_manifest_backend(
     return NullBackend;
   }
   error = backend->initialise(profile_name);
+  if (error) {
+    assert(error < 0);
+    if (backend->abandonFailedInitialisation()) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  return wasmFS.addBackend(std::move(backend));
+#endif
+}
+
+backend_t wasmfs_create_opfs_profile_log_v4_filesystem_backend(
+  const char* profile_name) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
+  if (!IsValidProfileLeaseName(profile_name)) {
+    errno = EINVAL;
+    return NullBackend;
+  }
+
+#ifndef __EMSCRIPTEN_PTHREADS__
+  // The V4 filesystem needs the same dedicated-worker ownership boundary as
+  // the V4 envelope. Main-thread Asyncify/JSPI cannot provide its leased OPFS
+  // lifetime or the synchronous profile access-handle semantics.
+  errno = ENOTSUP;
+  return NullBackend;
+#else
+  if (!wasmFS.reserveTerminalLeaseOwner()) {
+    errno = EBUSY;
+    return NullBackend;
+  }
+  assert(!emscripten_is_main_browser_thread() &&
+         "Cannot safely create leased OPFS backend on main browser thread");
+
+  auto backend = std::make_unique<ProfileLogV4FilesystemBackend>();
+  bool acquireProxyCompleted = false;
+  int error = backend->acquireProfileLease(
+    profile_name, &acquireProxyCompleted);
+  if (error) {
+    assert(error < 0);
+    if (acquireProxyCompleted) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+      backend->abandonUnacknowledgedProfileLeaseAcquire();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  error = backend->initialiseFilesystem(profile_name);
   if (error) {
     assert(error < 0);
     if (backend->abandonFailedInitialisation()) {

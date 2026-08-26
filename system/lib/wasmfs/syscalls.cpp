@@ -48,6 +48,14 @@ wasmfs_rename_first_parent_lock_for_testing(wasmfs::Directory* oldParent,
                                             wasmfs::Directory* newParent,
                                             wasmfs::Directory* firstParent);
 
+#ifdef WASMFS_RECORD_LOCK_TEST
+// A focused pthread test can stop fcntl after it has normalized a record-lock
+// request but before it proves that the descriptor still names that exact
+// OpenFileState. Production links leave this test-only weak hook null.
+extern "C" __attribute__((weak)) void
+wasmfs_record_lock_before_recheck_for_testing(void);
+#endif
+
 // File permission macros for wasmfs.
 // Used to improve readability compared to those in stat.h
 #define WASMFS_PERM_READ 0444
@@ -353,9 +361,21 @@ int checkRecordLockAccess(wasmfs::oflags_t flags, short type) {
   return 0;
 }
 
-int handleRecordLock(const std::shared_ptr<wasmfs::OpenFileState>& openFile,
-                     struct flock* lock,
-                     bool query) {
+struct PreparedRecordLock {
+  std::shared_ptr<wasmfs::OpenFileState> openFile;
+  std::shared_ptr<wasmfs::File> file;
+  uint64_t entryIncarnation;
+  RecordLockRange range;
+};
+
+// Normalize outside the descriptor-table mutex: SEEK_END may proxy to an OPFS
+// worker. A later table/File recheck linearizes the visible record-lock change
+// with close, dup2, and a scoped profile drain before it can alter File state.
+int prepareRecordLock(const std::shared_ptr<wasmfs::OpenFileState>& openFile,
+                      uint64_t entryIncarnation,
+                      struct flock* lock,
+                      bool query,
+                      PreparedRecordLock& prepared) {
   if (!lock || !isValidRecordLockType(lock->l_type, query)) {
     return -EINVAL;
   }
@@ -383,6 +403,43 @@ int handleRecordLock(const std::shared_ptr<wasmfs::OpenFileState>& openFile,
     return err;
   }
 
+  if (!query) {
+    if (int err = checkRecordLockAccess(flags, lock->l_type)) {
+      return err;
+    }
+  }
+
+  prepared = {openFile, std::move(file), entryIncarnation, range};
+  return 0;
+}
+
+// Apply only after the descriptor table proves the originally normalized open
+// file is still installed at |fd|. FileTable::setEntry() clears process-owned
+// locks while holding the same Table -> OpenFileState -> File lock order, so a
+// close that wins this race cannot leave a stale lock in a dcache-retained
+// File object.
+int applyPreparedRecordLock(int fd,
+                            const PreparedRecordLock& prepared,
+                            struct flock* lock,
+                            bool query) {
+#ifdef WASMFS_RECORD_LOCK_TEST
+  if (wasmfs_record_lock_before_recheck_for_testing) {
+    wasmfs_record_lock_before_recheck_for_testing();
+  }
+#endif
+
+  auto fileTable = wasmfs::wasmFS.getFileTable().locked();
+  const auto current = fileTable.getEntrySnapshot(fd);
+  if (current.openFile != prepared.openFile ||
+      current.incarnation != prepared.entryIncarnation) {
+    return -EBADF;
+  }
+  auto lockedOpenFile = prepared.openFile->locked();
+  if (lockedOpenFile.getFile() != prepared.file) {
+    return -EBADF;
+  }
+  auto lockedFile = prepared.file->locked();
+
   if (query) {
     // A valid leased OPFS profile admits exactly one WasmFS process. POSIX
     // F_GETLK ignores locks owned by that same process, so every supported
@@ -392,14 +449,12 @@ int handleRecordLock(const std::shared_ptr<wasmfs::OpenFileState>& openFile,
     return 0;
   }
 
-  if (int err = checkRecordLockAccess(flags, lock->l_type)) {
-    return err;
-  }
-
   // F_SETLKW is immediately satisfiable in this exclusive single-process
   // domain. It has the same state transition as F_SETLK and never blocks the
   // browser runtime thread waiting for a lock owner that cannot exist here.
-  lockedFile.applyRecordLock(lock->l_type, range.start, range.end);
+  lockedFile.applyRecordLock(lock->l_type,
+                             prepared.range.start,
+                             prepared.range.end);
   return 0;
 }
 
@@ -1207,6 +1262,17 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
         }
         created = std::move(dataFile);
       } else {
+        // A backend that owns atomic namespace transactions must not be
+        // exposed through the historical cache-only file-mount path. Its
+        // createFile() result is deliberately a private transaction candidate,
+        // not a durable standalone file, so mounting it here could publish an
+        // unreachable inode even when the following open fails. Such a
+        // backend may provide an explicit mount-root directory factory, but
+        // it has no corresponding safe file-mount contract.
+        if (backend->requiresAtomicNamespaceMutations()) {
+          return -ENOTSUP;
+        }
+        const std::string mountName(childName);
         created = backend->createFile(mode);
         if (!created) {
           // TODO Receive a specific error code, and report it here. For now,
@@ -1214,8 +1280,36 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
           return -EIO;
         }
         [[maybe_unused]] bool mounted =
-          lockedParent.mountChild(std::string(childName), created);
+          lockedParent.mountChild(mountName, created);
         assert(mounted);
+
+        // This cache-only mount is not a durable namespace mutation. If a
+        // later attempt to open or install its descriptor fails, undo its
+        // publication before reporting the error. Otherwise a failed
+        // wasmfs_create_file() could leave an inode-0 candidate reachable in
+        // the parent dcache.
+        const auto rollbackMount = [&]() {
+          const int error = lockedParent.removeChild(mountName);
+          return error;
+        };
+        if (returnMode == OpenReturnMode::Nothing) {
+          return 0;
+        }
+        std::shared_ptr<OpenFileState> openFile;
+        if (auto err = OpenFileState::create(created, flags, openFile)) {
+          assert(err < 0);
+          if (int rollbackError = rollbackMount()) {
+            return rollbackError;
+          }
+          return err;
+        }
+        const int installed = installOpenFile(std::move(openFile));
+        if (installed < 0) {
+          if (int rollbackError = rollbackMount()) {
+            return rollbackError;
+          }
+        }
+        return installed;
       }
       // TODO: Check that the insert actually succeeds.
       if (returnMode == OpenReturnMode::Nothing) {
@@ -1474,7 +1568,11 @@ doMkdir(path::ParsedParent parsed,
       return error;
     }
   } else {
-    auto created = backend->createDirectory(mode);
+    // Persistent namespace backends may use createDirectory() solely to make
+    // private atomic-create candidates. Give an explicit mount its own root
+    // factory so a second mount cannot appear to succeed with one of those
+    // unreachable candidates.
+    auto created = backend->createMountRootDirectory(mode);
     if (!created) {
       // TODO Receive a specific error code, and report it here. For now, report
       //      a generic error.
@@ -2729,11 +2827,14 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
   WASMFS_GUARD_NEGATIVE();
   if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
     std::shared_ptr<OpenFileState> openFile;
+    uint64_t entryIncarnation = 0;
     {
       // Record-lock normalization can query an OPFS file's size. Do not hold
       // the descriptor-table mutex over that proxying operation.
       auto fileTable = wasmFS.getFileTable().locked();
-      openFile = fileTable.getEntry(fd);
+      const auto snapshot = fileTable.getEntrySnapshot(fd);
+      openFile = snapshot.openFile;
+      entryIncarnation = snapshot.incarnation;
     }
     if (!openFile) {
       return -EBADF;
@@ -2748,15 +2849,20 @@ int __syscall_fcntl64(int fd, int cmd, ...) {
     lock = va_arg(v1, struct flock*);
     va_end(v1);
 
-    if (cmd == F_GETLK) {
+    const bool query = cmd == F_GETLK;
+    PreparedRecordLock prepared;
+    if (int err =
+          prepareRecordLock(openFile, entryIncarnation, lock, query, prepared)) {
+      return err;
+    }
+    if (query) {
       // If these constants differ then we'd need a case for both.
       static_assert(F_GETLK == F_GETLK64);
-      return handleRecordLock(openFile, lock, true);
+    } else {
+      static_assert(F_SETLK == F_SETLK64);
+      static_assert(F_SETLKW == F_SETLKW64);
     }
-
-    static_assert(F_SETLK == F_SETLK64);
-    static_assert(F_SETLKW == F_SETLKW64);
-    return handleRecordLock(openFile, lock, false);
+    return applyPreparedRecordLock(fd, prepared, lock, query);
   }
 
   auto fileTable = wasmFS.getFileTable().locked();

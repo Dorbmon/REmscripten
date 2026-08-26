@@ -2054,6 +2054,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
         'opfs_profile_log_v4_test_selected_corruption')
     self.opfs_profile_log_v4_test_live_corruption = kwargs.pop(
         'opfs_profile_log_v4_test_live_corruption')
+    self.opfs_profile_log_v4_test_empty_post_root_manifest = kwargs.pop(
+        'opfs_profile_log_v4_test_empty_post_root_manifest')
     self.opfs_get_child_proxy_failure_test = kwargs.pop(
         'opfs_get_child_proxy_failure_test')
     self.opfs_directory_proxy_completion_failure_test = kwargs.pop(
@@ -2105,6 +2107,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     if self.opfs_profile_log_v4_test_live_corruption:
       cflags += ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION=' +
                  str(self.opfs_profile_log_v4_test_live_corruption)]
+    if self.opfs_profile_log_v4_test_empty_post_root_manifest:
+      cflags += ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST=1']
     if self.opfs_get_child_proxy_failure_test:
       cflags += ['-DWASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE']
     if self.opfs_directory_proxy_completion_failure_test:
@@ -2152,6 +2156,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     if self.opfs_profile_log_v4_test_live_corruption:
       name += '-opfs-profile-log-v4-live-corruption-' + str(
           self.opfs_profile_log_v4_test_live_corruption)
+    if self.opfs_profile_log_v4_test_empty_post_root_manifest:
+      name += '-opfs-profile-log-v4-empty-post-root-manifest'
     if self.opfs_get_child_proxy_failure_test:
       name += '-opfs-get-child-proxy-failure-test'
     if self.opfs_directory_proxy_completion_failure_test:
@@ -2175,6 +2181,7 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       'opfs_profile_log_v4_test_interrupt',
       'opfs_profile_log_v4_test_selected_corruption',
       'opfs_profile_log_v4_test_live_corruption',
+      'opfs_profile_log_v4_test_empty_post_root_manifest',
       'opfs_get_child_proxy_failure_test',
       'opfs_directory_proxy_completion_failure_test']
 
@@ -2208,6 +2215,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION),
         opfs_profile_log_v4_test_live_corruption=(
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION),
+        opfs_profile_log_v4_test_empty_post_root_manifest=bool(
+            settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST),
         opfs_get_child_proxy_failure_test=(
             settings.WASMFS_OPFS_TEST_GET_CHILD_PROXY_FAILURE),
         opfs_directory_proxy_completion_failure_test=(

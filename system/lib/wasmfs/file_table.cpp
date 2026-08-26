@@ -8,18 +8,24 @@
 #include "file_table.h"
 #include "special_files.h"
 
+#include <cstdlib>
+#include <limits>
+
 namespace wasmfs {
 
 FileTable::FileTable() {
   entries.emplace_back();
+  entryIncarnations.emplace_back();
   (void)OpenFileState::create(
     SpecialFiles::getStdin(), O_RDONLY, entries.back());
   entries.back()->uses = 1;
   entries.emplace_back();
+  entryIncarnations.emplace_back();
   (void)OpenFileState::create(
     SpecialFiles::getStdout(), O_WRONLY, entries.back());
   entries.back()->uses = 1;
   entries.emplace_back();
+  entryIncarnations.emplace_back();
   (void)OpenFileState::create(
     SpecialFiles::getStderr(), O_WRONLY, entries.back());
   entries.back()->uses = 1;
@@ -32,6 +38,14 @@ std::shared_ptr<OpenFileState> FileTable::Handle::getEntry(__wasi_fd_t fd) {
   return fileTable.entries[fd];
 }
 
+FileTable::Handle::EntrySnapshot
+FileTable::Handle::getEntrySnapshot(__wasi_fd_t fd) {
+  if (fd >= fileTable.entries.size() || fd < 0) {
+    return {};
+  }
+  return {fileTable.entries[fd], fileTable.entryIncarnations[fd]};
+}
+
 std::shared_ptr<DataFile>
 FileTable::Handle::setEntry(__wasi_fd_t fd,
                             std::shared_ptr<OpenFileState> openFile) {
@@ -39,6 +53,15 @@ FileTable::Handle::setEntry(__wasi_fd_t fd,
   assert(fd < WASMFS_FD_MAX);
   if (fd >= fileTable.entries.size()) {
     fileTable.entries.resize(fd + 1);
+    fileTable.entryIncarnations.resize(fd + 1);
+  }
+  // Do not silently reuse a descriptor incarnation in a release build. There
+  // is no error channel from setEntry(), and reusing it could let an ancient
+  // fcntl snapshot pass its publication recheck, so terminate before changing
+  // the table if a process somehow reaches this otherwise unreachable limit.
+  if (fileTable.entryIncarnations[fd] ==
+      std::numeric_limits<uint64_t>::max()) {
+    std::abort();
   }
   if (openFile) {
     ++openFile->uses;
@@ -53,6 +76,11 @@ FileTable::Handle::setEntry(__wasi_fd_t fd,
       ret = oldFile->dynCast<DataFile>();
     }
   }
+  // In practice this counter cannot wrap: reaching it would require more
+  // than 2^64 replacements of one descriptor without destroying WasmFS. The
+  // pre-increment release-build guard above makes that limit fail closed.
+  ++fileTable.entryIncarnations[fd];
+  assert(fileTable.entryIncarnations[fd] != 0);
   fileTable.entries[fd] = openFile;
   return ret;
 }

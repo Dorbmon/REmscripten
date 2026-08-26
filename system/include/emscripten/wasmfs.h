@@ -230,6 +230,27 @@ int wasmfs_opfs_profile_log_v4_commit_manifest(backend_t backend,
                                                const uint8_t* data,
                                                size_t size);
 
+// Creates the experimental mountable V4 logical-profile filesystem. Its
+// regular files use immutable copy-on-write chunks and its inode, directory,
+// symlink, size, and complete metadata post-images are published through the
+// V4 descriptor/witness quorum. The physical files use a distinct `fs` stem,
+// so an opaque V4 manifest with the same profile name is never interpreted as
+// a filesystem. Mount the returned backend with wasmfs_create_directory().
+//
+// This is an isolated WasmFS persistence experiment, not yet a Chromium
+// profile backend. While its browser Web Lock lease is active it supports
+// WasmFS's single-process POSIX fcntl range-lock subset, including
+// any-descriptor-close release; it does not support flock or turn arbitrary
+// external OPFS users into lock participants. SQLite/LevelDB recovery,
+// Chrome-owned shutdown admission, and Chromium profile activation remain
+// separate gates. It has the same pthread-only leased-OPFS, Web Lock,
+// profile-name validation, one-leased-backend-per-WasmFS-instance, and
+// explicit-drain requirements as the V2/V3/V4 experiments. On failure it
+// returns NULL and sets errno. The opaque V4 manifest read/commit APIs reject
+// this backend with -ENOTSUP.
+backend_t wasmfs_create_opfs_profile_log_v4_filesystem_backend(
+  const char* profile_name);
+
 // Creates the experimental V3 fixed-file payload projection. This is
 // deliberately not a mountable filesystem backend: it creates no directories
 // and exposes at most one regular DataFile through wasmfs_create_file() in the

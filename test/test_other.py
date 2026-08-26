@@ -13602,6 +13602,14 @@ Module.postRun = () => {{
     self.do_runf('wasmfs/wasmfs_fcntl_locks.c', 'success',
                  cflags=['-sWASMFS_RECORD_LOCK_TEST=1'])
 
+  @requires_pthreads
+  def test_wasmfs_fcntl_close_race(self):
+    self.set_setting('WASMFS')
+    self.do_runf(
+        'wasmfs/wasmfs_fcntl_close_race.c', 'success',
+        cflags=['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME',
+                '-sWASMFS_RECORD_LOCK_TEST=1'])
+
   def test_wasmfs_fcntl_locks_unsupported(self):
     self.set_setting('WASMFS')
     self.do_runf('wasmfs/wasmfs_fcntl_locks_unsupported.c', 'success')

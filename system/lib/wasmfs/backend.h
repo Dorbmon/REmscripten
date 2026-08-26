@@ -25,6 +25,17 @@ public:
   virtual std::shared_ptr<Directory> createDirectory(mode_t mode) = 0;
   virtual std::shared_ptr<Symlink> createSymlink(std::string target) = 0;
 
+  // Construct the root supplied by wasmfs_create_directory() when its
+  // explicit backend differs from the parent mount. Most backends use the
+  // same factory for an ordinary child and a mount root, so retain that
+  // historical default. A persistent backend which returns private directory
+  // candidates from createDirectory() for atomic namespace transactions must
+  // override this: an explicit second mount must never publish an unreachable
+  // candidate and report success.
+  virtual std::shared_ptr<Directory> createMountRootDirectory(mode_t mode) {
+    return createDirectory(mode);
+  }
+
   // Whether this backend permits WasmFS to attempt explicit POSIX mode and
   // timestamp setters on its Files. A true result does not promise that the
   // metadata is durable or survives a remount: each File may still reject its
@@ -76,6 +87,15 @@ public:
   // before opting in, so a successful fcntl lock never merely masks
   // cross-instance data races.
   virtual bool supportsRecordLocks() const { return false; }
+
+  // Validate storage state once after a public WasmFS operation has acquired
+  // this backend's admission token and before pathname or descriptor caches
+  // can answer from a previously discovered File object. Persistent backends
+  // use this to fail closed when a selected durable generation no longer
+  // validates; the default leaves historical in-memory and non-persistent
+  // backends unchanged. The implementation must return zero or a negative
+  // errno and must not re-enter a public WasmFS operation.
+  virtual int validateOperation() { return 0; }
 
   // A leased OPFS backend uses this narrow operation admission protocol while
   // a profile-specific drain seals it. Other backends remain no-ops so their

@@ -62,12 +62,14 @@ typedef struct wasmfs_opfs_profile_drain_result {
 // wasmfs_create_opfs_profile_namespace_backend(), or the experimental
 // wasmfs_create_opfs_profile_log_v2_control_backend(), or the experimental
 // wasmfs_create_opfs_profile_log_v3_data_backend(), or the experimental
-// wasmfs_create_opfs_profile_log_v4_manifest_backend(). This is an embedding
+// wasmfs_create_opfs_profile_log_v4_manifest_backend(), or the experimental
+// wasmfs_create_opfs_profile_log_v4_filesystem_backend(). This is an embedding
 // primitive for a profile-specific orderly handoff. The V2 control and V4
 // manifest primitives have no mount or fd-table descriptors of their own,
-// while V3 has at most its one explicitly attached DataFile projection; all
-// still own private OPFS handles and the same cooperative lease. The drain
-// leaves unrelated WasmFS mounts, descriptors, and stdio usable.
+// while V3 has at most its one explicitly attached DataFile projection and V4
+// filesystem descriptors are detached and closed by the drain; all still own
+// private OPFS handles and the same cooperative lease. The drain leaves
+// unrelated WasmFS mounts, descriptors, and stdio usable.
 //
 // The backend must be the exact live leased-OPFS backend returned by that
 // factory. Default OPFS and every other backend return -ENOTSUP. The call must

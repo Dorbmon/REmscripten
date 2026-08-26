@@ -9,6 +9,7 @@
 
 #include "file.h"
 #include <assert.h>
+#include <cstdint>
 #include <fcntl.h>
 #include <mutex>
 #include <utility>
@@ -104,6 +105,11 @@ class FileTable {
   friend class WasmFS;
 
   std::vector<std::shared_ptr<OpenFileState>> entries;
+  // Every setEntry() call creates a new descriptor-table incarnation, even
+  // when dup2() reinstalls the same OpenFileState after closing the target.
+  // fcntl record-lock publication captures this under the table lock so a
+  // close/reinsert cannot resurrect a lock that POSIX any-close just cleared.
+  std::vector<uint64_t> entryIncarnations;
   std::recursive_mutex mutex;
 
   FileTable();
@@ -115,10 +121,21 @@ public:
     std::unique_lock<std::recursive_mutex> lock;
 
   public:
+    struct EntrySnapshot {
+      std::shared_ptr<OpenFileState> openFile;
+      uint64_t incarnation = 0;
+    };
+
     Handle(FileTable& fileTable)
       : fileTable(fileTable), lock(fileTable.mutex) {}
 
     std::shared_ptr<OpenFileState> getEntry(__wasi_fd_t fd);
+
+    // Capture both the descriptor's current OpenFileState and its table-slot
+    // incarnation while the FileTable mutex is held. The incarnation changes
+    // on every close, replacement, or insertion at this fd, including a
+    // reinserted alias of the same OpenFileState.
+    EntrySnapshot getEntrySnapshot(__wasi_fd_t fd);
 
     // Set the table slot at `fd` to the given file. If this overwrites the last
     // reference to an OpenFileState for a data file in the table, return the

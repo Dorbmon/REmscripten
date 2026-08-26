@@ -8436,6 +8436,590 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem(self):
+    # The V4 filesystem is an isolated WasmFS mount proof. Fresh documents
+    # cover its durable inode tree, copy-on-write data, metadata, namespace,
+    # directory flush, and orderly lease handoff. This does not yet claim
+    # database recovery, browser-crash/power-loss recovery, record-lock
+    # success, or Chromium-profile activation.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = (
+      f'wasmfs_profile_log_v4_filesystem_{random.getrandbits(64):016x}')
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TEST_PROFILE_NAME=' + profile)
+
+    def compile_role(output, role):
+      self.compile_btest(
+        test, common_args + [profile_arg, role, '-o', output],
+        reporting=Reporting.NONE)
+
+    compile_role('v4fs-owner.html',
+                 '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TEST_OWNER')
+    compile_role('v4fs-mutator.html',
+                 '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TEST_MUTATOR')
+    compile_role('v4fs-verifier.html',
+                 '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TEST_VERIFIER')
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kOwner = 0;
+        const kMutator = 1;
+        const kVerifier = 2;
+        const kBusy = 16;
+        const kWitnessType = 'wasmfs-opfs-profile-log-v4-filesystem';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          await runAfterLeaseRelease('v4fs-owner.html', kOwner,
+                                     'V4 filesystem owner');
+          await runAfterLeaseRelease('v4fs-mutator.html', kMutator,
+                                     'fresh V4 filesystem mutator');
+          await runAfterLeaseRelease('v4fs-verifier.html', kVerifier,
+                                     'fresh V4 filesystem verifier');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_bootstrap_recovery(self):
+    # Every safe native bootstrap cut point runs in a fresh iframe. The parent
+    # discards that document at the exact durable witness checkpoint and proves
+    # that a new document either mounts, writes, reads, and drains the profile,
+    # or rejects an intentionally incomplete bootstrap without creating a
+    # replacement root. Separate runs interrupt cleanup after each fixed-name
+    # deletion, so bootstrap-last retirement is exercised rather than assumed.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_recovery.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+
+    def profile_arg(profile):
+      return ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_PROFILE_NAME='
+              + profile)
+
+    def compile_role(output, profile, role, phase=None, extra_args=None):
+      args = common_args + [profile_arg(profile), role]
+      if phase is not None:
+        args += [
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_INTERRUPT_PHASE='
+          + str(phase),
+          '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1',
+        ]
+      if extra_args:
+        args += extra_args
+      self.compile_btest(test, args + ['-o', output], reporting=Reporting.NONE)
+
+    recovery_cases = []
+    for phase in (0, 1, 2, 3, 4):
+      profile = ('wasmfs_profile_log_v4_bootstrap_recovery_%d_%016x' %
+                 (phase, random.getrandbits(64)))
+      interruptor = 'v4fs-bootstrap-%d-interruptor.html' % phase
+      verifier = 'v4fs-bootstrap-%d-verifier.html' % phase
+      reload = 'v4fs-bootstrap-%d-reload.html' % phase
+      compile_role(
+        interruptor, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_INTERRUPTOR',
+        phase)
+      compile_role(
+        verifier, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_VERIFIER')
+      compile_role(
+        reload, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_RELOAD')
+      recovery_cases.append((phase, interruptor, verifier, reload))
+
+    fail_closed_cases = []
+    for phase in (-2, -1):
+      profile = ('wasmfs_profile_log_v4_bootstrap_fail_closed_%d_%016x' %
+                 (-phase, random.getrandbits(64)))
+      interruptor = 'v4fs-bootstrap-fail-%d-interruptor.html' % -phase
+      verifier = 'v4fs-bootstrap-fail-%d-verifier.html' % -phase
+      compile_role(
+        interruptor, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_INTERRUPTOR',
+        phase)
+      compile_role(
+        verifier, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_FAIL_CLOSED')
+      fail_closed_cases.append((phase, interruptor, verifier))
+
+    empty_post_root_profile = (
+      'wasmfs_profile_log_v4_empty_post_root_%016x' %
+      random.getrandbits(64))
+    compile_role(
+      'v4fs-bootstrap-empty-post-root-interruptor.html',
+      empty_post_root_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_INTERRUPTOR',
+      9,
+      ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST=1'])
+    compile_role(
+      'v4fs-bootstrap-empty-post-root-verifier.html',
+      empty_post_root_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_FAIL_CLOSED')
+
+    cleanup_cases = []
+    for phase in (5, 6, 7, 8):
+      profile = ('wasmfs_profile_log_v4_bootstrap_cleanup_%d_%016x' %
+                 (phase, random.getrandbits(64)))
+      seed = 'v4fs-bootstrap-cleanup-%d-seed.html' % phase
+      interruptor = 'v4fs-bootstrap-cleanup-%d-interruptor.html' % phase
+      verifier = 'v4fs-bootstrap-cleanup-%d-verifier.html' % phase
+      reload = 'v4fs-bootstrap-cleanup-%d-reload.html' % phase
+      # Phase 1 has a mirrored PREPARED pair and all three sibling names, but
+      # no mountable root. It is the seed state for each delete interruption.
+      compile_role(
+        seed, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_INTERRUPTOR',
+        1)
+      compile_role(
+        interruptor, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_INTERRUPTOR',
+        phase)
+      compile_role(
+        verifier, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_VERIFIER')
+      compile_role(
+        reload, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_RECOVERY_TEST_RELOAD')
+      cleanup_cases.append((phase, seed, interruptor, verifier, reload))
+
+    recovery_script = '\n'.join(
+      "          await interruptAfterRelease('%s', %d, 'bootstrap phase %d');\n"
+      "          await runAfterLeaseRelease('%s', kVerifier, "
+      "'bootstrap phase %d recovery verifier');\n"
+      "          await runAfterLeaseRelease('%s', kReload, "
+      "'bootstrap phase %d fresh reload');" %
+      (interruptor, phase, phase, verifier, phase, reload, phase)
+      for phase, interruptor, verifier, reload in recovery_cases)
+    fail_closed_script = '\n'.join(
+      "          await interruptAfterRelease('%s', %d, 'incomplete bootstrap phase %d');\n"
+      "          await runAfterLeaseRelease('%s', kFailClosed, "
+      "'incomplete bootstrap phase %d fail-closed verifier');" %
+      (interruptor, phase, phase, verifier, phase)
+      for phase, interruptor, verifier in fail_closed_cases)
+    cleanup_script = '\n'.join(
+      "          await interruptAfterRelease('%s', 1, 'cleanup phase %d seed');\n"
+      "          await interruptAfterRelease('%s', %d, 'cleanup phase %d interruption');\n"
+      "          await runAfterLeaseRelease('%s', kVerifier, "
+      "'cleanup phase %d recovery verifier');\n"
+      "          await runAfterLeaseRelease('%s', kReload, "
+      "'cleanup phase %d fresh reload');" %
+      (seed, phase, interruptor, phase, phase, verifier, phase, reload, phase)
+      for phase, seed, interruptor, verifier, reload in cleanup_cases)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kInterruptor = 0;
+        const kVerifier = 1;
+        const kReload = 2;
+        const kFailClosed = 3;
+        const kBusy = 16;
+        const kWitnessType = 'wasmfs-opfs-profile-log-v4-filesystem-recovery';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function interruptAfterRelease(path, checkpoint, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.event !== 'interrupt' ||
+                message.checkpoint !== checkpoint) {
+              throw new Error(description + ' did not reach checkpoint ' +
+                              checkpoint + ': role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+%(recovery_script)s
+%(fail_closed_script)s
+          await interruptAfterRelease(
+            'v4fs-bootstrap-empty-post-root-interruptor.html', 9,
+            'empty post-root manifest interruption');
+          await runAfterLeaseRelease(
+            'v4fs-bootstrap-empty-post-root-verifier.html', kFailClosed,
+            'empty post-root manifest fail-closed verifier');
+%(cleanup_script)s
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''' % {
+      'recovery_script': recovery_script,
+      'fail_closed_script': fail_closed_script,
+      'cleanup_script': cleanup_script,
+    })
+    self.run_browser('a.html', '/report_result?0', timeout=240)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_locks(self):
+    # Chromium database files use process-owned fcntl ranges. Exercise the V4
+    # filesystem's leased single-process subset in separate documents: another
+    # profile instance is rejected while a holder owns the Web Lock, then both
+    # document teardown and explicit drain release it for a fresh lock user.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_locks.c'
+    common_args = [
+      '-sWASMFS',
+      '-pthread',
+      '-sPROXY_TO_PTHREAD',
+      '-lopfs.js',
+      '-sWASMFS_RECORD_LOCK_TEST=1',
+    ]
+    profile = 'wasmfs_profile_log_v4_locks_%016x' % random.getrandbits(64)
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_PROFILE_NAME=' +
+      profile)
+
+    def compile_role(output, role):
+      self.compile_btest(
+        test,
+        common_args + [profile_arg, role, '-o', output],
+        reporting=Reporting.NONE)
+
+    compile_role(
+      'v4fs-lock-holder.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_HOLDER')
+    compile_role(
+      'v4fs-lock-contender.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_CONTENDER')
+    compile_role(
+      'v4fs-lock-drainer.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_DRAINER')
+    compile_role(
+      'v4fs-lock-verifier.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_VERIFIER')
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kDrainer = 2;
+        const kVerifier = 3;
+        const kBusy = 16;
+        const kWitnessType = 'wasmfs-opfs-profile-log-v4-filesystem-locks';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        function requireMessage(message, role, event, description) {
+          if (message.role !== role || message.error !== 0 ||
+              message.event !== event) {
+            throw new Error(description + ' failed: role=' + message.role +
+                            ', event=' + message.event +
+                            ', errno=' + message.error);
+          }
+        }
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            requireMessage(message, role, 'result', description);
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          let holder;
+          let drainer;
+          try {
+            holder = launchModule('v4fs-lock-holder.html');
+            requireMessage(await waitFor(holder, 'V4 lock holder'), kHolder,
+                           'ready', 'V4 lock holder');
+
+            const contender = launchModule('v4fs-lock-contender.html');
+            try {
+              requireMessage(await waitFor(contender, 'V4 lock contender'),
+                             kContender, 'result', 'V4 lock contender');
+            } finally {
+              disposeModule(contender);
+            }
+
+            // This is a crash-boundary/iframe-disposal probe. The later
+            // drainer case below is the orderly Chromium-shutdown path.
+            disposeModule(holder);
+            holder = undefined;
+            await runAfterLeaseRelease('v4fs-lock-verifier.html', kVerifier,
+                                       'V4 lock verifier after disposal');
+
+            drainer = launchModule('v4fs-lock-drainer.html');
+            requireMessage(await waitFor(drainer, 'V4 explicit drainer'),
+                           kDrainer, 'ready', 'V4 explicit drainer');
+            // The drainer remains alive with its old descriptor table after a
+            // successful detach/flush/close/release. A fresh module must still
+            // obtain the lease and take its own database locks.
+            await runAfterLeaseRelease('v4fs-lock-verifier.html', kVerifier,
+                                       'V4 lock verifier after explicit drain');
+            reportResultToServer('0');
+          } finally {
+            if (drainer) {
+              disposeModule(drainer);
+            }
+            if (holder) {
+              disposeModule(holder);
+            }
+          }
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v2_proxy_completion_failure(self):
     # A test-only terminal latch after a successfully flushed inactive V2 root
     # must make the explicit failed drain issue no later Worker proxy. It

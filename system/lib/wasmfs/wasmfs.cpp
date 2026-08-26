@@ -284,6 +284,13 @@ int WasmFS::Operation::admitBackend(backend_t backend) {
   if (int err = backend->acquireProfileOperation()) {
     return err;
   }
+  if (int err = backend->validateOperation()) {
+    // A failed validation did not become part of this operation's held
+    // backend set. Release its just-acquired token immediately so an
+    // integrity error cannot strand an otherwise healthy profile lease.
+    backend->releaseProfileOperation();
+    return err < 0 ? err : -EIO;
+  }
   admittedBackends.push_back(backend);
   return 0;
 }
