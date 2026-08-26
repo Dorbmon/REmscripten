@@ -56,6 +56,23 @@ int main() {
   assert(fileInode == newFile.st_ino);
   close(newfd);
 
+  // The default memory backend inherits File::getIno(). Keep a regular file's
+  // inode available and stable across independently opened descriptors.
+  int regularfd = open("wasmfs-stat-regular", O_CREAT | O_RDWR | O_TRUNC, 0600);
+  assert(regularfd >= 0);
+  struct stat regularFile;
+  assert(fstat(regularfd, &regularFile) == 0);
+  assert(regularFile.st_ino);
+  close(regularfd);
+
+  regularfd = open("wasmfs-stat-regular", O_RDONLY);
+  assert(regularfd >= 0);
+  struct stat reopenedRegularFile;
+  assert(fstat(regularfd, &reopenedRegularFile) == 0);
+  assert(reopenedRegularFile.st_ino == regularFile.st_ino);
+  close(regularfd);
+  assert(unlink("wasmfs-stat-regular") == 0);
+
   // Test opening a directory and calling fstat.
   struct stat directory;
   int fd2 = open("/dev", O_RDONLY | O_DIRECTORY);

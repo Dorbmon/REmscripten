@@ -90,7 +90,7 @@ public:
     return std::static_pointer_cast<T>(shared_from_this());
   }
 
-  ino_t getIno() {
+  virtual ino_t getIno() {
     // Set inode number to the file pointer. This gives a unique inode number.
     // TODO: For security it would be better to use an indirect mapping.
     // Ensure that the pointer will not overflow an ino_t.
