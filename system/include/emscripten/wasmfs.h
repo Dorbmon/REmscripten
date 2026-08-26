@@ -196,6 +196,31 @@ int wasmfs_opfs_profile_log_v2_read_root(backend_t backend,
 int wasmfs_opfs_profile_log_v2_commit_root(backend_t backend,
                                            uint64_t value);
 
+// Creates the experimental V3 fixed-file payload projection. This is
+// deliberately not a mountable filesystem backend: it creates no directories
+// and exposes at most one regular DataFile through wasmfs_create_file() in the
+// caller's existing WasmFS namespace. The caller must pass the same
+// |payload_mode| when attaching that projection in a fresh WasmFS instance.
+//
+// V3 stores one bounded payload and its complete mode/atime/mtime/ctime image
+// in immutable, checksummed pages in two opaque OPFS arena files. Its fixed
+// bootstrap/control files select only a CLEAN descriptor quorum. The payload
+// file opts into WasmFS's paired data/metadata hooks, so successful write,
+// resize, and explicit metadata operations have already committed their full
+// post-image before WasmFS publishes it in memory. A fresh instance selects
+// the old image for a valid g/g+1 phase split and then rejects mutation with
+// ESHUTDOWN; malformed selected control or page data fails the factory.
+//
+// This is a focused COW data-transaction experiment, not a Chromium profile
+// backend. It has no persistent namespace, directory fsync/rename, symlink,
+// record-lock, database, quota-management, physical-crash, or Chrome-service
+// claim. It follows the same pthread-only leased-OPFS and explicit-drain
+// requirements as the V2 control primitive. On failure it returns NULL and
+// sets errno.
+backend_t wasmfs_create_opfs_profile_log_v3_data_backend(
+  const char* profile_name,
+  mode_t payload_mode);
+
 // Creates a generic JSIMPL backend
 backend_t wasmfs_create_jsimpl_backend(void);
 

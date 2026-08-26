@@ -1902,6 +1902,25 @@ var WASMFS_OPFS_PROFILE_LOG_V2_TEST_SELECTED_CONTROL_CORRUPTION = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE = 0;
 
+// Test-only selectors for the deliberately non-mountable V3 fixed-payload
+// experiment. The interruption hook pauses after bootstrap witness zero or
+// after either flushed CLEAN phase witness. The corruption selector discards
+// a successfully-read selected phase (1), descriptor (2), or manifest (3).
+// They control code emitted at link time only; they expose no host JavaScript
+// OPFS access or production recovery API.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT = 0;
+
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION = 0;
+
+// Test-only selector that makes V3 reject its first post-bootstrap candidate
+// transaction before it writes any OPFS page and latch EIO. It is an
+// in-process fail-closed test fault, not a browser crash or physical-storage
+// corruption simulation.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR = 0;
+
 // Test-only selector that makes the first OPFS SyncAccessHandle close fail.
 // This controls code emitted at link time only; it intentionally provides no
 // runtime configuration or recovery API.

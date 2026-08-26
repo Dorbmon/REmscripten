@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <condition_variable>
 #include <errno.h>
 #include <limits>
@@ -4633,6 +4635,1412 @@ public:
   }
 };
 
+// V3 deliberately remains a one-payload data transaction experiment.  It
+// does not expose an OPFS-backed directory tree: callers may attach exactly
+// one DataFile through wasmfs_create_file(), which lets the generic paired
+// DataFile hooks exercise a real persistent transaction without claiming that
+// create/remove/rename have durable namespace semantics.
+constexpr size_t kProfileLogV3RecordSize = 128;
+constexpr size_t kProfileLogV3BootstrapSize = 2 * kProfileLogV3RecordSize;
+constexpr size_t kProfileLogV3ControlSize = 6 * kProfileLogV3RecordSize;
+constexpr size_t kProfileLogV3PageSize = 16 * 1024;
+constexpr size_t kProfileLogV3DataOffset = 64;
+constexpr size_t kProfileLogV3PayloadCapacity =
+  kProfileLogV3PageSize - kProfileLogV3DataOffset;
+constexpr uint64_t kProfileLogV3MaxSafeOffset = UINT64_C(9007199254740991);
+static_assert(kProfileLogV3BootstrapSize <= kProfileLogV3MaxSafeOffset);
+static_assert(kProfileLogV3ControlSize <= kProfileLogV3MaxSafeOffset);
+static_assert(kProfileLogV3PageSize <= kProfileLogV3MaxSafeOffset);
+constexpr uint32_t kProfileLogV3FormatVersion = 3;
+constexpr uint32_t kProfileLogV3BootstrapReady = 1;
+constexpr uint32_t kProfileLogV3PhaseClean = 1;
+constexpr uint32_t kProfileLogV3LayoutEpoch = 1;
+constexpr std::array<uint8_t, 8> kProfileLogV3BootstrapMagic = {
+  'W', 'F', 'S', 'L', 'G', '3', 'B', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV3DescriptorMagic = {
+  'W', 'F', 'S', 'L', 'G', '3', 'D', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV3PhaseMagic = {
+  'W', 'F', 'S', 'L', 'G', '3', 'P', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV3ManifestMagic = {
+  'W', 'F', 'S', 'L', 'G', '3', 'M', '0'};
+constexpr std::array<uint8_t, 8> kProfileLogV3DataMagic = {
+  'W', 'F', 'S', 'L', 'G', '3', 'D', 'A'};
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT
+#define WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT 0
+#endif
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION
+#define WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION 0
+#endif
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR
+#define WASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR 0
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT > 1
+#error "invalid profile-log V3 interruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION > 3
+#error "invalid profile-log V3 selected corruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR > 1
+#error "invalid profile-log V3 forced commit error selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT
+extern "C" void wasmfs_opfs_profile_log_v3_test_maybe_interrupt(
+  int checkpoint);
+#endif
+
+uint64_t profileLogV3Checksum(const uint8_t* data, size_t size) {
+  uint64_t result = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i != size; ++i) {
+    result ^= data[i];
+    result *= UINT64_C(1099511628211);
+  }
+  return result;
+}
+
+template <size_t Size>
+uint64_t profileLogV3ChecksumWithZeroedRange(
+  const std::array<uint8_t, Size>& data,
+  size_t offset,
+  size_t length) {
+  if (offset > Size || length > Size - offset) {
+    return 0;
+  }
+  uint64_t result = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i != Size; ++i) {
+    const uint8_t value = i >= offset && i < offset + length ? 0 : data[i];
+    result ^= value;
+    result *= UINT64_C(1099511628211);
+  }
+  return result;
+}
+
+template <size_t Size>
+bool profileLogV3HasZeroTail(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  return offset <= Size &&
+         std::all_of(data.begin() + offset,
+                     data.end(),
+                     [](uint8_t value) { return value == 0; });
+}
+
+template <size_t Size>
+bool profileLogV3HasZeroRange(const std::array<uint8_t, Size>& data,
+                              size_t offset,
+                              size_t length) {
+  return offset <= Size && length <= Size - offset &&
+         std::all_of(data.begin() + offset,
+                     data.begin() + offset + length,
+                     [](uint8_t value) { return value == 0; });
+}
+
+template <size_t Size>
+void writeProfileLogV3U32(std::array<uint8_t, Size>& data,
+                          size_t offset,
+                          uint32_t value) {
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+template <size_t Size>
+void writeProfileLogV3U64(std::array<uint8_t, Size>& data,
+                          size_t offset,
+                          uint64_t value) {
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    data[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+  }
+}
+
+template <size_t Size>
+uint32_t readProfileLogV3U32(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  uint32_t value = 0;
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    value |= uint32_t(data[offset + i]) << (8 * i);
+  }
+  return value;
+}
+
+template <size_t Size>
+uint64_t readProfileLogV3U64(const std::array<uint8_t, Size>& data,
+                             size_t offset) {
+  uint64_t value = 0;
+  for (size_t i = 0; i != sizeof(value); ++i) {
+    value |= uint64_t(data[offset + i]) << (8 * i);
+  }
+  return value;
+}
+
+uint64_t profileLogV3DoubleBits(double value) {
+  uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value));
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+double profileLogV3BitsDouble(uint64_t bits) {
+  double value = 0;
+  static_assert(sizeof(bits) == sizeof(value));
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+struct ProfileLogV3Descriptor {
+  uint64_t generation;
+  uint32_t arena;
+  uint64_t manifestOffset;
+  uint64_t manifestChecksum;
+  uint64_t arenaEnd;
+  uint64_t logicalSize;
+  uint64_t recordChecksum;
+};
+
+struct ProfileLogV3Phase {
+  uint64_t generation;
+  uint32_t arena;
+  uint64_t descriptorChecksum;
+};
+
+struct ProfileLogV3Manifest {
+  uint64_t generation;
+  uint64_t dataOffset;
+  uint64_t dataChecksum;
+  uint64_t logicalSize;
+  File::Metadata metadata;
+  uint64_t pageChecksum;
+};
+
+struct ProfileLogV3Snapshot {
+  std::vector<uint8_t> payload;
+  File::Metadata metadata;
+};
+
+class ProfileLogV3DataFile;
+
+class ProfileLogV3DataBackend final : public OPFSBackend {
+  std::recursive_mutex storeMutex;
+  std::shared_ptr<OPFSDirectory> physicalRoot;
+  std::shared_ptr<OPFSFile> bootstrap;
+  std::shared_ptr<OPFSFile> control;
+  std::array<std::shared_ptr<OPFSFile>, 2> arenas;
+  bool bootstrapOpen = false;
+  bool controlOpen = false;
+  std::array<bool, 2> arenasOpen = {};
+  bool initialisationAmbiguous = false;
+  bool bootstrapComplete = false;
+  bool payloadExposed = false;
+  bool recoveryNeedsRepair = false;
+  uint64_t profileChecksum = 0;
+  uint32_t profileLength = 0;
+  mode_t payloadMode = 0;
+  uint64_t generation = 0;
+  ProfileLogV3Snapshot snapshot;
+  int fatalError = 0;
+  std::string bootstrapName;
+  std::string controlName;
+  std::array<std::string, 2> arenaNames;
+
+  static std::string storageStem(std::string_view profileName) {
+    std::string result = ".wasmfs-profile-log-v3-";
+    result += std::to_string(profileName.size());
+    result += '-';
+    result.append(profileName.data(), profileName.size());
+    return result;
+  }
+
+  static uint64_t descriptorOffset(uint64_t recordGeneration,
+                                   uint64_t copy) {
+    return ((recordGeneration & 1) * 2 + copy) * kProfileLogV3RecordSize;
+  }
+
+  static uint64_t phaseOffset(uint64_t copy) {
+    return (4 + copy) * kProfileLogV3RecordSize;
+  }
+
+  static std::optional<uint64_t> alignPage(uint64_t offset) {
+    constexpr uint64_t kMask = kProfileLogV3PageSize - 1;
+    if (offset > kProfileLogV3MaxSafeOffset - kMask) {
+      return std::nullopt;
+    }
+    return (offset + kMask) & ~kMask;
+  }
+
+  static bool validMetadata(const File::Metadata& metadata) {
+    return S_ISREG(metadata.mode) && std::isfinite(metadata.atime) &&
+           std::isfinite(metadata.mtime) && std::isfinite(metadata.ctime);
+  }
+
+  int poisonLocked(int error) {
+    if (error >= 0) {
+      error = -EIO;
+    }
+    if (!fatalError) {
+      fatalError = error;
+    }
+    return fatalError;
+  }
+
+  int recordInitialisationProxyFailure() {
+    initialisationAmbiguous = true;
+    terminalCloseState->recordUnacknowledgedProxyCompletion();
+    return -EIO;
+  }
+
+  // Directory calls are permitted only while the fixed file set is being
+  // established or reopened. All steady-state payload operations must use the
+  // already-open AccessHandles below.
+  int admitBootstrapDirectoryOperationLocked() const {
+    return bootstrapComplete ? -ESHUTDOWN : 0;
+  }
+
+  std::shared_ptr<OPFSFile> makePhysicalFile(const std::string& name) {
+    auto file = std::make_shared<OPFSFile>(0600,
+                                           this,
+                                           kOPFSRootDirectoryID,
+                                           name,
+                                           proxy,
+                                           terminalCloseState,
+                                           profileLeaseState,
+                                           terminalCloseState);
+    file->locked().setParent(physicalRoot);
+    return file;
+  }
+
+  int initialisePhysicalRootLocked() {
+    if (int error = admitBootstrapDirectoryOperationLocked()) {
+      return error;
+    }
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    if (!proxy([](auto ctx) { _wasmfs_opfs_init_root_directory(ctx.ctx); })) {
+      return recordInitialisationProxyFailure();
+    }
+    physicalRoot = std::make_shared<OPFSDirectory>(0700,
+                                                    this,
+                                                    kOPFSRootDirectoryID,
+                                                    proxy,
+                                                    terminalCloseState,
+                                                    profileLeaseState,
+                                                    terminalCloseState);
+    return 0;
+  }
+
+  int lookupPhysicalFileLocked(const std::string& name) {
+    if (int error = admitBootstrapDirectoryOperationLocked()) {
+      return error;
+    }
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    int childType = 0;
+    int childID = -EIO;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_get_child(ctx.ctx,
+                                 kOPFSRootDirectoryID,
+                                 name.c_str(),
+                                 &childType,
+                                 &childID);
+        })) {
+      return recordInitialisationProxyFailure();
+    }
+    if (childID == -ENOENT) {
+      return -ENOENT;
+    }
+    return childType == 1 && childID == 0 ? 0
+                                          : childID < 0 ? childID : -EIO;
+  }
+
+  int insertPhysicalFileLocked(const std::string& name) {
+    if (int error = admitBootstrapDirectoryOperationLocked()) {
+      return error;
+    }
+    DirectOPFSOperation operation(*profileLeaseState, terminalCloseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    int childID = -EIO;
+    if (!proxy([&](auto ctx) {
+          _wasmfs_opfs_insert_file(
+            ctx.ctx, kOPFSRootDirectoryID, name.c_str(), &childID);
+        })) {
+      return recordInitialisationProxyFailure();
+    }
+    return childID == 0 ? 0 : childID < 0 ? childID : -EIO;
+  }
+
+  int openFileLocked(const std::shared_ptr<OPFSFile>& file, bool* opened) {
+    if (!file || !opened) {
+      return -EIO;
+    }
+    int error = file->locked().open(O_RDWR);
+    if (!error) {
+      *opened = true;
+    }
+    return error;
+  }
+
+  int openAllFilesLocked() {
+    if (int error = openFileLocked(bootstrap, &bootstrapOpen)) {
+      return error;
+    }
+    if (int error = openFileLocked(control, &controlOpen)) {
+      return error;
+    }
+    for (size_t i = 0; i != arenas.size(); ++i) {
+      if (int error = openFileLocked(arenas[i], &arenasOpen[i])) {
+        return error;
+      }
+    }
+    return 0;
+  }
+
+  int closeFileForRetirementLocked(const std::shared_ptr<OPFSFile>& file,
+                                   bool* opened,
+                                   bool flushFirst) {
+    if (!opened || !*opened) {
+      return 0;
+    }
+    int firstError = flushFirst ? file->locked().flush() : 0;
+    int closeError = file->locked().close();
+    if (!closeError) {
+      *opened = false;
+    } else if (!firstError) {
+      firstError = closeError;
+    }
+    return firstError;
+  }
+
+  int closeAllFilesForRetirementLocked(bool flushFirst) {
+    int firstError = 0;
+    auto closeOne = [&](const std::shared_ptr<OPFSFile>& file, bool* opened) {
+      int error = closeFileForRetirementLocked(file, opened, flushFirst);
+      if (!firstError && error) {
+        firstError = error;
+      }
+      return terminalCloseState->getUnacknowledgedProxyError() == 0;
+    };
+    if (!closeOne(arenas[0], &arenasOpen[0]) ||
+        !closeOne(arenas[1], &arenasOpen[1]) ||
+        !closeOne(control, &controlOpen) ||
+        !closeOne(bootstrap, &bootstrapOpen)) {
+      return firstError ? firstError
+                        : terminalCloseState->getUnacknowledgedProxyError();
+    }
+    return firstError;
+  }
+
+  void abandonPhysicalFilesLocked() {
+    if (bootstrap) {
+      bootstrap->abandonForTerminalFailure();
+    }
+    if (control) {
+      control->abandonForTerminalFailure();
+    }
+    for (const auto& arena : arenas) {
+      if (arena) {
+        arena->abandonForTerminalFailure();
+      }
+    }
+  }
+
+  int stopAfterUnacknowledgedProxyLocked() {
+    const int error = terminalCloseState->getUnacknowledgedProxyError();
+    if (!error) {
+      return 0;
+    }
+    abandonPhysicalFilesLocked();
+    profileLeaseState->closeDestructorProxying();
+    return error;
+  }
+
+  int setFixedSizeLocked(const std::shared_ptr<OPFSFile>& file, size_t size) {
+    if (!file || size > static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    if (int error = file->locked().setSize(size)) {
+      return error;
+    }
+    return file->locked().flush();
+  }
+
+  int requireFixedSizeLocked(const std::shared_ptr<OPFSFile>& file,
+                             size_t expectedSize) {
+    if (!file || expectedSize >
+                   static_cast<size_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const off_t size = file->locked().getSize();
+    if (size < 0) {
+      return size;
+    }
+    return size_t(size) == expectedSize ? 0 : -EIO;
+  }
+
+  int writeRecordLocked(const std::shared_ptr<OPFSFile>& file,
+                        uint64_t offset,
+                        const std::array<uint8_t, kProfileLogV3RecordSize>&
+                          record) {
+    if (!file || offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const ssize_t written = file->locked().write(
+      record.data(), record.size(), static_cast<off_t>(offset));
+    if (written < 0) {
+      return written;
+    }
+    if (size_t(written) != record.size()) {
+      return -EIO;
+    }
+    return file->locked().flush();
+  }
+
+  int readRecordLocked(const std::shared_ptr<OPFSFile>& file,
+                       uint64_t offset,
+                       std::array<uint8_t, kProfileLogV3RecordSize>* record) {
+    if (!file || !record ||
+        offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const ssize_t read = file->locked().read(
+      record->data(), record->size(), static_cast<off_t>(offset));
+    if (read < 0) {
+      return read;
+    }
+    return size_t(read) == record->size() ? 0 : -EIO;
+  }
+
+  int writePageLocked(const std::shared_ptr<OPFSFile>& file,
+                      uint64_t offset,
+                      const std::array<uint8_t, kProfileLogV3PageSize>& page) {
+    if (!file || offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const ssize_t written = file->locked().write(
+      page.data(), page.size(), static_cast<off_t>(offset));
+    if (written < 0) {
+      return written;
+    }
+    if (size_t(written) != page.size()) {
+      return -EIO;
+    }
+    return file->locked().flush();
+  }
+
+  int readPageLocked(const std::shared_ptr<OPFSFile>& file,
+                     uint64_t offset,
+                     std::array<uint8_t, kProfileLogV3PageSize>* page) {
+    if (!file || !page ||
+        offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+      return -EOVERFLOW;
+    }
+    const ssize_t read = file->locked().read(
+      page->data(), page->size(), static_cast<off_t>(offset));
+    if (read < 0) {
+      return read;
+    }
+    return size_t(read) == page->size() ? 0 : -EIO;
+  }
+
+  std::array<uint8_t, kProfileLogV3RecordSize> makeBootstrapRecord() const {
+    std::array<uint8_t, kProfileLogV3RecordSize> record = {};
+    std::copy(kProfileLogV3BootstrapMagic.begin(),
+              kProfileLogV3BootstrapMagic.end(),
+              record.begin());
+    writeProfileLogV3U32(record, 8, kProfileLogV3FormatVersion);
+    writeProfileLogV3U32(record, 12, kProfileLogV3RecordSize);
+    writeProfileLogV3U64(record, 16, profileChecksum);
+    writeProfileLogV3U32(record, 24, profileLength);
+    writeProfileLogV3U32(record, 28, static_cast<uint32_t>(payloadMode));
+    writeProfileLogV3U32(record, 32, kProfileLogV3PageSize);
+    writeProfileLogV3U32(record, 36, arenas.size());
+    writeProfileLogV3U32(record, 40, kProfileLogV3BootstrapReady);
+    writeProfileLogV3U64(record, 48, kProfileLogV3LayoutEpoch);
+    writeProfileLogV3U64(record, 56, profileLogV3Checksum(record.data(), 56));
+    return record;
+  }
+
+  bool parseBootstrapRecord(
+    const std::array<uint8_t, kProfileLogV3RecordSize>& record) const {
+    return std::equal(kProfileLogV3BootstrapMagic.begin(),
+                      kProfileLogV3BootstrapMagic.end(),
+                      record.begin()) &&
+           readProfileLogV3U32(record, 8) == kProfileLogV3FormatVersion &&
+           readProfileLogV3U32(record, 12) == kProfileLogV3RecordSize &&
+           readProfileLogV3U64(record, 16) == profileChecksum &&
+           readProfileLogV3U32(record, 24) == profileLength &&
+           readProfileLogV3U32(record, 28) == payloadMode &&
+           readProfileLogV3U32(record, 32) == kProfileLogV3PageSize &&
+           readProfileLogV3U32(record, 36) == arenas.size() &&
+           readProfileLogV3U32(record, 40) == kProfileLogV3BootstrapReady &&
+           profileLogV3HasZeroRange(record, 44, 4) &&
+           readProfileLogV3U64(record, 48) == kProfileLogV3LayoutEpoch &&
+           readProfileLogV3U64(record, 56) ==
+             profileLogV3Checksum(record.data(), 56) &&
+           profileLogV3HasZeroTail(record, 64);
+  }
+
+  std::array<uint8_t, kProfileLogV3RecordSize> makeDescriptorRecord(
+    const ProfileLogV3Descriptor& descriptor) const {
+    std::array<uint8_t, kProfileLogV3RecordSize> record = {};
+    std::copy(kProfileLogV3DescriptorMagic.begin(),
+              kProfileLogV3DescriptorMagic.end(),
+              record.begin());
+    writeProfileLogV3U32(record, 8, kProfileLogV3FormatVersion);
+    writeProfileLogV3U32(record, 12, kProfileLogV3RecordSize);
+    writeProfileLogV3U64(record, 16, descriptor.generation);
+    writeProfileLogV3U32(record, 24, descriptor.arena);
+    writeProfileLogV3U64(record, 32, descriptor.manifestOffset);
+    writeProfileLogV3U64(record, 40, descriptor.manifestChecksum);
+    writeProfileLogV3U64(record, 48, descriptor.arenaEnd);
+    writeProfileLogV3U64(record, 56, descriptor.logicalSize);
+    writeProfileLogV3U64(record, 64, profileChecksum);
+    writeProfileLogV3U64(record, 72, kProfileLogV3LayoutEpoch);
+    writeProfileLogV3U64(record, 80, profileLogV3Checksum(record.data(), 80));
+    return record;
+  }
+
+  std::optional<ProfileLogV3Descriptor> parseDescriptorRecord(
+    const std::array<uint8_t, kProfileLogV3RecordSize>& record) const {
+    if (!std::equal(kProfileLogV3DescriptorMagic.begin(),
+                    kProfileLogV3DescriptorMagic.end(),
+                    record.begin()) ||
+        readProfileLogV3U32(record, 8) != kProfileLogV3FormatVersion ||
+        readProfileLogV3U32(record, 12) != kProfileLogV3RecordSize ||
+        !profileLogV3HasZeroRange(record, 28, 4) ||
+        readProfileLogV3U64(record, 64) != profileChecksum ||
+        readProfileLogV3U64(record, 72) != kProfileLogV3LayoutEpoch ||
+        readProfileLogV3U64(record, 80) !=
+          profileLogV3Checksum(record.data(), 80) ||
+        !profileLogV3HasZeroTail(record, 88)) {
+      return std::nullopt;
+    }
+    const uint64_t recordGeneration = readProfileLogV3U64(record, 16);
+    const uint32_t arena = readProfileLogV3U32(record, 24);
+    const uint64_t logicalSize = readProfileLogV3U64(record, 56);
+    if (!recordGeneration || arena >= arenas.size() ||
+        logicalSize > kProfileLogV3PayloadCapacity) {
+      return std::nullopt;
+    }
+    return ProfileLogV3Descriptor{recordGeneration,
+                                  arena,
+                                  readProfileLogV3U64(record, 32),
+                                  readProfileLogV3U64(record, 40),
+                                  readProfileLogV3U64(record, 48),
+                                  logicalSize,
+                                  readProfileLogV3U64(record, 80)};
+  }
+
+  std::array<uint8_t, kProfileLogV3RecordSize> makePhaseRecord(
+    uint64_t recordGeneration,
+    uint32_t arena,
+    uint64_t descriptorChecksum) const {
+    std::array<uint8_t, kProfileLogV3RecordSize> record = {};
+    std::copy(kProfileLogV3PhaseMagic.begin(),
+              kProfileLogV3PhaseMagic.end(),
+              record.begin());
+    writeProfileLogV3U32(record, 8, kProfileLogV3FormatVersion);
+    writeProfileLogV3U32(record, 12, kProfileLogV3RecordSize);
+    writeProfileLogV3U64(record, 16, recordGeneration);
+    writeProfileLogV3U32(record, 24, arena);
+    writeProfileLogV3U32(record, 28, kProfileLogV3PhaseClean);
+    writeProfileLogV3U64(record, 32, descriptorChecksum);
+    writeProfileLogV3U64(record, 40, profileChecksum);
+    writeProfileLogV3U64(record, 48, profileLogV3Checksum(record.data(), 48));
+    return record;
+  }
+
+  std::optional<ProfileLogV3Phase> parsePhaseRecord(
+    const std::array<uint8_t, kProfileLogV3RecordSize>& record) const {
+    if (!std::equal(kProfileLogV3PhaseMagic.begin(),
+                    kProfileLogV3PhaseMagic.end(),
+                    record.begin()) ||
+        readProfileLogV3U32(record, 8) != kProfileLogV3FormatVersion ||
+        readProfileLogV3U32(record, 12) != kProfileLogV3RecordSize ||
+        readProfileLogV3U64(record, 40) != profileChecksum ||
+        readProfileLogV3U32(record, 28) != kProfileLogV3PhaseClean ||
+        readProfileLogV3U64(record, 48) !=
+          profileLogV3Checksum(record.data(), 48) ||
+        !profileLogV3HasZeroTail(record, 56)) {
+      return std::nullopt;
+    }
+    const uint64_t recordGeneration = readProfileLogV3U64(record, 16);
+    const uint32_t arena = readProfileLogV3U32(record, 24);
+    if (!recordGeneration || arena >= arenas.size()) {
+      return std::nullopt;
+    }
+    return ProfileLogV3Phase{recordGeneration,
+                             arena,
+                             readProfileLogV3U64(record, 32)};
+  }
+
+  std::array<uint8_t, kProfileLogV3PageSize> makeDataPage(
+    uint64_t recordGeneration,
+    const std::vector<uint8_t>& payload) const {
+    std::array<uint8_t, kProfileLogV3PageSize> page = {};
+    std::copy(kProfileLogV3DataMagic.begin(),
+              kProfileLogV3DataMagic.end(),
+              page.begin());
+    writeProfileLogV3U32(page, 8, kProfileLogV3FormatVersion);
+    writeProfileLogV3U32(page, 12, kProfileLogV3PageSize);
+    writeProfileLogV3U64(page, 16, recordGeneration);
+    writeProfileLogV3U64(page, 24, payload.size());
+    writeProfileLogV3U64(page, 32, profileChecksum);
+    std::copy(payload.begin(), payload.end(), page.begin() + kProfileLogV3DataOffset);
+    writeProfileLogV3U64(
+      page,
+      40,
+      profileLogV3ChecksumWithZeroedRange(page, 40, sizeof(uint64_t)));
+    return page;
+  }
+
+  int parseDataPage(const std::array<uint8_t, kProfileLogV3PageSize>& page,
+                    uint64_t expectedGeneration,
+                    ProfileLogV3Snapshot* result,
+                    uint64_t* checksum) const {
+    const uint64_t size = readProfileLogV3U64(page, 24);
+    if (!result || !checksum ||
+        !std::equal(kProfileLogV3DataMagic.begin(),
+                    kProfileLogV3DataMagic.end(),
+                    page.begin()) ||
+        readProfileLogV3U32(page, 8) != kProfileLogV3FormatVersion ||
+        readProfileLogV3U32(page, 12) != kProfileLogV3PageSize ||
+        readProfileLogV3U64(page, 16) != expectedGeneration ||
+        readProfileLogV3U64(page, 32) != profileChecksum ||
+        readProfileLogV3U64(page, 40) !=
+          profileLogV3ChecksumWithZeroedRange(page, 40, sizeof(uint64_t)) ||
+        !profileLogV3HasZeroRange(
+          page, 48, kProfileLogV3DataOffset - 48) ||
+        size > kProfileLogV3PayloadCapacity ||
+        !profileLogV3HasZeroTail(page, kProfileLogV3DataOffset + size)) {
+      return -EIO;
+    }
+    result->payload.assign(page.begin() + kProfileLogV3DataOffset,
+                           page.begin() + kProfileLogV3DataOffset + size);
+    *checksum = readProfileLogV3U64(page, 40);
+    return 0;
+  }
+
+  std::array<uint8_t, kProfileLogV3PageSize> makeManifestPage(
+    uint64_t recordGeneration,
+    uint64_t dataOffset,
+    uint64_t dataChecksum,
+    const ProfileLogV3Snapshot& next) const {
+    std::array<uint8_t, kProfileLogV3PageSize> page = {};
+    std::copy(kProfileLogV3ManifestMagic.begin(),
+              kProfileLogV3ManifestMagic.end(),
+              page.begin());
+    writeProfileLogV3U32(page, 8, kProfileLogV3FormatVersion);
+    writeProfileLogV3U32(page, 12, kProfileLogV3PageSize);
+    writeProfileLogV3U64(page, 16, recordGeneration);
+    writeProfileLogV3U64(page, 24, dataOffset);
+    writeProfileLogV3U64(page, 32, dataChecksum);
+    writeProfileLogV3U64(page, 40, next.payload.size());
+    writeProfileLogV3U32(page, 48, next.metadata.mode);
+    writeProfileLogV3U64(page, 56, profileLogV3DoubleBits(next.metadata.atime));
+    writeProfileLogV3U64(page, 64, profileLogV3DoubleBits(next.metadata.mtime));
+    writeProfileLogV3U64(page, 72, profileLogV3DoubleBits(next.metadata.ctime));
+    writeProfileLogV3U64(page, 80, profileChecksum);
+    writeProfileLogV3U64(
+      page,
+      88,
+      profileLogV3ChecksumWithZeroedRange(page, 88, sizeof(uint64_t)));
+    return page;
+  }
+
+  std::optional<ProfileLogV3Manifest> parseManifestPage(
+    const std::array<uint8_t, kProfileLogV3PageSize>& page) const {
+    if (!std::equal(kProfileLogV3ManifestMagic.begin(),
+                    kProfileLogV3ManifestMagic.end(),
+                    page.begin()) ||
+        readProfileLogV3U32(page, 8) != kProfileLogV3FormatVersion ||
+        readProfileLogV3U32(page, 12) != kProfileLogV3PageSize ||
+        !profileLogV3HasZeroRange(page, 52, 4) ||
+        readProfileLogV3U64(page, 80) != profileChecksum ||
+        readProfileLogV3U64(page, 88) !=
+          profileLogV3ChecksumWithZeroedRange(page, 88, sizeof(uint64_t)) ||
+        !profileLogV3HasZeroTail(page, 96)) {
+      return std::nullopt;
+    }
+    const uint64_t logicalSize = readProfileLogV3U64(page, 40);
+    File::Metadata metadata = {
+      static_cast<mode_t>(readProfileLogV3U32(page, 48)),
+      profileLogV3BitsDouble(readProfileLogV3U64(page, 56)),
+      profileLogV3BitsDouble(readProfileLogV3U64(page, 64)),
+      profileLogV3BitsDouble(readProfileLogV3U64(page, 72)),
+    };
+    if (!readProfileLogV3U64(page, 16) ||
+        logicalSize > kProfileLogV3PayloadCapacity ||
+        !validMetadata(metadata)) {
+      return std::nullopt;
+    }
+    return ProfileLogV3Manifest{readProfileLogV3U64(page, 16),
+                                readProfileLogV3U64(page, 24),
+                                readProfileLogV3U64(page, 32),
+                                logicalSize,
+                                metadata,
+                                readProfileLogV3U64(page, 88)};
+  }
+
+  int writeDescriptorPairLocked(const ProfileLogV3Descriptor& descriptor,
+                                uint64_t* descriptorChecksum) {
+    const auto record = makeDescriptorRecord(descriptor);
+    if (descriptorChecksum) {
+      *descriptorChecksum = readProfileLogV3U64(record, 80);
+    }
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      if (int error = writeRecordLocked(
+            control, descriptorOffset(descriptor.generation, copy), record)) {
+        return error;
+      }
+    }
+    return 0;
+  }
+
+  int writePhaseWitnessLocked(uint64_t copy,
+                              uint64_t recordGeneration,
+                              uint32_t arena,
+                              uint64_t descriptorChecksum) {
+    return writeRecordLocked(control,
+                             phaseOffset(copy),
+                             makePhaseRecord(recordGeneration,
+                                             arena,
+                                             descriptorChecksum));
+  }
+
+  int writeGenerationLocked(uint64_t recordGeneration,
+                            const ProfileLogV3Snapshot& next) {
+    if (!recordGeneration || !validMetadata(next.metadata) ||
+        next.payload.size() > kProfileLogV3PayloadCapacity) {
+      return -EINVAL;
+    }
+    const uint32_t arena = recordGeneration & 1;
+    const off_t size = arenas[arena]->locked().getSize();
+    if (size < 0) {
+      return size;
+    }
+    auto dataOffset = alignPage(static_cast<uint64_t>(size));
+    if (!dataOffset || *dataOffset > kProfileLogV3MaxSafeOffset -
+                                     2 * kProfileLogV3PageSize) {
+      return -EFBIG;
+    }
+    const uint64_t manifestOffset = *dataOffset + kProfileLogV3PageSize;
+    const uint64_t arenaEnd = manifestOffset + kProfileLogV3PageSize;
+    const auto data = makeDataPage(recordGeneration, next.payload);
+    const uint64_t dataChecksum = readProfileLogV3U64(data, 40);
+    const auto manifest = makeManifestPage(
+      recordGeneration, *dataOffset, dataChecksum, next);
+    const uint64_t manifestChecksum = readProfileLogV3U64(manifest, 88);
+    if (int error = writePageLocked(arenas[arena], *dataOffset, data)) {
+      return error;
+    }
+    if (int error = writePageLocked(arenas[arena], manifestOffset, manifest)) {
+      return error;
+    }
+    const ProfileLogV3Descriptor descriptor = {recordGeneration,
+                                                arena,
+                                                manifestOffset,
+                                                manifestChecksum,
+                                                arenaEnd,
+                                                next.payload.size(),
+                                                0};
+    uint64_t descriptorChecksum = 0;
+    if (int error = writeDescriptorPairLocked(descriptor, &descriptorChecksum)) {
+      return error;
+    }
+    if (int error = writePhaseWitnessLocked(
+          0, recordGeneration, arena, descriptorChecksum)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v3_test_maybe_interrupt(1);
+#endif
+    if (int error = writePhaseWitnessLocked(
+          1, recordGeneration, arena, descriptorChecksum)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v3_test_maybe_interrupt(2);
+#endif
+    return 0;
+  }
+
+  int validatePhaseSnapshotLocked(const ProfileLogV3Phase& phase,
+                                  ProfileLogV3Snapshot* result) {
+    if (!result || phase.arena != (phase.generation & 1)) {
+      return -EIO;
+    }
+    std::array<std::optional<ProfileLogV3Descriptor>, 2> descriptors;
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      std::array<uint8_t, kProfileLogV3RecordSize> record;
+      if (int error = readRecordLocked(
+            control, descriptorOffset(phase.generation, copy), &record)) {
+        return error;
+      }
+      descriptors[copy] = parseDescriptorRecord(record);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION == 2
+    descriptors[0].reset();
+#endif
+    if (!descriptors[0] || !descriptors[1] ||
+        descriptors[0]->generation != phase.generation ||
+        descriptors[1]->generation != phase.generation ||
+        descriptors[0]->arena != phase.arena ||
+        descriptors[1]->arena != phase.arena ||
+        descriptors[0]->manifestOffset != descriptors[1]->manifestOffset ||
+        descriptors[0]->manifestChecksum != descriptors[1]->manifestChecksum ||
+        descriptors[0]->arenaEnd != descriptors[1]->arenaEnd ||
+        descriptors[0]->logicalSize != descriptors[1]->logicalSize ||
+        descriptors[0]->recordChecksum != phase.descriptorChecksum ||
+        descriptors[1]->recordChecksum != phase.descriptorChecksum) {
+      return -EIO;
+    }
+    const ProfileLogV3Descriptor& descriptor = *descriptors[0];
+    if (descriptor.manifestOffset % kProfileLogV3PageSize ||
+        descriptor.manifestOffset > kProfileLogV3MaxSafeOffset -
+                                      kProfileLogV3PageSize ||
+        descriptor.manifestOffset + kProfileLogV3PageSize !=
+          descriptor.arenaEnd) {
+      return -EIO;
+    }
+    const off_t physicalSize = arenas[descriptor.arena]->locked().getSize();
+    if (physicalSize < 0) {
+      return physicalSize;
+    }
+    if (static_cast<uint64_t>(physicalSize) < descriptor.arenaEnd) {
+      return -EIO;
+    }
+    std::array<uint8_t, kProfileLogV3PageSize> manifestPage;
+    if (int error = readPageLocked(
+          arenas[descriptor.arena], descriptor.manifestOffset, &manifestPage)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION == 3
+    manifestPage[0] ^= 1;
+#endif
+    auto manifest = parseManifestPage(manifestPage);
+    if (!manifest || manifest->generation != phase.generation ||
+        manifest->pageChecksum != descriptor.manifestChecksum ||
+        manifest->logicalSize != descriptor.logicalSize ||
+        manifest->dataOffset % kProfileLogV3PageSize ||
+        manifest->dataOffset > kProfileLogV3MaxSafeOffset -
+                                  kProfileLogV3PageSize ||
+        manifest->dataOffset + kProfileLogV3PageSize !=
+          descriptor.manifestOffset) {
+      return -EIO;
+    }
+    std::array<uint8_t, kProfileLogV3PageSize> dataPage;
+    if (int error = readPageLocked(
+          arenas[descriptor.arena], manifest->dataOffset, &dataPage)) {
+      return error;
+    }
+    uint64_t dataChecksum = 0;
+    if (int error = parseDataPage(
+          dataPage, phase.generation, result, &dataChecksum)) {
+      return error;
+    }
+    if (dataChecksum != manifest->dataChecksum ||
+        result->payload.size() != manifest->logicalSize) {
+      return -EIO;
+    }
+    result->metadata = manifest->metadata;
+    return 0;
+  }
+
+  int recoverControlLocked() {
+    std::array<std::optional<ProfileLogV3Phase>, 2> phases;
+    for (uint64_t copy = 0; copy != 2; ++copy) {
+      std::array<uint8_t, kProfileLogV3RecordSize> record;
+      if (int error = readRecordLocked(control, phaseOffset(copy), &record)) {
+        return error;
+      }
+      phases[copy] = parsePhaseRecord(record);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION == 1
+    phases[0].reset();
+#endif
+    if (!phases[0] || !phases[1]) {
+      return -EIO;
+    }
+    recoveryNeedsRepair = false;
+    ProfileLogV3Snapshot selected;
+    if (phases[0]->generation == phases[1]->generation) {
+      if (phases[0]->arena != phases[1]->arena ||
+          phases[0]->descriptorChecksum != phases[1]->descriptorChecksum) {
+        return -EIO;
+      }
+      if (int error = validatePhaseSnapshotLocked(*phases[0], &selected)) {
+        return error;
+      }
+      generation = phases[0]->generation;
+    } else {
+      const ProfileLogV3Phase& oldPhase =
+        phases[0]->generation < phases[1]->generation ? *phases[0]
+                                                       : *phases[1];
+      const ProfileLogV3Phase& newPhase =
+        phases[0]->generation < phases[1]->generation ? *phases[1]
+                                                       : *phases[0];
+      if (oldPhase.generation == std::numeric_limits<uint64_t>::max() ||
+          newPhase.generation != oldPhase.generation + 1 ||
+          oldPhase.arena != (oldPhase.generation & 1) ||
+          newPhase.arena != (newPhase.generation & 1)) {
+        return -EIO;
+      }
+      if (int error = validatePhaseSnapshotLocked(oldPhase, &selected)) {
+        return error;
+      }
+      ProfileLogV3Snapshot newSnapshot;
+      if (int error = validatePhaseSnapshotLocked(newPhase, &newSnapshot)) {
+        return error;
+      }
+      generation = oldPhase.generation;
+      recoveryNeedsRepair = true;
+    }
+    snapshot = std::move(selected);
+    return 0;
+  }
+
+  int verifyBootstrapLocked() {
+    std::array<uint8_t, kProfileLogV3RecordSize> first;
+    std::array<uint8_t, kProfileLogV3RecordSize> second;
+    if (int error = readRecordLocked(bootstrap, 0, &first)) {
+      return error;
+    }
+    if (int error = readRecordLocked(
+          bootstrap, kProfileLogV3RecordSize, &second)) {
+      return error;
+    }
+    return parseBootstrapRecord(first) && parseBootstrapRecord(second) &&
+           first == second
+             ? 0
+             : -EIO;
+  }
+
+  int initialiseFreshLocked() {
+    for (const auto& name : {arenaNames[0], arenaNames[1], controlName,
+                             bootstrapName}) {
+      if (int error = insertPhysicalFileLocked(name)) {
+        return error;
+      }
+    }
+    bootstrap = makePhysicalFile(bootstrapName);
+    control = makePhysicalFile(controlName);
+    arenas[0] = makePhysicalFile(arenaNames[0]);
+    arenas[1] = makePhysicalFile(arenaNames[1]);
+    if (int error = openAllFilesLocked()) {
+      return error;
+    }
+    if (int error = setFixedSizeLocked(bootstrap, kProfileLogV3BootstrapSize)) {
+      return error;
+    }
+    if (int error = setFixedSizeLocked(control, kProfileLogV3ControlSize)) {
+      return error;
+    }
+    const double now = emscripten_date_now();
+    ProfileLogV3Snapshot initial = {
+      {}, {static_cast<mode_t>(S_IFREG | payloadMode), now, now, now}};
+    if (int error = writeGenerationLocked(1, initial)) {
+      return error;
+    }
+    const auto bootstrapRecord = makeBootstrapRecord();
+    if (int error = writeRecordLocked(bootstrap, 0, bootstrapRecord)) {
+      return error;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT
+    wasmfs_opfs_profile_log_v3_test_maybe_interrupt(0);
+#endif
+    if (int error = writeRecordLocked(
+          bootstrap, kProfileLogV3RecordSize, bootstrapRecord)) {
+      return error;
+    }
+    generation = 1;
+    snapshot = std::move(initial);
+    return 0;
+  }
+
+  int openEstablishedLocked() {
+    bootstrap = makePhysicalFile(bootstrapName);
+    control = makePhysicalFile(controlName);
+    arenas[0] = makePhysicalFile(arenaNames[0]);
+    arenas[1] = makePhysicalFile(arenaNames[1]);
+    if (int error = openAllFilesLocked()) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(
+          bootstrap, kProfileLogV3BootstrapSize)) {
+      return error;
+    }
+    if (int error = requireFixedSizeLocked(control, kProfileLogV3ControlSize)) {
+      return error;
+    }
+    if (int error = verifyBootstrapLocked()) {
+      return error;
+    }
+    return recoverControlLocked();
+  }
+
+  int commitSnapshotLocked(const ProfileLogV3Snapshot& next) {
+    if (fatalError || !generation) {
+      return fatalError ? fatalError : -ESHUTDOWN;
+    }
+    if (recoveryNeedsRepair) {
+      return -ESHUTDOWN;
+    }
+    if (generation == std::numeric_limits<uint64_t>::max()) {
+      return poisonLocked(-EOVERFLOW);
+    }
+    if (!validMetadata(next.metadata) ||
+        next.payload.size() > kProfileLogV3PayloadCapacity) {
+      return -EINVAL;
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR
+    // This is a synthetic pre-write test fault, not an OPFS crash model. It
+    // makes the first candidate transaction terminally fail so the focused
+    // test can prove that the already-attached DataFile does not later reopen
+    // through a backend that has latched an indeterminate commit outcome.
+    return poisonLocked(-EIO);
+#endif
+    if (int error = writeGenerationLocked(generation + 1, next)) {
+      return poisonLocked(error);
+    }
+    generation++;
+    snapshot = next;
+    return 0;
+  }
+
+  int payloadOperationErrorLocked() const {
+    return fatalError ? fatalError : generation ? 0 : -ESHUTDOWN;
+  }
+
+  friend class ProfileLogV3DataFile;
+
+public:
+  bool supportsExplicitMetadataMutation() const override { return true; }
+  bool requiresAtomicMetadataMutations() const override { return true; }
+  bool supportsRecordLocks() const override { return false; }
+
+  // V3 deliberately has no persistent directory. A caller may only attach
+  // its one DataFile with wasmfs_create_file() into an existing namespace.
+  std::shared_ptr<Directory> createDirectory(mode_t) override { return nullptr; }
+  std::shared_ptr<Symlink> createSymlink(std::string) override {
+    return nullptr;
+  }
+  std::shared_ptr<DataFile> createFile(mode_t mode) override;
+
+  int initialise(const char* profileName, mode_t requestedPayloadMode) {
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (!profileName || (requestedPayloadMode & ~S_IALLUGO) != 0) {
+      return -EINVAL;
+    }
+    const std::string_view profile(profileName);
+    if (profile.size() > std::numeric_limits<uint32_t>::max()) {
+      return -EOVERFLOW;
+    }
+    profileChecksum = profileLogV3Checksum(
+      reinterpret_cast<const uint8_t*>(profile.data()), profile.size());
+    profileLength = profile.size();
+    payloadMode = requestedPayloadMode;
+    const std::string stem = storageStem(profile);
+    bootstrapName = stem + "-bootstrap";
+    controlName = stem + "-control";
+    arenaNames[0] = stem + "-arena-0";
+    arenaNames[1] = stem + "-arena-1";
+
+    if (int error = initialisePhysicalRootLocked()) {
+      return error;
+    }
+    const int bootstrapStatus = lookupPhysicalFileLocked(bootstrapName);
+    if (bootstrapStatus == -ENOENT) {
+      for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
+        if (int status = lookupPhysicalFileLocked(name); status != -ENOENT) {
+          return status == 0 ? -EIO : status;
+        }
+      }
+      if (int error = initialiseFreshLocked()) {
+        return error;
+      }
+    } else {
+      if (bootstrapStatus) {
+        return bootstrapStatus;
+      }
+      for (const auto& name : {controlName, arenaNames[0], arenaNames[1]}) {
+        if (int status = lookupPhysicalFileLocked(name)) {
+          return status == -ENOENT ? -EIO : status;
+        }
+      }
+      if (int error = openEstablishedLocked()) {
+        return error;
+      }
+    }
+    // From this point onward every V3 operation has all four OPFS files open.
+    // Any attempted directory lookup/creation is rejected by the guard above.
+    bootstrapComplete = true;
+    return 0;
+  }
+
+  off_t getPayloadSize() {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = payloadOperationErrorLocked()) {
+      return error;
+    }
+    return snapshot.payload.size();
+  }
+
+  int openPayload() {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    // A valid g/g+1 recovery remains attachable for read-only access. Only a
+    // terminal backend error (or absent initialized snapshot) rejects the
+    // descriptor open.
+    return payloadOperationErrorLocked();
+  }
+
+  ssize_t readPayload(uint8_t* buffer, size_t length, off_t offset) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = payloadOperationErrorLocked()) {
+      return error;
+    }
+    if (offset < 0) {
+      return -EINVAL;
+    }
+    if (static_cast<uint64_t>(offset) >= snapshot.payload.size()) {
+      return 0;
+    }
+    const size_t start = offset;
+    const size_t count = std::min(length, snapshot.payload.size() - start);
+    std::copy_n(snapshot.payload.data() + start, count, buffer);
+    return count;
+  }
+
+  ssize_t writePayloadWithMetadata(const uint8_t* buffer,
+                                   size_t length,
+                                   off_t offset,
+                                   const File::Metadata& metadata) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = payloadOperationErrorLocked()) {
+      return error;
+    }
+    if (offset < 0 || !validMetadata(metadata)) {
+      return -EINVAL;
+    }
+    const uint64_t start = offset;
+    if (start > kProfileLogV3PayloadCapacity ||
+        length > kProfileLogV3PayloadCapacity - start) {
+      return -EFBIG;
+    }
+    if (!length) {
+      return 0;
+    }
+    ProfileLogV3Snapshot next = snapshot;
+    const size_t end = start + length;
+    if (end > next.payload.size()) {
+      next.payload.resize(end);
+    }
+    std::copy_n(buffer, length, next.payload.data() + start);
+    next.metadata = metadata;
+    if (int error = commitSnapshotLocked(next)) {
+      return error;
+    }
+    return length;
+  }
+
+  int resizePayloadWithMetadata(off_t size, const File::Metadata& metadata) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = payloadOperationErrorLocked()) {
+      return error;
+    }
+    if (size < 0 || static_cast<uint64_t>(size) > kProfileLogV3PayloadCapacity ||
+        !validMetadata(metadata)) {
+      return -EINVAL;
+    }
+    ProfileLogV3Snapshot next = snapshot;
+    next.payload.resize(size);
+    next.metadata = metadata;
+    return commitSnapshotLocked(next);
+  }
+
+  int persistPayloadMetadata(const File::Metadata& metadata) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = payloadOperationErrorLocked()) {
+      return error;
+    }
+    if (!validMetadata(metadata)) {
+      return -EINVAL;
+    }
+    ProfileLogV3Snapshot next = snapshot;
+    next.metadata = metadata;
+    return commitSnapshotLocked(next);
+  }
+
+  int flushPayload() {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = payloadOperationErrorLocked()) {
+      return error;
+    }
+    if (int error = arenas[generation & 1]->locked().flush()) {
+      return poisonLocked(error);
+    }
+    if (int error = control->locked().flush()) {
+      return poisonLocked(error);
+    }
+    return 0;
+  }
+
+  int prepareOPFSProfileRetirement(bool checkResources) override {
+    int firstError = 0;
+    {
+      ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+      if (!operation) {
+        firstError = operation.getError();
+      } else {
+        std::lock_guard<std::recursive_mutex> lock(storeMutex);
+        if (int error = stopAfterUnacknowledgedProxyLocked()) {
+          return error;
+        }
+        firstError = closeAllFilesForRetirementLocked(!fatalError);
+        if (int error = stopAfterUnacknowledgedProxyLocked()) {
+          return error;
+        }
+        if (!firstError && fatalError) {
+          firstError = fatalError;
+        }
+      }
+    }
+    int inherited = OPFSBackend::prepareOPFSProfileRetirement(
+      checkResources && firstError == 0);
+    return firstError ? firstError : inherited;
+  }
+
+  bool abandonFailedInitialisation() {
+    if (initialisationAmbiguous || getOPFSProfilePriorCloseError()) {
+      {
+        std::lock_guard<std::recursive_mutex> lock(storeMutex);
+        abandonPhysicalFilesLocked();
+      }
+      profileLeaseState->closeDestructorProxying();
+      if (beginOPFSProfileDrain() == 0) {
+        bool leaseReleased = false;
+        (void)finishOPFSProfileDrain(false, &leaseReleased);
+        assert(!leaseReleased);
+      } else {
+        proxy.abandonScopedProfileWorker();
+      }
+      return false;
+    }
+    if (beginOPFSProfileDrain()) {
+      return false;
+    }
+    const int preparation = prepareOPFSProfileRetirement(true);
+    bool leaseReleased = false;
+    const int finish = finishOPFSProfileDrain(
+      preparation == 0, &leaseReleased);
+    if (!leaseReleased) {
+      return false;
+    }
+    const int retirement = retireOPFSProfileBackend(
+      preparation == 0 && finish == 0);
+    return preparation == 0 && finish == 0 && retirement == 0;
+  }
+};
+
+class ProfileLogV3DataFile final : public DataFile {
+  ProfileLogV3DataBackend* backend;
+
+  off_t getSize() override { return backend->getPayloadSize(); }
+  // The generic WasmFS open path validates the flags and owns O_TRUNC and
+  // O_APPEND behavior. This file is already backed by the V3 backend's fixed
+  // open arena handles, so a descriptor open itself has no additional OPFS
+  // operation. It still must recheck the backend terminal latch before the
+  // O_CREAT|O_EXCL|O_RDWR attach or any later open of the mounted path.
+  int open(oflags_t) override { return backend->openPayload(); }
+  int close() override { return 0; }
+  ssize_t read(uint8_t* buffer, size_t length, off_t offset) override {
+    return backend->readPayload(buffer, length, offset);
+  }
+  ssize_t write(const uint8_t*, size_t, off_t) override {
+    // The backend opts into the paired hook. Any accidental legacy call must
+    // fail rather than publish data with stale metadata.
+    return -ENOTSUP;
+  }
+  ssize_t writeWithMetadata(const uint8_t* buffer,
+                            size_t length,
+                            off_t offset,
+                            const Metadata& metadata) override {
+    return backend->writePayloadWithMetadata(buffer, length, offset, metadata);
+  }
+  int setSize(off_t) override { return -ENOTSUP; }
+  int setSizeWithMetadata(off_t size, const Metadata& metadata) override {
+    return backend->resizePayloadWithMetadata(size, metadata);
+  }
+  int flush() override { return backend->flushPayload(); }
+  int persistMetadata(const Metadata& metadata) override {
+    return backend->persistPayloadMetadata(metadata);
+  }
+
+public:
+  ProfileLogV3DataFile(ProfileLogV3DataBackend* backend,
+                       const Metadata& metadata)
+    : DataFile(metadata.mode & ~S_IFMT, backend), backend(backend) {
+    mode = metadata.mode;
+    atime = metadata.atime;
+    mtime = metadata.mtime;
+    ctime = metadata.ctime;
+  }
+};
+
+std::shared_ptr<DataFile> ProfileLogV3DataBackend::createFile(mode_t mode) {
+  ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+  if (!operation) {
+    return nullptr;
+  }
+  std::lock_guard<std::recursive_mutex> lock(storeMutex);
+  if (fatalError || payloadExposed ||
+      (mode & (S_IRWXUGO | S_ISVTX)) != payloadMode) {
+    return nullptr;
+  }
+  payloadExposed = true;
+  return std::make_shared<ProfileLogV3DataFile>(this, snapshot.metadata);
+}
+
 } // anonymous namespace
 
 extern "C" {
@@ -4836,6 +6244,63 @@ backend_t wasmfs_create_opfs_profile_log_v2_control_backend(
     return NullBackend;
   }
   error = backend->initialise(profile_name);
+  if (error) {
+    assert(error < 0);
+    if (backend->abandonFailedInitialisation()) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  return wasmFS.addBackend(std::move(backend));
+#endif
+}
+
+backend_t wasmfs_create_opfs_profile_log_v3_data_backend(
+  const char* profile_name,
+  mode_t payload_mode) {
+  WasmFS::Operation operation(wasmFS);
+  if (!operation) {
+    errno = operation.getError();
+    return NullBackend;
+  }
+  if (!IsValidProfileLeaseName(profile_name) ||
+      (payload_mode & ~S_IALLUGO) != 0) {
+    errno = EINVAL;
+    return NullBackend;
+  }
+
+#ifndef __EMSCRIPTEN_PTHREADS__
+  // V3's fixed physical files and cooperative profile lease must remain in
+  // the dedicated OPFS worker for their whole lifetime.
+  errno = ENOTSUP;
+  return NullBackend;
+#else
+  if (!wasmFS.reserveTerminalLeaseOwner()) {
+    errno = EBUSY;
+    return NullBackend;
+  }
+  assert(!emscripten_is_main_browser_thread() &&
+         "Cannot safely create leased OPFS backend on main browser thread");
+
+  auto backend = std::make_unique<ProfileLogV3DataBackend>();
+  bool acquireProxyCompleted = false;
+  int error = backend->acquireProfileLease(
+    profile_name, &acquireProxyCompleted);
+  if (error) {
+    assert(error < 0);
+    if (acquireProxyCompleted) {
+      wasmFS.cancelTerminalLeaseOwnerReservation();
+    } else {
+      wasmFS.markTerminalLeaseOwnerReservationAmbiguous();
+      backend->abandonUnacknowledgedProfileLeaseAcquire();
+    }
+    errno = -error;
+    return NullBackend;
+  }
+  error = backend->initialise(profile_name, payload_mode);
   if (error) {
     assert(error < 0);
     if (backend->abandonFailedInitialisation()) {

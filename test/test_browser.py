@@ -7809,6 +7809,296 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v3_data(self):
+    # V3 is deliberately a single non-mountable DataFile projection. These
+    # fresh-iframe tests exercise its fixed bootstrap/control/arena layout:
+    # partial-bootstrap rejection, old-image selection before the CLEAN
+    # quorum, new-image selection after it, read-only g/g+1 recovery, and
+    # selected control/manifest parser rejection. They do not claim physical
+    # crash, namespace, directory, database, or Chromium profile recovery.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v3_data.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    before_profile = f'wasmfs_profile_log_v3_before_{random.getrandbits(64):016x}'
+    after_profile = f'wasmfs_profile_log_v3_after_{random.getrandbits(64):016x}'
+    bootstrap_profile = f'wasmfs_profile_log_v3_bootstrap_{random.getrandbits(64):016x}'
+    corrupt_profile = f'wasmfs_profile_log_v3_corrupt_{random.getrandbits(64):016x}'
+    resize_profile = f'wasmfs_profile_log_v3_resize_{random.getrandbits(64):016x}'
+    forced_error_profile = f'wasmfs_profile_log_v3_forced_error_{random.getrandbits(64):016x}'
+
+    def profile_arg(profile):
+      return '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_PROFILE_NAME=' + profile
+
+    def compile_role(output, profile, role_args, extra_args=None):
+      self.compile_btest(
+        test,
+        common_args + [profile_arg(profile)] + role_args +
+          (extra_args or []) + ['-o', output],
+        reporting=Reporting.NONE)
+
+    compile_role('v3-before-owner.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_OWNER'])
+    compile_role('v3-before-mutator.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_MUTATOR',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT_PHASE=1'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT=1'])
+    compile_role('v3-before-verifier.html', before_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_EXPECT_COMMIT_REJECTION'])
+
+    compile_role('v3-after-owner.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_OWNER'])
+    compile_role('v3-after-mutator.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_MUTATOR',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT_PHASE=2'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT=1'])
+    compile_role('v3-after-verifier.html', after_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_EXPECT_NEW'])
+
+    compile_role('v3-bootstrap-owner.html', bootstrap_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_OWNER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT_PHASE=0'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V3_TEST_INTERRUPT=1'])
+    compile_role('v3-bootstrap-corruptor.html', bootstrap_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_CORRUPTOR'])
+
+    compile_role('v3-corrupt-owner.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_OWNER'])
+    compile_role('v3-corrupt-mutator.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_MUTATOR'])
+    for selector, name in ((1, 'phase'), (2, 'descriptor'), (3, 'manifest')):
+      compile_role(f'v3-corrupt-{name}.html', corrupt_profile,
+                   ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_CORRUPTOR'],
+                   ['-sWASMFS_OPFS_PROFILE_LOG_V3_TEST_SELECTED_CORRUPTION=' +
+                    str(selector)])
+    compile_role('v3-corrupt-verifier.html', corrupt_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_EXPECT_NEW'])
+
+    compile_role('v3-resize-owner.html', resize_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_OWNER'])
+    compile_role('v3-resize-mutator.html', resize_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_RESIZER'])
+    compile_role('v3-resize-verifier.html', resize_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_VERIFIER',
+                  '-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_EXPECT_RESIZED_SHORT'])
+
+    compile_role('v3-forced-error-owner.html', forced_error_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_OWNER'])
+    compile_role('v3-forced-error-mutator.html', forced_error_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_COMMIT_ERROR'],
+                 ['-sWASMFS_OPFS_PROFILE_LOG_V3_TEST_FORCED_COMMIT_ERROR=1'])
+    compile_role('v3-forced-error-verifier.html', forced_error_profile,
+                 ['-DWASMFS_OPFS_PROFILE_LOG_V3_TEST_VERIFIER'])
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kOwner = 0;
+        const kMutator = 1;
+        const kResizer = 2;
+        const kVerifier = 3;
+        const kCorruptor = 4;
+        const kCommitError = 5;
+        const kReady = 0;
+        const kCorruptionRejected = 1;
+        const kBusy = 16;
+        const kWitnessType = 'wasmfs-opfs-profile-log-v3-data';
+        const kEventTimeoutMs = 20000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, predicate, description) {
+          const index = module.events.findIndex(predicate);
+          if (index >= 0) {
+            return Promise.resolve(module.events.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const waiter = module.waiters.findIndex(
+                (candidate) => candidate.resolve === resolve);
+              if (waiter >= 0) {
+                module.waiters.splice(waiter, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({predicate, resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin != window.location.origin ||
+              event.data?.type != kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          const waiter = module.waiters.findIndex(
+            (candidate) => candidate.predicate(event.data));
+          if (waiter >= 0) {
+            const candidate = module.waiters.splice(waiter, 1)[0];
+            clearTimeout(candidate.timeout);
+            candidate.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runResult(path, role, result, description) {
+          const module = launchModule(path);
+          try {
+            const message = await waitFor(
+              module, (event) => event.event === 'result', description);
+            if (message.role !== role || message.result !== result ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error);
+            }
+          } finally {
+            disposeModule(module);
+          }
+        }
+
+        async function runAfterLeaseRelease(path, role, result, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(
+                module, (event) => event.event === 'result', description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.result !== result ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function runInterruptedScenario(owner, mutator, verifier,
+                                               phase, description) {
+          await runResult(owner, kOwner, kReady, description + ' owner');
+          const module = launchModule(mutator);
+          try {
+            const interruption = await waitFor(
+              module,
+              (event) => event.event === 'interrupt' && event.phase === phase,
+              description + ' interruption');
+            if (interruption.phase !== phase) {
+              throw new Error(description + ' reported wrong interruption');
+            }
+          } finally {
+            // This fresh-document disposal is the controlled interruption;
+            // the parent never reads or writes OPFS directly.
+            disposeModule(module);
+          }
+          await runAfterLeaseRelease(verifier, kVerifier, kReady,
+                                     description + ' fresh verifier');
+        }
+
+        async function runBootstrapInterruption(owner, corruptor) {
+          const module = launchModule(owner);
+          try {
+            await waitFor(
+              module,
+              (event) => event.event === 'interrupt' && event.phase === 0,
+              'first bootstrap witness interruption');
+          } finally {
+            // A partial fixed-file set must be rejected rather than adopted or
+            // recreated by the next fresh factory.
+            disposeModule(module);
+          }
+          await runAfterLeaseRelease(corruptor, kCorruptor,
+                                     kCorruptionRejected,
+                                     'partial bootstrap factory rejection');
+        }
+
+        (async () => {
+          await runBootstrapInterruption(
+            'v3-bootstrap-owner.html', 'v3-bootstrap-corruptor.html');
+          await runInterruptedScenario(
+            'v3-before-owner.html', 'v3-before-mutator.html',
+            'v3-before-verifier.html', 1,
+            'old payload before CLEAN quorum and read-only recovery');
+          await runInterruptedScenario(
+            'v3-after-owner.html', 'v3-after-mutator.html',
+            'v3-after-verifier.html', 2,
+            'new payload after CLEAN quorum');
+          await runResult('v3-corrupt-owner.html', kOwner, kReady,
+                          'selected-chain owner');
+          await runResult('v3-corrupt-mutator.html', kMutator, kReady,
+                          'selected-chain update');
+          for (const name of ['phase', 'descriptor', 'manifest']) {
+            await runAfterLeaseRelease('v3-corrupt-' + name + '.html',
+                                       kCorruptor, kCorruptionRejected,
+                                       'selected ' + name +
+                                       ' corruption rejection');
+          }
+          await runAfterLeaseRelease('v3-corrupt-verifier.html', kVerifier,
+                                     kReady,
+                                     'normal verifier after corruption tests');
+          await runResult('v3-resize-owner.html', kOwner, kReady,
+                          'resize owner');
+          await runResult('v3-resize-mutator.html', kResizer, kReady,
+                          'paired ftruncate grow and shrink');
+          await runAfterLeaseRelease('v3-resize-verifier.html', kVerifier,
+                                     kReady,
+                                     'fresh exact short payload after resize');
+          await runResult('v3-forced-error-owner.html', kOwner, kReady,
+                          'forced-error owner');
+          // This is an in-process pre-write fault injection, not a physical
+          // storage-corruption or browser-crash test. It proves both the
+          // failing attached pwrite and the fatal-latch check on a later open.
+          await runResult('v3-forced-error-mutator.html', kCommitError,
+                          kReady, 'forced commit error and reopen rejection');
+          await runAfterLeaseRelease('v3-forced-error-verifier.html',
+                                     kVerifier, kReady,
+                                     'fresh payload after synthetic error');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v2_proxy_completion_failure(self):
     # A test-only terminal latch after a successfully flushed inactive V2 root
     # must make the explicit failed drain issue no later Worker proxy. It

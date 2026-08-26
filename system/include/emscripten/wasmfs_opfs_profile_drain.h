@@ -60,9 +60,11 @@ typedef struct wasmfs_opfs_profile_drain_result {
 // Atomically seal, flush, close, and release one backend created by either
 // wasmfs_create_opfs_backend_with_profile_lease() or
 // wasmfs_create_opfs_profile_namespace_backend(), or the experimental
-// wasmfs_create_opfs_profile_log_v2_control_backend(). This is an embedding
+// wasmfs_create_opfs_profile_log_v2_control_backend(), or the experimental
+// wasmfs_create_opfs_profile_log_v3_data_backend(). This is an embedding
 // primitive for a profile-specific orderly handoff. The V2 control primitive
-// has no mount or fd-table descriptors of its own, but still owns private OPFS
+// has no mount or fd-table descriptors of its own, while V3 has at most its
+// one explicitly attached DataFile projection; both still own private OPFS
 // handles and the same cooperative lease. The drain leaves unrelated WasmFS
 // mounts, descriptors, and stdio usable.
 //
