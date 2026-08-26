@@ -220,8 +220,9 @@ class IgnoreCaseBackend : public Backend {
   backend_t backend;
 
 public:
-  IgnoreCaseBackend(std::function<backend_t()> createBackend) {
-    backend = createBackend();
+  explicit IgnoreCaseBackend(backend_t backend) : backend(backend) {
+    assert(backend);
+    assert(!backend->requiresAtomicNamespaceMutations());
   }
 
   bool supportsExplicitMetadataMutation() const override {
@@ -253,7 +254,15 @@ public:
 
 // Create an ignore case backend by supplying another backend.
 backend_t createIgnoreCaseBackend(std::function<backend_t()> createBackend) {
-  return wasmFS.addBackend(std::make_unique<IgnoreCaseBackend>(createBackend));
+  auto backend = createBackend();
+  // This helper is also used internally, where the C API's validation below
+  // is bypassed. A virtual case-folding directory cannot transform an atomic
+  // namespace request and its complete post-images, so reject the inner
+  // backend before allocating a wrapper in every route.
+  if (!backend || backend->requiresAtomicNamespaceMutations()) {
+    return NullBackend;
+  }
+  return wasmFS.addBackend(std::make_unique<IgnoreCaseBackend>(backend));
 }
 
 extern "C" {
@@ -284,7 +293,19 @@ backend_t wasmfs_create_icase_backend(backend_t backend) {
     errno = ENOTSUP;
     return NullBackend;
   }
-  return createIgnoreCaseBackend([backend]() { return backend; });
+  // Namespace transactions contain parent identities, replacement objects,
+  // and complete metadata post-images. Until a virtual backend can transform
+  // and publish both its wrapper and its real namespace images as one unit,
+  // wrapping an opted-in backend would be an unsafe legacy-operation bypass.
+  if (backend->requiresAtomicNamespaceMutations()) {
+    errno = ENOTSUP;
+    return NullBackend;
+  }
+  auto result = createIgnoreCaseBackend([backend]() { return backend; });
+  if (!result) {
+    errno = ENOTSUP;
+  }
+  return result;
 }
 
 } // extern "C"

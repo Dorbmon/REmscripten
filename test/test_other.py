@@ -13325,6 +13325,32 @@ Module.postRun = () => {{
     '': ([],),
     'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
   })
+  def test_wasmfs_atomic_namespace_mutation(self, args):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    self.do_runf(
+        'wasmfs/wasmfs_atomic_namespace_mutation.cpp', 'ok', cflags=args)
+
+  @parameterized({
+    '': ([],),
+    'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
+  def test_wasmfs_atomic_namespace_preload(self, args):
+    self.set_setting('WASMFS')
+    self.set_setting('FORCE_FILESYSTEM')
+    create_file('wasmfs_atomic_namespace_preload_payload', 'preload data')
+    self.do_runf(
+        'wasmfs/wasmfs_atomic_namespace_preload.cpp', 'ok',
+        cflags=args + [
+          '--preload-file',
+          'wasmfs_atomic_namespace_preload_payload@'
+          '/wasmfs-atomic-preload/payload',
+        ])
+
+  @parameterized({
+    '': ([],),
+    'pthreads': (['-pthread', '-sPROXY_TO_PTHREAD', '-sEXIT_RUNTIME'],),
+  })
   def test_wasmfs_ftruncate_descriptor_mode(self, args):
     self.set_setting('WASMFS')
     self.do_run_in_out_file_test(

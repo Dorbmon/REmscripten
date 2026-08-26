@@ -110,8 +110,10 @@ public:
     int admitBackend(backend_t backend);
   };
 
-  // Serializes CWD installation with mount detachment. Acquire this before
-  // renameMutex, `mutex`, FileTable, and any File or Directory lock.
+  // Serializes CWD installation and namespace attachment topology (mount,
+  // unmount, rename, and removal) with attachment-sensitive namespace
+  // mutations. Acquire this before renameMutex, `mutex`, FileTable, and any
+  // File or Directory lock.
   class CWDTransition {
     friend class WasmFS;
 

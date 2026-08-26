@@ -778,9 +778,42 @@ std::shared_ptr<Directory> WasmFS::initRootDirectory() {
   // The root directory is its own parent.
   lockedRoot.setParent(rootDirectory);
 
+  const bool atomicNamespace =
+    rootBackend->requiresAtomicNamespaceMutations();
+  auto createRootChildDirectory = [&](const char* name, mode_t mode) {
+    // The legacy insertion hooks historically tolerate existing root children
+    // supplied by NODERAWFS or preload setup. An atomic persistent root must
+    // discover and reuse such a directory before attempting a transaction,
+    // rather than treating its durable EEXIST as a startup failure.
+    if (atomicNamespace) {
+      auto lookup = lockedRoot.getChildWithError(name);
+      if (lookup.getError()) {
+        emscripten_err("Fatal error during root directory lookup in WasmFS.");
+        abort();
+      }
+      if (auto existing = lookup.getFile()) {
+        auto directory = existing->dynCast<Directory>();
+        if (!directory) {
+          emscripten_err("Fatal non-directory root child in WasmFS.");
+          abort();
+        }
+        return directory;
+      }
+    }
+
+    std::shared_ptr<Directory> result;
+    int error = lockedRoot.insertDirectoryWithNamespaceTransaction(
+      name, mode, result);
+    if (error && atomicNamespace) {
+      emscripten_err("Fatal error during root directory initialization in WasmFS.");
+      abort();
+    }
+    return result;
+  };
+
   // If the /dev/ directory does not already exist, create it. (It may already
   // exist in NODERAWFS mode, or if those files have been preloaded.)
-  auto devDir = lockedRoot.insertDirectory("dev", S_IRUGO | S_IXUGO);
+  auto devDir = createRootChildDirectory("dev", S_IRUGO | S_IXUGO);
   if (devDir) {
     auto lockedDev = devDir->locked();
     lockedDev.mountChild("null", SpecialFiles::getNull());
@@ -793,7 +826,8 @@ std::shared_ptr<Directory> WasmFS::initRootDirectory() {
 
   // As with the /dev/ directory, it is not an error for /tmp/ to already
   // exist.
-  lockedRoot.insertDirectory("tmp", S_IRWXUGO);
+  [[maybe_unused]] auto tmpDir =
+    createRootChildDirectory("tmp", S_IRWXUGO);
 
   return rootDirectory;
 }
@@ -858,9 +892,19 @@ void WasmFS::preloadFiles() {
       continue;
     }
 
-    auto inserted =
-      lockedParentDir.insertDirectory(childName, S_IRUGO | S_IXUGO);
-    assert(inserted && "TODO: handle preload insertion errors");
+    std::shared_ptr<Directory> inserted;
+    int error = lockedParentDir.insertDirectoryWithNamespaceTransaction(
+      childName, S_IRUGO | S_IXUGO, inserted);
+    if (error && parentDir->getBackend() &&
+        parentDir->getBackend()->requiresAtomicNamespaceMutations()) {
+      emscripten_err(
+        "Fatal error during directory creation in file preloading.");
+      abort();
+    }
+    // Keep the historical legacy-backend assertion behavior. Atomic namespace
+    // backends above abort rather than silently proceeding after a failed
+    // transaction, including the default ENOTSUP hook.
+    assert(!error && inserted && "TODO: handle preload insertion errors");
   }
 
   for (int i = 0; i < numFiles; i++) {
@@ -875,10 +919,25 @@ void WasmFS::preloadFiles() {
       abort();
     }
     auto& [parent, childName] = parsed.getParentChild();
-    auto created =
-      parent->locked().insertDataFile(std::string(childName), (mode_t)mode);
-    assert(created && "TODO: handle preload insertion errors");
-    created->locked().preloadFromJS(i);
+    std::shared_ptr<DataFile> created;
+    int error;
+    {
+      auto lockedParent = parent->locked();
+      error = lockedParent.insertDataFileWithNamespaceTransaction(
+        std::string(childName), (mode_t)mode, created);
+    }
+    if (error && parent->getBackend() &&
+        parent->getBackend()->requiresAtomicNamespaceMutations()) {
+      emscripten_err("Fatal error during file creation in file preloading.");
+      abort();
+    }
+    // See the directory case above: preserve the legacy assertion while
+    // making an opted-in backend's failed transaction terminal.
+    assert(!error && created && "TODO: handle preload insertion errors");
+    if (created->locked().preloadFromJS(i)) {
+      emscripten_err("Fatal error during file data preloading.");
+      abort();
+    }
   }
 }
 

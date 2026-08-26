@@ -14,6 +14,7 @@
 #include <emscripten/syscalls.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -37,6 +38,15 @@
 #include "pipe_backend.h"
 #include "special_files.h"
 #include "wasmfs.h"
+
+// This undefined weak hook is intentionally an internal focused-test seam: it
+// has no public declaration or default implementation. A pthread regression
+// test may define it to observe the first *actual* parent File lock acquired
+// by RenameParentLocks. Production links leave it null.
+extern "C" __attribute__((weak)) void
+wasmfs_rename_first_parent_lock_for_testing(wasmfs::Directory* oldParent,
+                                            wasmfs::Directory* newParent,
+                                            wasmfs::Directory* firstParent);
 
 // File permission macros for wasmfs.
 // Used to improve readability compared to those in stat.h
@@ -76,6 +86,127 @@ bool cwdIsAtOrBelow(wasmfs::WasmFS::CWDTransition& cwdTransition,
   }
   return false;
 }
+
+// Call only while holding WasmFS::CWDTransition and no File or Directory
+// handle. That transition serializes parent-link changes made by mount,
+// unmount, rename, and namespace removal, so this one-lock-at-a-time
+// traversal remains valid through a following durable namespace transaction
+// without inverting directory locks.
+//
+// A missing parent means the retained directory is no longer visible from the
+// global root. A non-root cycle is corrupt topology rather than a detached
+// namespace, so keep its distinct EIO result rather than looping forever or
+// reporting a misleading ENOENT.
+int namespaceAttachmentError(wasmfs::WasmFS::CWDTransition&,
+                             const std::shared_ptr<wasmfs::Directory>&
+                               directory) {
+  auto current = directory;
+  auto root = wasmfs::wasmFS.getRootDirectory();
+  std::vector<std::shared_ptr<wasmfs::Directory>> seen;
+  while (true) {
+    if (!current) {
+      return -ENOENT;
+    }
+    if (current == root) {
+      return 0;
+    }
+    for (const auto& seenDirectory : seen) {
+      if (seenDirectory == current) {
+        return -EIO;
+      }
+    }
+    seen.push_back(current);
+
+    std::shared_ptr<wasmfs::Directory> parent;
+    {
+      auto lockedCurrent = current->locked();
+      parent = lockedCurrent.getParent();
+    }
+    if (!parent) {
+      return -ENOENT;
+    }
+    current = std::move(parent);
+  }
+}
+
+// Call only while holding WasmFS::CWDTransition and no File or Directory
+// handle. Lock related rename parents from ancestor to descendant; for
+// unrelated directories, use a stable address order. This avoids both an
+// ancestor->child lookup racing a child->ancestor rename and two opposing
+// unrelated renames taking the pair in different orders.
+bool isAncestorDirectory(const std::shared_ptr<wasmfs::Directory>& ancestor,
+                         const std::shared_ptr<wasmfs::Directory>& directory) {
+  auto current = directory;
+  std::vector<std::shared_ptr<wasmfs::Directory>> seen;
+  while (current) {
+    if (current == ancestor) {
+      return true;
+    }
+    for (const auto& seenDirectory : seen) {
+      if (seenDirectory == current) {
+        return false;
+      }
+    }
+    seen.push_back(current);
+
+    std::shared_ptr<wasmfs::Directory> parent;
+    {
+      auto lockedCurrent = current->locked();
+      parent = lockedCurrent.getParent();
+    }
+    if (!parent || parent == current) {
+      return false;
+    }
+    current = std::move(parent);
+  }
+  return false;
+}
+
+bool lockOldRenameParentFirst(
+  const std::shared_ptr<wasmfs::Directory>& oldParent,
+  const std::shared_ptr<wasmfs::Directory>& newParent) {
+  if (oldParent == newParent) {
+    return true;
+  }
+  const bool oldIsAncestor = isAncestorDirectory(oldParent, newParent);
+  const bool newIsAncestor = isAncestorDirectory(newParent, oldParent);
+  if (oldIsAncestor != newIsAncestor) {
+    return oldIsAncestor;
+  }
+  return std::less<wasmfs::Directory*>()(oldParent.get(), newParent.get());
+}
+
+void reportFirstRenameParentLock(
+  const std::shared_ptr<wasmfs::Directory>& oldParent,
+  const std::shared_ptr<wasmfs::Directory>& newParent,
+  const std::shared_ptr<wasmfs::Directory>& firstParent) {
+  if (wasmfs_rename_first_parent_lock_for_testing) {
+    wasmfs_rename_first_parent_lock_for_testing(
+      oldParent.get(), newParent.get(), firstParent.get());
+  }
+}
+
+class RenameParentLocks {
+  std::optional<wasmfs::Directory::Handle> lockedOldParent;
+  std::optional<wasmfs::Directory::Handle> lockedNewParent;
+
+public:
+  RenameParentLocks(const std::shared_ptr<wasmfs::Directory>& oldParent,
+                    const std::shared_ptr<wasmfs::Directory>& newParent) {
+    if (lockOldRenameParentFirst(oldParent, newParent)) {
+      lockedOldParent.emplace(oldParent);
+      reportFirstRenameParentLock(oldParent, newParent, oldParent);
+      lockedNewParent.emplace(newParent);
+    } else {
+      lockedNewParent.emplace(newParent);
+      reportFirstRenameParentLock(oldParent, newParent, newParent);
+      lockedOldParent.emplace(oldParent);
+    }
+  }
+
+  wasmfs::Directory::Handle& old() { return *lockedOldParent; }
+  wasmfs::Directory::Handle& next() { return *lockedNewParent; }
+};
 
 bool canMutateExplicitMetadata(const std::shared_ptr<wasmfs::File>& file) {
   if (auto* backend = file->getBackend()) {
@@ -988,6 +1119,14 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
     return err;
   }
 
+  // Hold mount topology stable while a create validates attachment and then
+  // installs a child. Path parsing above this helper may race unmount, so the
+  // transitive check below remains authoritative.
+  std::optional<WasmFS::CWDTransition> attachmentTransition;
+  if (flags & O_CREAT) {
+    attachmentTransition.emplace(wasmFS.beginCWDTransition());
+  }
+
   int accessMode = (flags & O_ACCMODE);
 
   if (auto err = parsed.getError()) {
@@ -1006,15 +1145,34 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
       return err;
     }
     child = lookup.getFile();
-    // The requested node was not found.
-    if (!child) {
-      // If curr is the last element and the create flag is specified
-      // If O_DIRECTORY is also specified, still create a regular file:
-      // https://man7.org/linux/man-pages/man2/open.2.html#BUGS
-      if (!(flags & O_CREAT)) {
-        return -ENOENT;
-      }
+  }
 
+  // Only a missing O_CREAT path changes the namespace. Check its full parent
+  // ancestry with no directory handle live: a lookup may hold an ancestor
+  // while it fills a child cache, so walking child-to-parent while retaining
+  // this parent lock can deadlock a concurrent lookup.
+  if (!child) {
+    // If curr is the last element and the create flag is specified
+    // If O_DIRECTORY is also specified, still create a regular file:
+    // https://man7.org/linux/man-pages/man2/open.2.html#BUGS
+    if (!(flags & O_CREAT)) {
+      return -ENOENT;
+    }
+    assert(attachmentTransition);
+    if (int err = namespaceAttachmentError(*attachmentTransition, parent)) {
+      return err;
+    }
+
+    // Revalidate the missing entry after the lock-free ancestry walk. The
+    // topology transition keeps its parent chain fixed, while this directory
+    // lock protects ordinary lookup/cache publication.
+    auto lockedParent = parent->locked();
+    auto lookup = lockedParent.getChildWithError(std::string(childName));
+    if (int err = lookup.getError()) {
+      return err;
+    }
+    child = lookup.getFile();
+    if (!child) {
       // Inserting into an unlinked directory is not allowed.
       if (!lockedParent.getParent()) {
         return -ENOENT;
@@ -1042,12 +1200,12 @@ static __wasi_fd_t doOpen(path::ParsedParent parsed,
 
       std::shared_ptr<File> created;
       if (backend == parent->getBackend()) {
-        created = lockedParent.insertDataFile(std::string(childName), mode);
-        if (!created) {
-          // TODO Receive a specific error code, and report it here. For now,
-          //      report a generic error.
-          return -EIO;
+        std::shared_ptr<DataFile> dataFile;
+        if (int error = lockedParent.insertDataFileWithNamespaceTransaction(
+              std::string(childName), mode, dataFile)) {
+          return error;
         }
+        created = std::move(dataFile);
       } else {
         created = backend->createFile(mode);
         if (!created) {
@@ -1230,18 +1388,46 @@ static int
 doMkdir(path::ParsedParent parsed,
         int mode,
         wasmfs::backend_t backend = NullBackend) {
+  // Keep an attachment check and any following child publication serialized
+  // with mount detachment and parent-link changes.
+  auto attachmentTransition = wasmFS.beginCWDTransition();
   if (auto err = parsed.getError()) {
     return err;
   }
   auto& [parent, childNameView] = parsed.getParentChild();
   std::string childName(childNameView);
-  auto lockedParent = parent->locked();
 
   if (childName.size() > WASMFS_NAME_MAX) {
     return -ENAMETOOLONG;
   }
 
   // Check if the requested directory already exists.
+  std::shared_ptr<File> child;
+  {
+    auto lockedParent = parent->locked();
+    auto lookup = lockedParent.getChildWithError(childName);
+    if (int err = lookup.getError()) {
+      return err;
+    }
+    child = lookup.getFile();
+  }
+  if (child) {
+    if (int err = admitFile(child)) {
+      return err;
+    }
+    return -EEXIST;
+  }
+
+  // Do not retain a parent handle while walking its ancestry. A concurrent
+  // lookup may lock an ancestor and then cache this child under the parent.
+  if (int err = namespaceAttachmentError(attachmentTransition, parent)) {
+    return err;
+  }
+
+  // Revalidate the missing entry after the lock-free ancestry walk. The
+  // CWD transition prevents parent-link changes; this lock protects ordinary
+  // cache and child changes.
+  auto lockedParent = parent->locked();
   auto lookup = lockedParent.getChildWithError(childName);
   if (int err = lookup.getError()) {
     return err;
@@ -1282,10 +1468,10 @@ doMkdir(path::ParsedParent parsed,
   }
 
   if (backend == parent->getBackend()) {
-    if (!lockedParent.insertDirectory(childName, mode)) {
-      // TODO Receive a specific error code, and report it here. For now, report
-      //      a generic error.
-      return -EIO;
+    std::shared_ptr<Directory> created;
+    if (int error = lockedParent.insertDirectoryWithNamespaceTransaction(
+          childName, mode, created)) {
+      return error;
     }
   } else {
     auto created = backend->createDirectory(mode);
@@ -1537,18 +1723,46 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
       return -EINVAL;
     }
   }
+  // Hold topology stable while a retained descendant descriptor is checked
+  // and potentially mutates its parent.
+  auto attachmentTransition = wasmFS.beginCWDTransition();
   auto parsed = path::parseParent((char*)path, dirfd);
   if (auto err = parsed.getError()) {
     return err;
   }
   auto& [parent, childNameView] = parsed.getParentChild();
   std::string childName(childNameView);
+  std::shared_ptr<File> file;
+  {
+    auto lockedParent = parent->locked();
+    auto lookup = lockedParent.getChildWithError(childName);
+    if (int err = lookup.getError()) {
+      return err;
+    }
+    file = lookup.getFile();
+  }
+  if (!file) {
+    return -ENOENT;
+  }
+  if (int err = admitFile(file)) {
+    return err;
+  }
+
+  // Do not walk from a retained child toward the root while holding its
+  // parent. Read-only lookup can lock the root first and then cache this
+  // child, so that order would deadlock despite the topology transition.
+  if (int err = namespaceAttachmentError(attachmentTransition, parent)) {
+    return err;
+  }
+
+  // Revalidate the exact source after the lock-free ancestry walk. The
+  // transition protects topology; this lock protects the directory entry.
   auto lockedParent = parent->locked();
   auto lookup = lockedParent.getChildWithError(childName);
   if (int err = lookup.getError()) {
     return err;
   }
-  auto file = lookup.getFile();
+  file = lookup.getFile();
   if (!file) {
     return -ENOENT;
   }
@@ -1561,6 +1775,7 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
   }
 
   auto lockedFile = file->locked();
+  auto mutationKind = Directory::NamespaceMutation::Kind::Unlink;
   if (auto dir = file->dynCast<Directory>()) {
     if (flags != AT_REMOVEDIR) {
       return -EISDIR;
@@ -1578,6 +1793,7 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
     if (numEntries > 0) {
       return -ENOTEMPTY;
     }
+    mutationKind = Directory::NamespaceMutation::Kind::RemoveDirectory;
   } else {
     // A normal file or symlink.
     if (flags == AT_REMOVEDIR) {
@@ -1591,7 +1807,8 @@ int __syscall_unlinkat(int dirfd, intptr_t path, int flags) {
   }
 
   // Input is valid, perform the unlink.
-  return lockedParent.removeChild(childName);
+  return lockedParent.removeChildWithNamespaceTransaction(
+    childName, file, mutationKind);
 }
 
 int __syscall_rmdir(intptr_t path) {
@@ -1610,6 +1827,14 @@ int wasmfs_unmount(const char* path) {
   }
   auto& [parent, childNameView] = parsed.getParentChild();
   std::string childName(childNameView);
+
+  // A retained descriptor can still resolve a nested mount below an already
+  // detached tree. Do not let that stale path perform a second topology
+  // mutation. This runs before taking the parent lock, and the loop below
+  // revalidates the mount entry before removing it.
+  if (int err = namespaceAttachmentError(cwdTransition, parent)) {
+    return err;
+  }
 
   // Do not hold the mount's parent lock while walking CWD ancestry. Apart from
   // avoiding nested directory locks, revalidate the mountpoint before unlinking
@@ -1798,12 +2023,89 @@ int __syscall_renameat(int olddirfd,
     return -ENAMETOOLONG;
   }
 
-  // Lock both directories.
-  auto lockedOldParent = oldParent->locked();
-  auto lockedNewParent = newParent->locked();
+  std::shared_ptr<File> oldFile;
+  std::shared_ptr<File> newFile;
+  {
+    // Get the source and destination files. Preserve source lookup failure
+    // precedence so an I/O error never becomes a missing source or
+    // destination.
+    RenameParentLocks parentLocks(oldParent, newParent);
+    auto& lockedOldParent = parentLocks.old();
+    auto& lockedNewParent = parentLocks.next();
+    auto oldLookup = lockedOldParent.getChildWithError(oldFileName);
+    if (int err = oldLookup.getError()) {
+      return err;
+    }
+    auto newLookup = lockedNewParent.getChildWithError(newFileName);
+    if (int err = newLookup.getError()) {
+      return err;
+    }
+    oldFile = oldLookup.getFile();
+    newFile = newLookup.getFile();
 
-  // Get the source and destination files. Preserve source lookup failure
-  // precedence so an I/O error never becomes a missing source or destination.
+    // Check either discovered leaf before returning a non-profile lookup
+    // result. In particular, rename("missing", "/profile") must not reveal a
+    // sealed mount as an ordinary ENOENT source failure.
+    if (oldFile) {
+      if (int err = admitFile(oldFile)) {
+        return err;
+      }
+    }
+    if (newFile) {
+      if (int err = admitFile(newFile)) {
+        return err;
+      }
+    }
+    if (!oldFile) {
+      return -ENOENT;
+    }
+
+    // If the source and destination are the same, do nothing. Preserve this
+    // no-op result even for a descriptor retained after a mount detach.
+    if (oldFile == newFile) {
+      return 0;
+    }
+  }
+
+  // Retained descriptors may still find descendants of a detached mount, but
+  // no public namespace mutation may persist through that stale ancestry.
+  // Keep legacy rename's EPERM mapping for a detached destination/source,
+  // while preserving EIO for corrupt non-root parent cycles.
+  if (int err = namespaceAttachmentError(cwdTransition, oldParent)) {
+    return err == -ENOENT ? -EPERM : err;
+  }
+  if (int err = namespaceAttachmentError(cwdTransition, newParent)) {
+    return err == -ENOENT ? -EPERM : err;
+  }
+
+  // Check the ancestor relation without either parent handle live. The
+  // topology transition makes this path stable; holding old/new parents while
+  // climbing from child to ancestor would invert ordinary lookup's
+  // ancestor-to-child lock order.
+  auto root = wasmFS.getRootDirectory();
+  for (auto curr = newParent; curr != root;) {
+    if (curr == oldFile) {
+      return -EINVAL;
+    }
+    std::shared_ptr<Directory> parent;
+    {
+      auto lockedCurrent = curr->locked();
+      parent = lockedCurrent.getParent();
+    }
+    // namespaceAttachmentError() above already proved that this route reaches
+    // root, but retain a defensive error if an internal caller corrupts it.
+    if (!parent) {
+      return -EIO;
+    }
+    curr = std::move(parent);
+  }
+
+  // Reacquire and revalidate after the lock-free ancestry checks. The
+  // topology transition pins parent links; directory handles protect the
+  // ordinary child mapping used by the durable transaction.
+  RenameParentLocks parentLocks(oldParent, newParent);
+  auto& lockedOldParent = parentLocks.old();
+  auto& lockedNewParent = parentLocks.next();
   auto oldLookup = lockedOldParent.getChildWithError(oldFileName);
   if (int err = oldLookup.getError()) {
     return err;
@@ -1812,12 +2114,8 @@ int __syscall_renameat(int olddirfd,
   if (int err = newLookup.getError()) {
     return err;
   }
-  auto oldFile = oldLookup.getFile();
-  auto newFile = newLookup.getFile();
-
-  // Check either discovered leaf before returning a non-profile lookup
-  // result. In particular, rename("missing", "/profile") must not reveal a
-  // sealed mount as an ordinary ENOENT source failure.
+  oldFile = oldLookup.getFile();
+  newFile = newLookup.getFile();
   if (oldFile) {
     if (int err = admitFile(oldFile)) {
       return err;
@@ -1831,14 +2129,11 @@ int __syscall_renameat(int olddirfd,
   if (!oldFile) {
     return -ENOENT;
   }
-
-  // If the source and destination are the same, do nothing.
   if (oldFile == newFile) {
     return 0;
   }
 
   // Never allow renaming or overwriting the root.
-  auto root = wasmFS.getRootDirectory();
   if (oldFile == root || newFile == root) {
     return -EBUSY;
   }
@@ -1860,13 +2155,6 @@ int __syscall_renameat(int olddirfd,
   // Both parents must have the same backend.
   if (oldParent->getBackend() != newParent->getBackend()) {
     return -EXDEV;
-  }
-
-  // Check that oldDir is not an ancestor of newDir.
-  for (auto curr = newParent; curr != root; curr = curr->locked().getParent()) {
-    if (curr == oldFile) {
-      return -EINVAL;
-    }
   }
 
   // The new file will be removed if it already exists.
@@ -1894,7 +2182,12 @@ int __syscall_renameat(int olddirfd,
   }
 
   // Perform the move.
-  if (auto err = lockedNewParent.insertMove(newFileName, oldFile)) {
+  if (auto err = lockedNewParent.insertMoveWithNamespaceTransaction(
+        lockedOldParent,
+        oldFileName,
+        newFileName,
+        oldFile,
+        newFile)) {
     assert(err < 0);
     return err;
   }
@@ -1904,6 +2197,9 @@ int __syscall_renameat(int olddirfd,
 // TODO: Test this with non-AT_FDCWD values.
 int __syscall_symlinkat(intptr_t target, int newdirfd, intptr_t linkpath) {
   WASMFS_GUARD_NEGATIVE();
+  // Serialize attachment validation and the following child publication with
+  // unmount and other parent-link topology changes.
+  auto attachmentTransition = wasmFS.beginCWDTransition();
   auto parsed = path::parseParent((char*)linkpath, newdirfd);
   if (auto err = parsed.getError()) {
     return err;
@@ -1912,8 +2208,30 @@ int __syscall_symlinkat(intptr_t target, int newdirfd, intptr_t linkpath) {
   if (childNameView.size() > WASMFS_NAME_MAX) {
     return -ENAMETOOLONG;
   }
-  auto lockedParent = parent->locked();
   std::string childName(childNameView);
+  std::shared_ptr<File> child;
+  {
+    auto lockedParent = parent->locked();
+    auto lookup = lockedParent.getChildWithError(childName);
+    if (int err = lookup.getError()) {
+      return err;
+    }
+    child = lookup.getFile();
+  }
+  if (child) {
+    if (int err = admitFile(child)) {
+      return err;
+    }
+    return -EEXIST;
+  }
+
+  // Like create and mkdir, release the parent before walking its ancestry so
+  // a concurrent ancestor-to-child lookup cannot form an ABBA lock cycle.
+  if (int err = namespaceAttachmentError(attachmentTransition, parent)) {
+    return err;
+  }
+
+  auto lockedParent = parent->locked();
   auto lookup = lockedParent.getChildWithError(childName);
   if (int err = lookup.getError()) {
     return err;
@@ -1932,11 +2250,10 @@ int __syscall_symlinkat(intptr_t target, int newdirfd, intptr_t linkpath) {
   if (!(lockedParent.getMode() & WASMFS_PERM_WRITE)) {
     return -EACCES;
   }
-  if (!lockedParent.insertSymlink(childName, (char*)target)) {
-    // The pointer-only backend insertion API cannot communicate a specific
-    // failure. Do not misreport this as a permission failure after the
-    // generic permission check above has already succeeded.
-    return -EIO;
+  std::shared_ptr<Symlink> created;
+  if (int error = lockedParent.insertSymlinkWithNamespaceTransaction(
+        childName, (char*)target, created)) {
+    return error;
   }
   return 0;
 }

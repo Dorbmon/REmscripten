@@ -267,6 +267,56 @@ public:
     }
   };
 
+  // A complete namespace transaction request. The caller has already
+  // performed pathname, permission, mountpoint, replacement-type, emptiness,
+  // and descendant validation before invoking the backend hook. The hook must
+  // atomically make this request durable before WasmFS publishes any matching
+  // dcache entry, parent link, or metadata image in memory. The hook runs with
+  // its parent directory locks held, plus the subject and replacement File
+  // locks whenever their metadata post-images are supplied. It must not call
+  // back into generic WasmFS mutation helpers or wait for another thread to
+  // acquire those File locks. Create candidates are private objects from the
+  // same backend with no parent link; the backend must not make them durably
+  // reachable before this hook returns zero. A negative result means no part
+  // of the request became durable and any temporary candidate was reclaimed,
+  // unless the backend has latched itself unrecoverable and thereafter fails
+  // every access explicitly.
+  struct NamespaceMutation {
+    enum class Kind {
+      CreateDataFile,
+      CreateDirectory,
+      CreateSymlink,
+      Unlink,
+      RemoveDirectory,
+      Rename,
+    };
+
+    Kind kind;
+
+    // A create has only a destination parent/name; an unlink or rmdir has
+    // only a source parent/name; a rename has both. The source and replacement
+    // identify the object moved or removed and any destination object that the
+    // generic checks have approved for replacement.
+    std::shared_ptr<Directory> sourceParent;
+    std::string sourceName;
+    std::shared_ptr<Directory> destinationParent;
+    std::string destinationName;
+    std::shared_ptr<File> subject;
+    std::shared_ptr<File> replacement;
+
+    // These are complete metadata post-images, not deltas. A same-parent
+    // rename supplies only sourceParentPostImage so one directory record is
+    // committed. It still supplies ctime post-images for the moved subject
+    // and any replaced target; unlink and rmdir similarly supply their
+    // removed subject's ctime image for retained descriptors. A create
+    // supplies subjectPostImage as well as its parent post-image before the
+    // new child becomes reachable through WasmFS.
+    std::optional<File::Metadata> sourceParentPostImage;
+    std::optional<File::Metadata> destinationParentPostImage;
+    std::optional<File::Metadata> subjectPostImage;
+    std::optional<File::Metadata> replacementPostImage;
+  };
+
 private:
   // The directory cache, or `dcache`, stores `File` objects for the children of
   // each directory so that subsequent lookups do not need to query the backend.
@@ -316,6 +366,21 @@ protected:
   // child has already been removed and otherwise returns a negative error code
   // if the child cannot be removed.
   virtual int removeChild(const std::string& name) = 0;
+
+  // Commit one complete namespace request. This is selected only when the
+  // owning Backend requiresAtomicNamespaceMutations(). The caller holds the
+  // request's parent directory locks and the subject/replacement File locks
+  // for supplied post-images; it will perform all WasmFS cache, parent-link,
+  // and metadata publication after a zero result. Implementations must not
+  // call back into those generic helpers, wait for another thread to acquire
+  // those File locks, or report success before the persistent namespace and
+  // supplied post-images are committed. On a negative result they must leave
+  // this request without durable effects and reclaim any create candidate,
+  // unless they have latched the backend unrecoverable and reject all later
+  // access explicitly.
+  virtual int commitNamespaceMutation(const NamespaceMutation&) {
+    return -ENOTSUP;
+  }
 
   // The number of entries in this directory. Returns the number of entries or a
   // negative error code.
@@ -422,6 +487,14 @@ public:
 
   Metadata getMetadata() {
     return {file->mode, file->atime, file->mtime, file->ctime};
+  }
+
+  // Publish a complete metadata image that a containing atomic operation has
+  // already committed durably. Unlike setMetadata(), this deliberately does
+  // not invoke a second storage hook. Namespace and paired data mutation
+  // paths must call this only after their transaction has succeeded.
+  void publishMetadataAfterAtomicMutation(Metadata metadata) {
+    publishMetadata(metadata);
   }
 
   // Ask the file's backend to persist a complete metadata candidate before
@@ -546,8 +619,9 @@ public:
 
   // This function loads preloaded files from JS Memory into this DataFile.
   // TODO: Make this virtual so specific backends can specialize it for better
-  // performance.
-  void preloadFromJS(int index);
+  // performance. Atomic data backends use their paired content/metadata hook;
+  // a negative return means preload initialization must fail closed.
+  [[nodiscard]] int preloadFromJS(int index);
 };
 
 class Directory::Handle : public File::Handle {
@@ -592,6 +666,23 @@ public:
   std::shared_ptr<Symlink> insertSymlink(const std::string& name,
                                          const std::string& target);
 
+  // Error-bearing counterparts for the atomic namespace capability. They
+  // preserve the legacy implementation exactly when the backend has not opted
+  // in, but return a backend transaction error (including default ENOTSUP)
+  // without collapsing it to a null child when it has.
+  [[nodiscard]] int insertDataFileWithNamespaceTransaction(
+    const std::string& name,
+    mode_t mode,
+    std::shared_ptr<DataFile>& result);
+  [[nodiscard]] int insertDirectoryWithNamespaceTransaction(
+    const std::string& name,
+    mode_t mode,
+    std::shared_ptr<Directory>& result);
+  [[nodiscard]] int insertSymlinkWithNamespaceTransaction(
+    const std::string& name,
+    const std::string& target,
+    std::shared_ptr<Symlink>& result);
+
   // Move the file represented by `file` from its current directory to this
   // directory with the new `name`, possibly overwriting another file that
   // already exists with that name. The old directory may be the same as this
@@ -601,10 +692,24 @@ public:
   [[nodiscard]] int insertMove(const std::string& name,
                                std::shared_ptr<File> file);
 
+  // The source and destination handles are both already locked by renameat.
+  // The transaction request includes the validated replacement (if any) and
+  // publishes cache and parent state only after its durable commit succeeds.
+  [[nodiscard]] int insertMoveWithNamespaceTransaction(
+    Directory::Handle& oldParent,
+    const std::string& oldName,
+    const std::string& newName,
+    std::shared_ptr<File> file,
+    std::shared_ptr<File> replacement);
+
   // Remove the file with the given name. Returns zero on success or if the
   // child has already been removed and otherwise returns a negative error code
   // if the child cannot be removed.
   [[nodiscard]] int removeChild(const std::string& name);
+  [[nodiscard]] int removeChildWithNamespaceTransaction(
+    const std::string& name,
+    std::shared_ptr<File> child,
+    NamespaceMutation::Kind kind);
 
   std::string getName(std::shared_ptr<File> file);
 

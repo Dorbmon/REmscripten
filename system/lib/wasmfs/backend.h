@@ -44,6 +44,30 @@ public:
   // transactions.
   virtual bool requiresAtomicMetadataMutations() const { return false; }
 
+  // A backend that persists namespace changes together with directory and
+  // child metadata must opt into Directory::commitNamespaceMutation(). Once
+  // this is true, WasmFS never falls back to the legacy insert/remove/move
+  // hooks for a persistent namespace mutation. A missing transaction hook is
+  // an explicit ENOTSUP rather than a split durable namespace and in-memory
+  // cache update.
+  //
+  // For a create request, createFile/createDirectory/createSymlink must return
+  // a private, unreachable candidate owned by this Backend and with no parent
+  // link. It must not make that candidate durably reachable before
+  // Directory::commitNamespaceMutation() returns success. If the transaction
+  // returns a negative errno, the backend must roll back or reclaim every
+  // temporary allocation and leave none of that request durable. The only
+  // exception is a backend that has latched its storage domain unrecoverable;
+  // it must then fail every later access explicitly rather than expose an
+  // ambiguous partial namespace.
+  //
+  // This is intentionally independent of requiresAtomicMetadataMutations().
+  // A backend may need one transaction shape for file data and another for
+  // directory topology, and opting into one must not imply the other.
+  // No production backend enables this generic seam yet; profile-backed OPFS
+  // integration must first supply the complete durable transaction contract.
+  virtual bool requiresAtomicNamespaceMutations() const { return false; }
+
   // Whether this backend provides a storage domain in which WasmFS can safely
   // implement POSIX process-owned record locks. Returning true is not a
   // promise that arbitrary external writers participate in locking. A

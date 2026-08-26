@@ -6,6 +6,7 @@
 // This file defines the file object.
 
 #include "file.h"
+#include "backend.h"
 #include "wasmfs.h"
 #include "wasmfs_internal.h"
 #include <algorithm>
@@ -13,6 +14,49 @@
 #include <fcntl.h>
 
 namespace wasmfs {
+
+namespace {
+
+bool requiresAtomicNamespaceMutations(Directory* directory) {
+  if (auto* backend = directory->getBackend()) {
+    return backend->requiresAtomicNamespaceMutations();
+  }
+  return false;
+}
+
+// A namespace-create factory is allowed to allocate a private candidate, but
+// must not return an object belonging to another storage domain. The caller
+// takes the candidate's long-lived File lock immediately afterward to check
+// that it has never been linked before the durable transaction.
+bool hasNamespaceCreateCandidateBackend(
+  const std::shared_ptr<File>& candidate, backend_t backend) {
+  return candidate && candidate->getBackend() == backend;
+}
+
+File::Metadata namespaceMutationPostImage(File::Handle& locked, double now) {
+  auto metadata = locked.getMetadata();
+  metadata.mtime = now;
+  metadata.ctime = now;
+  return metadata;
+}
+
+File::Metadata namespaceCTimePostImage(File::Handle& locked, double now) {
+  auto metadata = locked.getMetadata();
+  // Namespace operations that change a link or parent update ctime but not
+  // mtime. Keep the complete image so a namespace backend does not need to
+  // merge a delta.
+  metadata.ctime = now;
+  return metadata;
+}
+
+int checkedNamespaceMutationResult(int result) {
+  // Transaction hooks use the same zero-or-negative errno ABI as the other
+  // WasmFS backend hooks. A malformed positive result must not become a
+  // successful namespace operation with unknown persistent state.
+  return result > 0 ? -EIO : result;
+}
+
+} // anonymous namespace
 
 void File::Handle::applyRecordLock(short type,
                                    off_t start,
@@ -79,7 +123,7 @@ void File::Handle::applyRecordLock(short type,
 // DataFile
 //
 
-void DataFile::Handle::preloadFromJS(int index) {
+int DataFile::Handle::preloadFromJS(int index) {
   // TODO: Each Datafile type could have its own impl of file preloading.
   // Create a buffer with the required file size.
   std::vector<uint8_t> buffer(_wasmfs_get_preloaded_file_size(index));
@@ -90,7 +134,31 @@ void DataFile::Handle::preloadFromJS(int index) {
   // Load data into the in-memory buffer.
   _wasmfs_copy_preloaded_file_data(index, buffer.data());
 
+  // A backend that requires paired data/metadata writes must not receive this
+  // startup population through the legacy raw write path. Treat a failed or
+  // short preload as fatal to initialization so an atomic namespace entry is
+  // never followed by a falsely successful, split content update.
+  if (auto* backend = getFile()->getBackend();
+      backend && backend->requiresAtomicMetadataMutations()) {
+    if (buffer.empty()) {
+      return 0;
+    }
+    auto metadata = getMetadata();
+    const double now = emscripten_date_now();
+    metadata.mtime = now;
+    metadata.ctime = now;
+    auto result = writeWithMetadata(
+      reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size(), 0, metadata);
+    if (result < 0) {
+      return result;
+    }
+    return static_cast<size_t>(result) == buffer.size() ? 0 : -EIO;
+  }
+
+  // Preserve legacy preload behavior for non-atomic backends, including its
+  // historical best-effort raw write semantics.
   write((const uint8_t*)buffer.data(), buffer.size(), 0);
+  return 0;
 }
 
 //
@@ -216,6 +284,171 @@ Directory::Handle::insertSymlink(const std::string& name,
   return child;
 }
 
+int Directory::Handle::insertDataFileWithNamespaceTransaction(
+  const std::string& name,
+  mode_t mode,
+  std::shared_ptr<DataFile>& result) {
+  result = nullptr;
+  if (!requiresAtomicNamespaceMutations(getDir().get())) {
+    result = insertDataFile(name, mode);
+    return result ? 0 : -EIO;
+  }
+
+  if (!getParent()) {
+    return -ENOENT;
+  }
+  auto* backend = getDir()->getBackend();
+  if (!backend) {
+    return -EIO;
+  }
+  auto child = backend->createFile(mode);
+  if (!child) {
+    return -EIO;
+  }
+  if (!hasNamespaceCreateCandidateBackend(child, backend)) {
+    return -EIO;
+  }
+  // Keep the private candidate locked from its metadata snapshot through the
+  // durable transaction and post-commit publication. Otherwise a backend-side
+  // actor could update it between the snapshot and the image published below.
+  auto lockedChild = child->locked();
+  if (lockedChild.getParent()) {
+    return -EIO;
+  }
+
+  const double now = emscripten_date_now();
+  NamespaceMutation mutation;
+  mutation.kind = NamespaceMutation::Kind::CreateDataFile;
+  mutation.destinationParent = getDir();
+  mutation.destinationName = name;
+  mutation.subject = child;
+  mutation.destinationParentPostImage =
+    namespaceMutationPostImage(*this, now);
+  mutation.subjectPostImage = lockedChild.getMetadata();
+
+  if (int error = checkedNamespaceMutationResult(
+        getDir()->commitNamespaceMutation(mutation))) {
+    return error;
+  }
+
+  // The child had no path or parent before the durable transaction. Publish
+  // its complete candidate image, reachability, and parent metadata only
+  // after that transaction. In particular, do not rely on the constructor's
+  // currently matching image: a transaction hook may require this explicit
+  // publication contract.
+  lockedChild.publishMetadataAfterAtomicMutation(*mutation.subjectPostImage);
+  cacheChild(name, child, DCacheKind::Normal);
+  publishMetadata(*mutation.destinationParentPostImage);
+  result = std::move(child);
+  return 0;
+}
+
+int Directory::Handle::insertDirectoryWithNamespaceTransaction(
+  const std::string& name,
+  mode_t mode,
+  std::shared_ptr<Directory>& result) {
+  result = nullptr;
+  if (!requiresAtomicNamespaceMutations(getDir().get())) {
+    result = insertDirectory(name, mode);
+    return result ? 0 : -EIO;
+  }
+
+  if (!getParent()) {
+    return -ENOENT;
+  }
+  auto* backend = getDir()->getBackend();
+  if (!backend) {
+    return -EIO;
+  }
+  auto child = backend->createDirectory(mode);
+  if (!child) {
+    return -EIO;
+  }
+  if (!hasNamespaceCreateCandidateBackend(child, backend)) {
+    return -EIO;
+  }
+  // Keep the private candidate locked from its metadata snapshot through the
+  // durable transaction and post-commit publication.
+  auto lockedChild = child->locked();
+  if (lockedChild.getParent()) {
+    return -EIO;
+  }
+
+  const double now = emscripten_date_now();
+  NamespaceMutation mutation;
+  mutation.kind = NamespaceMutation::Kind::CreateDirectory;
+  mutation.destinationParent = getDir();
+  mutation.destinationName = name;
+  mutation.subject = child;
+  mutation.destinationParentPostImage =
+    namespaceMutationPostImage(*this, now);
+  mutation.subjectPostImage = lockedChild.getMetadata();
+
+  if (int error = checkedNamespaceMutationResult(
+        getDir()->commitNamespaceMutation(mutation))) {
+    return error;
+  }
+
+  lockedChild.publishMetadataAfterAtomicMutation(*mutation.subjectPostImage);
+  cacheChild(name, child, DCacheKind::Normal);
+  publishMetadata(*mutation.destinationParentPostImage);
+  result = std::move(child);
+  return 0;
+}
+
+int Directory::Handle::insertSymlinkWithNamespaceTransaction(
+  const std::string& name,
+  const std::string& target,
+  std::shared_ptr<Symlink>& result) {
+  result = nullptr;
+  if (!requiresAtomicNamespaceMutations(getDir().get())) {
+    result = insertSymlink(name, target);
+    return result ? 0 : -EIO;
+  }
+
+  if (!getParent()) {
+    return -ENOENT;
+  }
+  auto* backend = getDir()->getBackend();
+  if (!backend) {
+    return -EIO;
+  }
+  auto child = backend->createSymlink(target);
+  if (!child) {
+    return -EIO;
+  }
+  if (!hasNamespaceCreateCandidateBackend(child, backend)) {
+    return -EIO;
+  }
+  // Keep the private candidate locked from its metadata snapshot through the
+  // durable transaction and post-commit publication.
+  auto lockedChild = child->locked();
+  if (lockedChild.getParent()) {
+    return -EIO;
+  }
+
+  const double now = emscripten_date_now();
+  NamespaceMutation mutation;
+  mutation.kind = NamespaceMutation::Kind::CreateSymlink;
+  mutation.destinationParent = getDir();
+  mutation.destinationName = name;
+  mutation.subject = child;
+  mutation.destinationParentPostImage =
+    namespaceMutationPostImage(*this, now);
+  mutation.subjectPostImage = lockedChild.getMetadata();
+
+  if (int error = checkedNamespaceMutationResult(
+        getDir()->commitNamespaceMutation(mutation))) {
+    return error;
+  }
+
+  lockedChild.publishMetadataAfterAtomicMutation(*mutation.subjectPostImage);
+  cacheChild(name, child, DCacheKind::Normal);
+  publishMetadata(*mutation.destinationParentPostImage);
+  result = std::move(child);
+  return 0;
+}
+
 // TODO: consider moving this to be `Backend::move` to avoid asymmetry between
 // the source and destination directories and/or taking `Directory::Handle`
 // arguments to prove that the directories have already been locked.
@@ -268,6 +501,120 @@ int Directory::Handle::insertMove(const std::string& name,
   return 0;
 }
 
+int Directory::Handle::insertMoveWithNamespaceTransaction(
+  Directory::Handle& oldParent,
+  const std::string& oldName,
+  const std::string& newName,
+  std::shared_ptr<File> file,
+  std::shared_ptr<File> replacement) {
+  if (!requiresAtomicNamespaceMutations(getDir().get())) {
+    return insertMove(newName, std::move(file));
+  }
+
+  // Match insertMove(): a retained descriptor can name an unlinked directory,
+  // but it cannot be used as a durable rename destination.
+  if (!getParent()) {
+    return -EPERM;
+  }
+
+  auto oldDirectory = oldParent.unlocked()->cast<Directory>();
+  auto newDirectory = getDir();
+  if (oldDirectory->getBackend() != newDirectory->getBackend()) {
+    return -EXDEV;
+  }
+  // Keep the moved inode locked from validation through durable commit and
+  // post-commit publication. Otherwise a concurrent metadata mutation could
+  // commit after we snapshot the rename ctime image and then be overwritten by
+  // that stale image when the rename publishes.
+  auto lockedFile = file->locked();
+  if (lockedFile.getParent() != oldDirectory) {
+    return -EIO;
+  }
+  std::optional<File::Handle> lockedReplacement;
+  if (replacement) {
+    lockedReplacement.emplace(replacement);
+    if (lockedReplacement->getParent() != newDirectory) {
+      return -EIO;
+    }
+  }
+
+  // Validate all cache observations before the durable transaction. A cache
+  // mismatch after commit would leave no safe way to report an error without
+  // also withholding a necessary in-memory publication.
+  Directory::DCacheEntry cachedEntry = {DCacheKind::Normal, file};
+  auto& oldCache = oldDirectory->dcache;
+  auto oldEntry = oldCache.find(oldName);
+  if (!oldDirectory->maintainsFileIdentity()) {
+    if (oldEntry == oldCache.end() || oldEntry->second.file != file) {
+      return -EIO;
+    }
+    cachedEntry = oldEntry->second;
+  }
+
+  auto& newCache = newDirectory->dcache;
+  auto newEntry = newCache.find(newName);
+  if (!newDirectory->maintainsFileIdentity()) {
+    if (replacement) {
+      if (newEntry == newCache.end() || newEntry->second.file != replacement) {
+        return -EIO;
+      }
+    } else if (newEntry != newCache.end()) {
+      return -EIO;
+    }
+  }
+
+  const double now = emscripten_date_now();
+  NamespaceMutation mutation;
+  mutation.kind = NamespaceMutation::Kind::Rename;
+  mutation.sourceParent = oldDirectory;
+  mutation.sourceName = oldName;
+  mutation.destinationParent = newDirectory;
+  mutation.destinationName = newName;
+  mutation.subject = file;
+  mutation.replacement = replacement;
+  mutation.sourceParentPostImage =
+    namespaceMutationPostImage(oldParent, now);
+  mutation.subjectPostImage = namespaceCTimePostImage(lockedFile, now);
+  if (lockedReplacement) {
+    mutation.replacementPostImage =
+      namespaceCTimePostImage(*lockedReplacement, now);
+  }
+  if (oldDirectory != newDirectory) {
+    mutation.destinationParentPostImage =
+      namespaceMutationPostImage(*this, now);
+  }
+
+  if (int error = checkedNamespaceMutationResult(
+        getDir()->commitNamespaceMutation(mutation))) {
+    return error;
+  }
+
+  if (!oldDirectory->maintainsFileIdentity()) {
+    oldCache.erase(oldEntry);
+  }
+  if (!newDirectory->maintainsFileIdentity()) {
+    newEntry = newCache.find(newName);
+    if (newEntry != newCache.end()) {
+      newCache.erase(newEntry);
+    }
+    [[maybe_unused]] auto [_, inserted] =
+      newCache.insert({newName, cachedEntry});
+    assert(inserted);
+  }
+  if (lockedReplacement) {
+    lockedReplacement->publishMetadataAfterAtomicMutation(
+      *mutation.replacementPostImage);
+    lockedReplacement->setParent(nullptr);
+  }
+  lockedFile.publishMetadataAfterAtomicMutation(*mutation.subjectPostImage);
+  lockedFile.setParent(newDirectory);
+  oldParent.publishMetadata(*mutation.sourceParentPostImage);
+  if (mutation.destinationParentPostImage) {
+    publishMetadata(*mutation.destinationParentPostImage);
+  }
+  return 0;
+}
+
 int Directory::Handle::removeChild(const std::string& name) {
   auto& dcache = getDir()->dcache;
   auto entry = dcache.find(name);
@@ -289,6 +636,52 @@ int Directory::Handle::removeChild(const std::string& name) {
     dcache.erase(entry);
   }
   updateMTime();
+  return 0;
+}
+
+int Directory::Handle::removeChildWithNamespaceTransaction(
+  const std::string& name,
+  std::shared_ptr<File> child,
+  NamespaceMutation::Kind kind) {
+  if (!requiresAtomicNamespaceMutations(getDir().get()) ||
+      isMountChild(name)) {
+    return removeChild(name);
+  }
+
+  // Keep the unlinked object locked through the durable transaction and its
+  // ctime publication. A retained descriptor may otherwise commit newer
+  // metadata between the snapshot and the post-commit image.
+  auto lockedChild = child->locked();
+  if (lockedChild.getParent() != getDir()) {
+    return -EIO;
+  }
+  auto& dcache = getDir()->dcache;
+  auto entry = dcache.find(name);
+  if (!getDir()->maintainsFileIdentity() &&
+      (entry == dcache.end() || entry->second.file != child)) {
+    return -EIO;
+  }
+
+  const double now = emscripten_date_now();
+  NamespaceMutation mutation;
+  mutation.kind = kind;
+  mutation.sourceParent = getDir();
+  mutation.sourceName = name;
+  mutation.subject = child;
+  mutation.sourceParentPostImage = namespaceMutationPostImage(*this, now);
+  mutation.subjectPostImage = namespaceCTimePostImage(lockedChild, now);
+
+  if (int error = checkedNamespaceMutationResult(
+        getDir()->commitNamespaceMutation(mutation))) {
+    return error;
+  }
+
+  lockedChild.publishMetadataAfterAtomicMutation(*mutation.subjectPostImage);
+  lockedChild.setParent(nullptr);
+  if (entry != dcache.end()) {
+    dcache.erase(entry);
+  }
+  publishMetadata(*mutation.sourceParentPostImage);
   return 0;
 }
 
