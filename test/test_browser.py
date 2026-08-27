@@ -9033,6 +9033,157 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_quota_recovery(self):
+    # The quota role maps a test-only browser QuotaExceededError to ENOSPC on
+    # a real V4 data transaction. It must not report successful persistence,
+    # and its poisoned iframe is discarded before fresh normal documents prove
+    # that the last selected state survives and remains writable. This is not
+    # physical quota, power-loss, database, or Chromium-profile evidence.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_quota_recovery.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = ('wasmfs_profile_log_v4_filesystem_quota_recovery_%016x' %
+               random.getrandbits(64))
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_QUOTA_RECOVERY_TEST_PROFILE_NAME=' +
+      profile)
+
+    def compile_role(output, role, extra_args=None):
+      self.compile_btest(
+        test, common_args + [profile_arg, role] + (extra_args or []) +
+          ['-o', output], reporting=Reporting.NONE)
+
+    compile_role(
+      'v4fs-quota-seed.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_QUOTA_RECOVERY_TEST_SEED')
+    compile_role(
+      'v4fs-quota-failure.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_QUOTA_RECOVERY_TEST_QUOTA',
+      ['-sWASMFS_OPFS_TEST_QUOTA_WRITE=1'])
+    compile_role(
+      'v4fs-quota-verifier.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_QUOTA_RECOVERY_TEST_VERIFIER')
+    compile_role(
+      'v4fs-quota-reload.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_QUOTA_RECOVERY_TEST_RELOAD')
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kSeed = 0;
+        const kQuota = 1;
+        const kVerifier = 2;
+        const kReload = 3;
+        const kBusy = 16;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v4-filesystem-quota-recovery';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              // The quota role cannot complete a clean drain of a terminally
+              // latched backend.
+              // Removing only its iframe creates the fresh-document recovery
+              // boundary; all ordinary roles perform a checked native drain.
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', stage=' + message.stage +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          await runAfterLeaseRelease('v4fs-quota-seed.html', kSeed,
+                                     'V4 quota recovery seed');
+          await runAfterLeaseRelease('v4fs-quota-failure.html', kQuota,
+                                     'V4 quota ENOSPC and terminal latch');
+          await runAfterLeaseRelease('v4fs-quota-verifier.html', kVerifier,
+                                     'V4 fresh state after quota failure');
+          await runAfterLeaseRelease('v4fs-quota-reload.html', kReload,
+                                     'V4 post-quota fresh reload');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_locks(self):
     # Chromium database files use process-owned fcntl ranges. Exercise the V4
     # filesystem's leased single-process subset in separate documents: another
