@@ -8835,6 +8835,204 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_mutation_recovery(self):
+    # Interrupt real mounted-filesystem transactions at the V4 phase quorum,
+    # then reopen in fresh documents. Phase one must select the complete old
+    # data/tree; phase two must select the complete new data/tree. Every
+    # recovery result commits another directory mutation and reloads it. This
+    # is controlled iframe-disposal evidence, not a physical-crash, database,
+    # or Chromium-profile persistence claim.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_mutation_recovery.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+
+    def profile_arg(profile):
+      return ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_'
+              'PROFILE_NAME=' + profile)
+
+    def compile_role(output, profile, mutation, role, phase=None,
+                     expect_new=None):
+      args = common_args + [profile_arg(profile), mutation, role]
+      if phase is not None:
+        args += [
+          ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_'
+           'INTERRUPT_PHASE=' + str(phase)),
+          '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1',
+        ]
+      if expect_new is not None:
+        args += [
+          ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_'
+           'EXPECT_NEW=' + str(int(expect_new))),
+        ]
+      self.compile_btest(test, args + ['-o', output], reporting=Reporting.NONE)
+
+    cases = []
+    for mutation_name, mutation in (
+        ('data', '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_DATA'),
+        ('rename', '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_RENAME')):
+      for phase in (1, 2):
+        profile = ('wasmfs_profile_log_v4_filesystem_%s_recovery_%d_%016x' %
+                   (mutation_name, phase, random.getrandbits(64)))
+        prefix = 'v4fs-%s-recovery-%d' % (mutation_name, phase)
+        seed = prefix + '-seed.html'
+        interruptor = prefix + '-interruptor.html'
+        verifier = prefix + '-verifier.html'
+        reload = prefix + '-reload.html'
+        compile_role(
+          seed, profile, mutation,
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_SEED')
+        compile_role(
+          interruptor, profile, mutation,
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_INTERRUPTOR',
+          phase=phase)
+        compile_role(
+          verifier, profile, mutation,
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_VERIFIER',
+          expect_new=phase == 2)
+        compile_role(
+          reload, profile, mutation,
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_RELOAD',
+          expect_new=phase == 2)
+        cases.append((mutation_name, phase, seed, interruptor, verifier, reload))
+
+    case_script = '\n'.join(
+      "          await runAfterLeaseRelease('%s', kSeed, '%s phase %d seed');\n"
+      "          await interruptAfterLeaseRelease('%s', %d, '%s phase %d interruption');\n"
+      "          await runAfterLeaseRelease('%s', kVerifier, '%s phase %d recovery verifier');\n"
+      "          await runAfterLeaseRelease('%s', kReload, '%s phase %d fresh reload');" %
+      (seed, mutation_name, phase, interruptor, phase, mutation_name, phase,
+       verifier, mutation_name, phase, reload, mutation_name, phase)
+      for mutation_name, phase, seed, interruptor, verifier, reload in cases)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kSeed = 0;
+        const kInterruptor = 1;
+        const kVerifier = 2;
+        const kReload = 3;
+        const kBusy = 16;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v4-filesystem-mutation-recovery';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function interruptAfterLeaseRelease(path, checkpoint, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.event !== 'interrupt' ||
+                message.checkpoint !== checkpoint) {
+              throw new Error(description + ' did not reach checkpoint ' +
+                              checkpoint + ': role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+%(case_script)s
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''' % {'case_script': case_script})
+    self.run_browser('a.html', '/report_result?0', timeout=240)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_locks(self):
     # Chromium database files use process-owned fcntl ranges. Exercise the V4
     # filesystem's leased single-process subset in separate documents: another
