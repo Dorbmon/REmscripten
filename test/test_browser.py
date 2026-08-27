@@ -9033,6 +9033,350 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_tail_recovery(self):
+    # A phase-one interruption leaves a real unreachable V4 append tail. The
+    # parent only reads the named test artifacts to establish that boundary;
+    # fresh WasmFS documents perform all recovery and mutation. The injected
+    # truncate failure is not physical quota, power loss, database, or Chrome
+    # profile evidence.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_tail_recovery.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = ('wasmfs_profile_log_v4_filesystem_tail_recovery_%016x' %
+               random.getrandbits(64))
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TAIL_RECOVERY_TEST_PROFILE_NAME=' +
+      profile)
+
+    def compile_role(output, role, extra_args=None):
+      self.compile_btest(
+        test, common_args + [profile_arg, role] + (extra_args or []) +
+          ['-o', output], reporting=Reporting.NONE)
+
+    compile_role(
+      'v4fs-tail-seed.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TAIL_RECOVERY_TEST_SEED')
+    compile_role(
+      'v4fs-tail-interruptor.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TAIL_RECOVERY_TEST_INTERRUPTOR',
+      [
+        ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TAIL_RECOVERY_TEST_'
+         'INTERRUPT_PHASE=1'),
+        '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1',
+      ])
+    compile_role(
+      'v4fs-tail-trim-failure.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TAIL_RECOVERY_TEST_TRIM_FAILURE',
+      [
+        '-sWASMFS_OPFS_TEST_QUOTA_TRUNCATE=1',
+      ])
+    compile_role(
+      'v4fs-tail-verifier.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TAIL_RECOVERY_TEST_VERIFIER')
+    compile_role(
+      'v4fs-tail-reload.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_TAIL_RECOVERY_TEST_RELOAD')
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kSeed = 0;
+        const kInterruptor = 1;
+        const kTrimFailure = 2;
+        const kVerifier = 3;
+        const kReload = 4;
+        const kBusy = 16;
+        const kProfile = '%(profile)s';
+        const kRecordSize = 128;
+        const kControlSize = 6 * kRecordSize;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v4-filesystem-tail-recovery';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function require(condition, description) {
+          if (!condition) {
+            throw new Error(description);
+          }
+        }
+
+        function requireMagic(bytes, offset, magic, description) {
+          require(offset + magic.length <= bytes.byteLength,
+                  description + ' is truncated');
+          for (let index = 0; index < magic.length; ++index) {
+            require(bytes[offset + index] === magic.charCodeAt(index),
+                    description + ' has the wrong magic');
+          }
+        }
+
+        function readU64(view, offset, description) {
+          const value = view.getBigUint64(offset, true);
+          require(value <= BigInt(Number.MAX_SAFE_INTEGER),
+                  description + ' is not a safe integer');
+          return Number(value);
+        }
+
+        function parsePhase(bytes, view, offset, description) {
+          requireMagic(bytes, offset, 'WFSLG4P0', description);
+          require(view.getUint32(offset + 8, true) === 4,
+                  description + ' has the wrong version');
+          require(view.getUint32(offset + 12, true) === kRecordSize,
+                  description + ' has the wrong size');
+          const generation = readU64(view, offset + 16, description);
+          const arena = view.getUint32(offset + 24, true);
+          require(generation !== 0 && arena < 2 && arena === (generation & 1),
+                  description + ' is not a valid phase');
+          require(view.getUint32(offset + 28, true) === 1,
+                  description + ' is not clean');
+          return {generation, arena};
+        }
+
+        function parseDescriptor(bytes, view, generation, arena, copy) {
+          const offset = (((generation & 1) * 2 + copy) * kRecordSize);
+          const description = 'descriptor ' + generation + '/' + copy;
+          requireMagic(bytes, offset, 'WFSLG4D0', description);
+          require(view.getUint32(offset + 8, true) === 4,
+                  description + ' has the wrong version');
+          require(view.getUint32(offset + 12, true) === kRecordSize,
+                  description + ' has the wrong size');
+          require(readU64(view, offset + 16, description) === generation &&
+                  view.getUint32(offset + 24, true) === arena,
+                  description + ' does not name the selected phase');
+          return {
+            highWater: [
+              readU64(view, offset + 56, description),
+              readU64(view, offset + 64, description),
+            ],
+            manifestOffset: readU64(view, offset + 32, description),
+            manifestSize: readU64(view, offset + 40, description),
+          };
+        }
+
+        function parseSelectedDescriptor(control) {
+          require(control.byteLength === kControlSize,
+                  'V4 control file has the wrong fixed size');
+          const view = new DataView(control.buffer, control.byteOffset,
+                                    control.byteLength);
+          const first = parsePhase(control, view, 4 * kRecordSize, 'phase 0');
+          const second = parsePhase(control, view, 5 * kRecordSize, 'phase 1');
+          let selected = first;
+          if (first.generation === second.generation) {
+            require(first.arena === second.arena,
+                    'mirrored V4 phases disagree');
+          } else {
+            const older = first.generation < second.generation ? first : second;
+            const newer = first.generation < second.generation ? second : first;
+            require(newer.generation === older.generation + 1,
+                    'V4 phases do not form a recovery split');
+            selected = older;
+          }
+          const descriptor0 = parseDescriptor(
+            control, view, selected.generation, selected.arena, 0);
+          const descriptor1 = parseDescriptor(
+            control, view, selected.generation, selected.arena, 1);
+          require(descriptor0.manifestOffset === descriptor1.manifestOffset &&
+                  descriptor0.manifestSize === descriptor1.manifestSize &&
+                  descriptor0.highWater[0] === descriptor1.highWater[0] &&
+                  descriptor0.highWater[1] === descriptor1.highWater[1],
+                  'mirrored V4 descriptors disagree');
+          return {
+            generation: selected.generation,
+            highWater: descriptor0.highWater,
+          };
+        }
+
+        async function readPhysicalLayout() {
+          // This observer never mutates OPFS. Native V4 code selects and
+          // validates the records; it only witnesses the physical tail after
+          // the interrupted iframe has been disposed.
+          const root = await navigator.storage.getDirectory();
+          const stem = '.wasmfs-profile-log-v4-fs-' + kProfile.length + '-' +
+                       kProfile;
+          async function readFile(name) {
+            const handle = await root.getFileHandle(name);
+            return new Uint8Array(await (await handle.getFile()).arrayBuffer());
+          }
+          const control = await readFile(stem + '-control');
+          const selected = parseSelectedDescriptor(control);
+          const physical = await Promise.all([0, 1].map(async (arena) => {
+            const handle = await root.getFileHandle(stem + '-arena-' + arena);
+            return (await handle.getFile()).size;
+          }));
+          return {...selected, physical};
+        }
+
+        async function waitForPhysicalLayout(description) {
+          let lastError;
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            try {
+              return await readPhysicalLayout();
+            } catch (error) {
+              lastError = error;
+              await delay(100);
+            }
+          }
+          throw new Error(description + ' could not read test artifacts: ' +
+                          lastError);
+        }
+
+        function requireTail(layout, description) {
+          require(layout.physical.some(
+                    (size, arena) => size > layout.highWater[arena]),
+                  description + ' has no unreachable V4 arena tail');
+        }
+
+        function requireSameLayout(before, after, description) {
+          require(before.generation === after.generation &&
+                  before.highWater[0] === after.highWater[0] &&
+                  before.highWater[1] === after.highWater[1] &&
+                  before.physical[0] === after.physical[0] &&
+                  before.physical[1] === after.physical[1],
+                  description + ' changed the selected state or physical tail');
+        }
+
+        function requireExactPhysicalBounds(layout, description) {
+          require(layout.physical[0] === layout.highWater[0] &&
+                  layout.physical[1] === layout.highWater[1],
+                  description + ' did not trim V4 arena tails to high water');
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', stage=' + message.stage +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function interruptAfterLeaseRelease(path, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.event !== 'interrupt' || message.checkpoint !== 1) {
+              throw new Error(description + ' did not reach phase one: role=' +
+                              message.role + ', stage=' + message.stage +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          await runAfterLeaseRelease('v4fs-tail-seed.html', kSeed,
+                                     'V4 tail seed');
+          await interruptAfterLeaseRelease('v4fs-tail-interruptor.html',
+                                           'V4 tail interruption');
+          const interrupted = await waitForPhysicalLayout(
+            'V4 phase-one interrupted layout');
+          requireTail(interrupted, 'V4 phase-one interruption');
+          await runAfterLeaseRelease('v4fs-tail-trim-failure.html',
+                                     kTrimFailure,
+                                     'V4 injected tail-trim failure');
+          const afterFailure = await waitForPhysicalLayout(
+            'V4 quota-rejected tail-trim layout');
+          requireSameLayout(interrupted, afterFailure,
+                            'V4 injected tail-trim failure');
+          requireTail(afterFailure, 'V4 quota-rejected tail trim');
+          await runAfterLeaseRelease('v4fs-tail-verifier.html', kVerifier,
+                                     'V4 normal tail-trim verifier');
+          const repaired = await waitForPhysicalLayout(
+            'V4 repaired tail layout');
+          requireExactPhysicalBounds(repaired, 'V4 normal tail-trim verifier');
+          await runAfterLeaseRelease('v4fs-tail-reload.html', kReload,
+                                     'V4 tail-trim fresh reload');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''' % {'profile': profile})
+    self.run_browser('a.html', '/report_result?0', timeout=240)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_quota_recovery(self):
     # The quota role maps a test-only browser QuotaExceededError to ENOSPC on
     # a real V4 data transaction. It must not report successful persistence,

@@ -7544,6 +7544,55 @@ protected:
                                                                       : -EIO;
   }
 
+  // A transaction that reached an arena write but not the second phase
+  // witness leaves an unreachable append tail. The selected descriptor is the
+  // only reachability boundary: data below either high-water mark can still
+  // be named by the current filesystem manifest, including data in the
+  // inactive parity arena. Before the next logical transaction, reclaim only
+  // bytes beyond those durable boundaries. If the physical file is shorter,
+  // fail closed rather than treating a damaged selected extent as a tail.
+  int trimUnreachableArenaTailsLocked() {
+    if (!hasSelectedDescriptor) {
+      return -ESHUTDOWN;
+    }
+    for (size_t index = 0; index != arenas.size(); ++index) {
+      const uint64_t durableEnd = selectedDescriptor.highWater[index];
+      if (!arenas[index]) {
+        return -ESHUTDOWN;
+      }
+      if (durableEnd >
+          static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+        return -EOVERFLOW;
+      }
+      const off_t physicalSize = arenas[index]->locked().getSize();
+      if (physicalSize < 0) {
+        return physicalSize;
+      }
+      const uint64_t physicalEnd = static_cast<uint64_t>(physicalSize);
+      if (physicalEnd < durableEnd) {
+        return -EIO;
+      }
+      if (physicalEnd == durableEnd) {
+        continue;
+      }
+      if (int error = arenas[index]->locked().setSize(
+            static_cast<off_t>(durableEnd))) {
+        return error;
+      }
+      if (int error = arenas[index]->locked().flush()) {
+        return error;
+      }
+      const off_t trimmedSize = arenas[index]->locked().getSize();
+      if (trimmedSize < 0) {
+        return trimmedSize;
+      }
+      if (static_cast<uint64_t>(trimmedSize) != durableEnd) {
+        return -EIO;
+      }
+    }
+    return 0;
+  }
+
 protected:
   explicit ProfileLogV4Store(std::string storageTag = {},
                              bool recoverInitialBootstrap = false)
@@ -7676,6 +7725,9 @@ protected:
     }
     if (generation == std::numeric_limits<uint64_t>::max()) {
       return poisonLocked(-EOVERFLOW);
+    }
+    if (int error = trimUnreachableArenaTailsLocked()) {
+      return poisonLocked(error);
     }
     Transaction transaction(*this, generation + 1, highWater);
     std::vector<uint8_t> manifest;
