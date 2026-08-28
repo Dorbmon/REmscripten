@@ -6094,6 +6094,14 @@ constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
 #define WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST 0
 #endif
 
+// Test-only override for the V4 filesystem checkpoint cadence. Zero keeps
+// the production cadence; an odd value of at least three lets focused browser
+// tests exercise alternating two-arena reclamation without waiting for a full
+// production interval. This controls system-library source selection only.
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL 0
+#endif
+
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT < 0 || \
   WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT > 1
 #error "invalid profile-log V4 interruption selector"
@@ -6112,6 +6120,15 @@ constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST < 0 || \
   WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST > 1
 #error "invalid profile-log V4 empty post-root manifest selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL < 0 || \
+  (WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL && \
+   WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL < 3) || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL > 31 || \
+  (WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL && \
+   !(WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL & 1))
+#error "invalid profile-log V4 filesystem checkpoint interval"
 #endif
 
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
@@ -6269,6 +6286,7 @@ bool profileLogV4SameDescriptor(const ProfileLogV4Descriptor& lhs,
 // transaction on top of the exact same bootstrap, selector, and retirement
 // protocol.  Keep the store private to this translation unit: callers must
 // never be able to bypass their logical-format validation through this layer.
+class ProfileLogV4FilesystemBackend;
 class ProfileLogV4Store : public OPFSBackend {
 protected:
   // A transaction reserves the next selected generation and its parity arena
@@ -6282,8 +6300,10 @@ protected:
     uint64_t nextGeneration;
     uint32_t nextArena;
     std::array<uint64_t, 2> nextHighWater;
+    bool discardInactiveArena = false;
 
     friend class ProfileLogV4Store;
+    friend class ProfileLogV4FilesystemBackend;
 
     Transaction(ProfileLogV4Store& store,
                 uint64_t generation,
@@ -6297,6 +6317,22 @@ protected:
     uint64_t generation() const { return nextGeneration; }
     uint32_t arena() const { return nextArena; }
 
+  private:
+    // The caller has copied every live reference into |arena()| and may
+    // therefore publish a descriptor that no longer names the opposite
+    // arena. This must be requested only after every immutable checkpoint
+    // record has been appended: the outer store writes the descriptor and
+    // both phase witnesses before it can truncate that old arena.
+    int discardInactiveArenaAfterPublish() {
+      if (discardInactiveArena) {
+        return -EIO;
+      }
+      nextHighWater[nextArena ^ 1] = 0;
+      discardInactiveArena = true;
+      return 0;
+    }
+
+  public:
     // Append one immutable record to the selected parity arena and flush it
     // before returning its physical offset. A later failed selector publish
     // leaves this record unreachable; a retry may safely overwrite the tail
@@ -7599,6 +7635,38 @@ protected:
     : storageTag(std::move(storageTag)),
       recoverInitialBootstrap(recoverInitialBootstrap) {}
 
+  // Only a logical transaction builder may use this fast path. The caller
+  // holds storeMutex through commitTransaction(), which has already validated
+  // the selected descriptor and cannot publish a replacement until the
+  // builder returns. Revalidating the whole outer manifest for each copied
+  // checkpoint chunk would make one checkpoint quadratic in its live tree.
+  int readSelectedBytesDuringValidatedTransaction(uint32_t arena,
+                                                   uint64_t offset,
+                                                   uint8_t* buffer,
+                                                   size_t size) {
+    if (!hasSelectedDescriptor || (!buffer && size) || arena >= arenas.size() ||
+        offset > selectedDescriptor.highWater[arena] ||
+        size > selectedDescriptor.highWater[arena] - offset) {
+      return -EIO;
+    }
+    return readBytesLocked(arenas[arena], offset, buffer, size);
+  }
+
+  int trimSelectedUnreachableArenaTails() {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (int error = validateSelectedManifestLocked()) {
+      return poisonLocked(error);
+    }
+    return trimUnreachableArenaTailsLocked();
+  }
+
   int readManifest(uint8_t* buffer,
                    size_t capacity,
                    size_t* size,
@@ -7957,6 +8025,18 @@ constexpr size_t kProfileLogV4FilesystemDirectoryEntrySize = 40;
 constexpr size_t kProfileLogV4FilesystemExtentSize = 48;
 constexpr size_t kProfileLogV4FilesystemDataHeaderSize = 96;
 constexpr size_t kProfileLogV4FilesystemNameMax = 255;
+// A self-contained checkpoint is intentionally a bounded-retention building
+// block, not the eventual scalable mutation format. It copies the current
+// live tree into the next parity arena and lets the selector release the old
+// arena only after both phase witnesses are durable. The cadence must be odd:
+// an even period would always select the same generation-parity arena and
+// could never reclaim the other one. Schema-2 delta records will remove the
+// remaining O(namespace) work between these checkpoints.
+constexpr uint64_t kProfileLogV4FilesystemCheckpointInterval =
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL
+    ? WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL
+    : 31;
+static_assert(kProfileLogV4FilesystemCheckpointInterval & 1);
 constexpr std::array<uint8_t, 8> kProfileLogV4FilesystemMagic = {
   'W', 'F', 'S', 'V', '4', 'F', 'S', '1'};
 constexpr std::array<uint8_t, 8> kProfileLogV4FilesystemDataMagic = {
@@ -8140,13 +8220,23 @@ class ProfileLogV4FilesystemBackend final : public ProfileLogV4Store {
   int serializeLogicalStateLocked(const ProfileLogV4FilesystemState& value,
                                   uint64_t generation,
                                   std::vector<uint8_t>* manifest);
+  int appendImmutableChunkLocked(
+    Transaction& transaction,
+    uint64_t inode,
+    uint64_t chunk,
+    const std::vector<uint8_t>& bytes,
+    ProfileLogV4FilesystemExtent* result);
+  int copyLiveCheckpointExtentsLocked(ProfileLogV4FilesystemState* value,
+                                      Transaction& transaction);
   int commitLogicalStateLocked(ProfileLogV4FilesystemState value,
-                               std::vector<PendingChunk> pending);
+                               std::vector<PendingChunk> pending,
+                               bool allowCheckpoint = true);
   int readExtentLocked(const ProfileLogV4FilesystemExtent& extent,
                        uint64_t inode,
                        uint64_t chunk,
                        uint64_t generation,
-                       std::vector<uint8_t>* bytes);
+                       std::vector<uint8_t>* bytes,
+                       bool selectedAlreadyValidated = false);
   int readChunkLocked(const ProfileLogV4FilesystemInode& inode,
                       uint64_t chunk,
                       uint64_t generation,
@@ -9489,7 +9579,8 @@ int ProfileLogV4FilesystemBackend::readExtentLocked(
   uint64_t inode,
   uint64_t chunk,
   uint64_t generation,
-  std::vector<uint8_t>* bytes) {
+  std::vector<uint8_t>* bytes,
+  bool selectedAlreadyValidated) {
   if (!bytes || !inode || extent.arena >= 2 ||
       extent.payloadSize != kProfileLogV4FilesystemChunkSize ||
       extent.offset > kProfileLogV4MaxSafeOffset -
@@ -9499,7 +9590,16 @@ int ProfileLogV4FilesystemBackend::readExtentLocked(
     return -EIO;
   }
   std::array<uint8_t, kProfileLogV4FilesystemDataHeaderSize> header;
-  if (int error = readSelectedBytes(
+  const auto readSelected = [&](uint32_t arena,
+                                uint64_t offset,
+                                uint8_t* destination,
+                                size_t size) {
+    return selectedAlreadyValidated
+             ? readSelectedBytesDuringValidatedTransaction(
+                 arena, offset, destination, size)
+             : readSelectedBytes(arena, offset, destination, size);
+  };
+  if (int error = readSelected(
         extent.arena, extent.offset, header.data(), header.size())) {
     return error;
   }
@@ -9521,10 +9621,10 @@ int ProfileLogV4FilesystemBackend::readExtentLocked(
     return -EIO;
   }
   bytes->resize(payloadSize);
-  if (int error = readSelectedBytes(extent.arena,
-                                    extent.offset + header.size(),
-                                    bytes->data(),
-                                    bytes->size())) {
+  if (int error = readSelected(extent.arena,
+                               extent.offset + header.size(),
+                               bytes->data(),
+                               bytes->size())) {
     return error;
   }
   return profileLogV4Checksum(bytes->data(), bytes->size()) == payloadChecksum
@@ -9560,6 +9660,64 @@ int ProfileLogV4FilesystemBackend::getChunkForWriteLocked(
   uint64_t chunk,
   std::vector<uint8_t>* bytes) {
   return readChunkLocked(inode, chunk, state.generation, bytes);
+}
+
+int ProfileLogV4FilesystemBackend::appendImmutableChunkLocked(
+  Transaction& transaction,
+  uint64_t inode,
+  uint64_t chunk,
+  const std::vector<uint8_t>& bytes,
+  ProfileLogV4FilesystemExtent* result) {
+  if (!result || !inode ||
+      bytes.size() != kProfileLogV4FilesystemChunkSize) {
+    return -EIO;
+  }
+  const auto header = profileLogV4FilesystemMakeDataHeader(
+    transaction.generation(), inode, chunk, bytes.data(), bytes.size());
+  std::vector<uint8_t> record;
+  record.reserve(header.size() + bytes.size());
+  record.insert(record.end(), header.begin(), header.end());
+  record.insert(record.end(), bytes.begin(), bytes.end());
+  uint64_t offset = 0;
+  if (int error = transaction.append(record.data(), record.size(), &offset)) {
+    return error;
+  }
+  *result = {chunk,
+             transaction.arena(),
+             static_cast<uint32_t>(bytes.size()),
+             offset,
+             profileLogV4Checksum(bytes.data(), bytes.size())};
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::copyLiveCheckpointExtentsLocked(
+  ProfileLogV4FilesystemState* value,
+  Transaction& transaction) {
+  if (!value || !state.generation) {
+    return -EIO;
+  }
+  for (auto& [inodeID, inode] : value->inodes) {
+    if (inode.kind != ProfileLogV4FilesystemInodeKind::Regular) {
+      continue;
+    }
+    for (auto& [chunk, extent] : inode.extents) {
+      std::vector<uint8_t> bytes;
+      // The selected pre-image remains authoritative until the outer V4
+      // descriptor has both phase witnesses. Never read a just-appended
+      // checkpoint record through readSelectedBytes() here.
+      if (int error = readExtentLocked(
+            extent, inodeID, chunk, state.generation, &bytes, true)) {
+        return error;
+      }
+      ProfileLogV4FilesystemExtent copied;
+      if (int error = appendImmutableChunkLocked(
+            transaction, inodeID, chunk, bytes, &copied)) {
+        return error;
+      }
+      extent = copied;
+    }
+  }
+  return 0;
 }
 
 int ProfileLogV4FilesystemBackend::validateLogicalStateLocked(
@@ -9750,14 +9908,33 @@ int ProfileLogV4FilesystemBackend::commitMetadataLocked(
 
 int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
   ProfileLogV4FilesystemState value,
-  std::vector<PendingChunk> pending) {
+  std::vector<PendingChunk> pending,
+  bool allowCheckpoint) {
   if (int error = validateCurrentStateLocked()) {
     return error;
   }
+  // An unlinked-but-open inode is intentionally absent from |state|. Do not
+  // retire either arena while such a live descriptor could still read an old
+  // extent; reapOrphansLocked() will make a later checkpoint eligible. A
+  // namespace mutation that will add a new orphan after this commit likewise
+  // passes |allowCheckpoint| false, so the post-image cannot make its live
+  // descriptor's old extent unreachable before the orphan is installed.
+  const bool checkpoint = allowCheckpoint && orphans.empty() &&
+                          state.generation %
+                              kProfileLogV4FilesystemCheckpointInterval ==
+                            kProfileLogV4FilesystemCheckpointInterval - 1;
   std::set<std::pair<uint64_t, uint64_t>> writtenChunks;
   const int result = commitTransaction(
     [&](Transaction& transaction, std::vector<uint8_t>* manifest) {
       value.generation = transaction.generation();
+      if (checkpoint) {
+        // Copy durable extents first. Pending writes below are new records in
+        // the target arena and cannot be read through the old selected
+        // descriptor until this transaction's witness quorum is complete.
+        if (int error = copyLiveCheckpointExtentsLocked(&value, transaction)) {
+          return error;
+        }
+      }
       for (const auto& pendingChunk : pending) {
         if (!pendingChunk.inode ||
             pendingChunk.bytes.size() != kProfileLogV4FilesystemChunkSize ||
@@ -9771,29 +9948,16 @@ int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
               ((inode->second.size - 1) >> kProfileLogV4FilesystemChunkShift)) {
           return -EIO;
         }
-        const auto header = profileLogV4FilesystemMakeDataHeader(
-          transaction.generation(),
-          pendingChunk.inode,
-          pendingChunk.chunk,
-          pendingChunk.bytes.data(),
-          pendingChunk.bytes.size());
-        std::vector<uint8_t> record;
-        record.reserve(header.size() + pendingChunk.bytes.size());
-        record.insert(record.end(), header.begin(), header.end());
-        record.insert(
-          record.end(), pendingChunk.bytes.begin(), pendingChunk.bytes.end());
-        uint64_t offset = 0;
-        if (int error = transaction.append(record.data(), record.size(), &offset)) {
+        ProfileLogV4FilesystemExtent written;
+        if (int error = appendImmutableChunkLocked(
+              transaction,
+              pendingChunk.inode,
+              pendingChunk.chunk,
+              pendingChunk.bytes,
+              &written)) {
           return error;
         }
-        inode->second.extents[pendingChunk.chunk] = {
-          pendingChunk.chunk,
-          transaction.arena(),
-          static_cast<uint32_t>(pendingChunk.bytes.size()),
-          offset,
-          profileLogV4Checksum(
-            pendingChunk.bytes.data(), pendingChunk.bytes.size()),
-        };
+        inode->second.extents[pendingChunk.chunk] = written;
       }
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST
       // Controlled selected-record fault for the reload guard below. It
@@ -9804,12 +9968,37 @@ int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
         return 0;
       }
 #endif
-      return serializeLogicalStateLocked(value, transaction.generation(), manifest);
+      if (checkpoint) {
+        for (const auto& [_, inode] : value.inodes) {
+          if (inode.kind != ProfileLogV4FilesystemInodeKind::Regular) {
+            continue;
+          }
+          for (const auto& [_, extent] : inode.extents) {
+            if (extent.arena != transaction.arena()) {
+              return -EIO;
+            }
+          }
+        }
+        if (int error = transaction.discardInactiveArenaAfterPublish()) {
+          return error;
+        }
+      }
+      return serializeLogicalStateLocked(
+        value, transaction.generation(), manifest);
     });
   if (result) {
     return poisonFilesystemLocked(result);
   }
   state = std::move(value);
+  if (checkpoint) {
+    // commitTransaction() has already published the self-contained outer
+    // descriptor. Keep the in-memory tree synchronized with that selected
+    // generation before attempting post-quorum physical cleanup; a cleanup
+    // failure then latches the backend instead of reviving an old tree.
+    if (int error = trimSelectedUnreachableArenaTails()) {
+      return poisonFilesystemLocked(error);
+    }
+  }
   return 0;
 }
 
@@ -10113,7 +10302,7 @@ int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
       next.inodes.at(sourceID).entries.erase(mutation.sourceName);
       next.inodes.at(sourceID).metadata = *mutation.sourceParentPostImage;
       next.inodes.erase(subjectID);
-      if (int error = commitLogicalStateLocked(std::move(next), {})) {
+      if (int error = commitLogicalStateLocked(std::move(next), {}, false)) {
         return error;
       }
       orphans.emplace(subjectID, std::move(removed));
@@ -10183,7 +10372,8 @@ int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
       if (removedID) {
         next.inodes.erase(removedID);
       }
-      if (int error = commitLogicalStateLocked(std::move(next), {})) {
+      if (int error = commitLogicalStateLocked(
+            std::move(next), {}, !removedID)) {
         return error;
       }
       if (removedID) {

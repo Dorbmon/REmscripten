@@ -1947,6 +1947,12 @@ var WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST = 0;
 
+// Test-only odd checkpoint cadence override for the mountable V4 filesystem.
+// Zero selects the production cadence; an odd value of at least three enables
+// focused two-arena reclamation tests without exposing runtime configuration.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL = 0;
+
 // Test-only selector that makes the first OPFS SyncAccessHandle close fail.
 // This controls code emitted at link time only; it intentionally provides no
 // runtime configuration or recovery API.
