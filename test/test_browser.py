@@ -9377,6 +9377,545 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_checkpoint_recovery(self):
+    # Exercise two alternating V4 checkpoint generations in fresh documents.
+    # The parent reads only the fixed test artifacts after each orderly drain;
+    # native mounts prove the logical state. Separate phase cuts establish
+    # old/new selector recovery, and an open-unlink role checks that a
+    # prospective orphan prevents premature source-arena reclamation. This is
+    # controlled iframe-disposal evidence, not physical power-loss or
+    # Chromium-profile recovery evidence.
+    test = ('wasmfs/'
+            'wasmfs_opfs_profile_log_v4_filesystem_checkpoint_recovery.c')
+    base_args = [
+      '-sWASMFS',
+      '-pthread',
+      '-sPROXY_TO_PTHREAD',
+      '-lopfs.js',
+    ]
+    common_args = base_args + [
+      '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL=3',
+    ]
+
+    def profile_arg(profile):
+      return ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+              'PROFILE_NAME=' + profile)
+
+    def compile_role(output, profile, role, extra_args=None):
+      self.compile_btest(
+        test, common_args + [profile_arg(profile), role] +
+          (extra_args or []) + ['-o', output], reporting=Reporting.NONE)
+
+    def compile_production_role(output, profile, role):
+      self.compile_btest(
+        test, base_args + [profile_arg(profile), role, '-o', output],
+        reporting=Reporting.NONE)
+
+    def profile(name):
+      return ('wasmfs_profile_log_v4_filesystem_checkpoint_%s_%016x' %
+              (name, random.getrandbits(64)))
+
+    clean_profile = profile('clean')
+    compile_role(
+      'v4fs-checkpoint-clean-seed.html', clean_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_SEED')
+    compile_role(
+      'v4fs-checkpoint-clean-round-one.html', clean_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_ROUND_ONE')
+    compile_role(
+      'v4fs-checkpoint-clean-round-two.html', clean_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_ROUND_TWO')
+    compile_role(
+      'v4fs-checkpoint-clean-verifier.html', clean_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_VERIFIER')
+
+    production_profile = profile('production')
+    compile_production_role(
+      'v4fs-checkpoint-production.html', production_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_PRODUCTION')
+    compile_production_role(
+      'v4fs-checkpoint-production-reload.html', production_profile,
+      ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+       'PRODUCTION_RELOAD'))
+
+    phase_cases = []
+    for phase in (1, 2):
+      phase_profile = profile('phase-%d' % phase)
+      prefix = 'v4fs-checkpoint-phase-%d' % phase
+      seed = prefix + '-seed.html'
+      interruptor = prefix + '-interruptor.html'
+      verifier = prefix + '-verifier.html'
+      reload = prefix + '-reload.html'
+      compile_role(
+        seed, phase_profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_SEED')
+      compile_role(
+        interruptor, phase_profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_INTERRUPTOR',
+        [
+          ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+           'INTERRUPT_PHASE=%d' % phase),
+          '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1',
+        ])
+      recovery_args = [
+        ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+         'EXPECT_ROUND_ONE=%d' % int(phase == 2)),
+      ]
+      compile_role(
+        verifier, phase_profile,
+        ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+         'RECOVERY_VERIFIER'), recovery_args)
+      compile_role(
+        reload, phase_profile,
+        ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+         'RECOVERY_RELOAD'), recovery_args)
+      phase_cases.append((phase, phase_profile, seed, interruptor,
+                          verifier, reload))
+
+    orphan_profile = profile('orphan')
+    compile_role(
+      'v4fs-checkpoint-orphan-seed.html', orphan_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_SEED')
+    compile_role(
+      'v4fs-checkpoint-orphan.html', orphan_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_ORPHAN')
+    compile_role(
+      'v4fs-checkpoint-orphan-reload.html', orphan_profile,
+      ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+       'ORPHAN_RELOAD'))
+
+    replacement_profile = profile('replacement')
+    compile_role(
+      'v4fs-checkpoint-replacement-seed.html', replacement_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_SEED')
+    compile_role(
+      'v4fs-checkpoint-replacement.html', replacement_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_REPLACEMENT')
+    compile_role(
+      'v4fs-checkpoint-replacement-reload.html', replacement_profile,
+      ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_CHECKPOINT_TEST_' +
+       'REPLACEMENT_RELOAD'))
+
+    phase_script = '\n'.join(
+      "          await runAfterLeaseRelease('%s', kSeed, '%s seed');\n"
+      "          await interruptAfterLeaseRelease('%s', %d, '%s interruption');\n"
+      "          const interrupted%d = await waitForPhysicalLayout(" \
+      "'%s', '%s interrupted layout');\n"
+      "          requireInterruptedCheckpoint(interrupted%d, %d, " \
+      "'%s interruption');\n"
+      "          await runAfterLeaseRelease('%s', kRecoveryVerifier, " \
+      "'%s recovery verifier');\n"
+      "          const recovered%d = await waitForPhysicalLayout(" \
+      "'%s', '%s recovered layout');\n"
+      "          requireExactPhysicalBounds(recovered%d, '%s recovery verifier');\n"
+      "          await runAfterLeaseRelease('%s', kRecoveryReload, " \
+      "'%s recovery reload');" %
+      (seed, 'phase %d' % phase, interruptor, phase, 'phase %d' % phase,
+       phase, phase_profile, 'phase %d' % phase, phase, phase,
+       'phase %d' % phase, verifier, 'phase %d' % phase, phase,
+       phase_profile, 'phase %d' % phase, phase, 'phase %d' % phase,
+       reload, 'phase %d' % phase)
+      for phase, phase_profile, seed, interruptor, verifier, reload in
+      phase_cases)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kSeed = 0;
+        const kRoundOne = 1;
+        const kRoundTwo = 2;
+        const kVerifier = 3;
+        const kInterruptor = 4;
+        const kRecoveryVerifier = 5;
+        const kRecoveryReload = 6;
+        const kOrphan = 7;
+        const kOrphanReload = 8;
+        const kProduction = 9;
+        const kProductionReload = 10;
+        const kReplacement = 11;
+        const kReplacementReload = 12;
+        const kBusy = 16;
+        const kRecordSize = 128;
+        const kControlSize = 6 * kRecordSize;
+        const kManifestHeaderSize = 96;
+        const kFilesystemHeaderSize = 128;
+        const kFilesystemExtentSize = 48;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v4-filesystem-checkpoint-recovery';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function require(condition, description) {
+          if (!condition) {
+            throw new Error(description);
+          }
+        }
+
+        function requireMagic(bytes, offset, magic, description) {
+          require(offset + magic.length <= bytes.byteLength,
+                  description + ' is truncated');
+          for (let index = 0; index < magic.length; ++index) {
+            require(bytes[offset + index] === magic.charCodeAt(index),
+                    description + ' has the wrong magic');
+          }
+        }
+
+        function readU64(view, offset, description) {
+          const value = view.getBigUint64(offset, true);
+          require(value <= BigInt(Number.MAX_SAFE_INTEGER),
+                  description + ' is not a safe integer');
+          return Number(value);
+        }
+
+        function parsePhase(bytes, view, offset, description) {
+          requireMagic(bytes, offset, 'WFSLG4P0', description);
+          require(view.getUint32(offset + 8, true) === 4,
+                  description + ' has the wrong version');
+          require(view.getUint32(offset + 12, true) === kRecordSize,
+                  description + ' has the wrong size');
+          const generation = readU64(view, offset + 16, description);
+          const arena = view.getUint32(offset + 24, true);
+          require(generation !== 0 && arena < 2 && arena === (generation & 1),
+                  description + ' is not a valid phase');
+          require(view.getUint32(offset + 28, true) === 1,
+                  description + ' is not clean');
+          return {generation, arena};
+        }
+
+        function parseDescriptor(bytes, view, generation, arena, copy) {
+          const offset = (((generation & 1) * 2 + copy) * kRecordSize);
+          const description = 'descriptor ' + generation + '/' + copy;
+          requireMagic(bytes, offset, 'WFSLG4D0', description);
+          require(view.getUint32(offset + 8, true) === 4,
+                  description + ' has the wrong version');
+          require(view.getUint32(offset + 12, true) === kRecordSize,
+                  description + ' has the wrong size');
+          require(readU64(view, offset + 16, description) === generation &&
+                  view.getUint32(offset + 24, true) === arena,
+                  description + ' does not name the selected phase');
+          return {
+            highWater: [
+              readU64(view, offset + 56, description),
+              readU64(view, offset + 64, description),
+            ],
+            manifestOffset: readU64(view, offset + 32, description),
+            manifestSize: readU64(view, offset + 40, description),
+          };
+        }
+
+        function parseSelectedDescriptor(control) {
+          require(control.byteLength === kControlSize,
+                  'V4 control file has the wrong fixed size');
+          const view = new DataView(control.buffer, control.byteOffset,
+                                    control.byteLength);
+          const first = parsePhase(control, view, 4 * kRecordSize, 'phase 0');
+          const second = parsePhase(control, view, 5 * kRecordSize, 'phase 1');
+          let selected = first;
+          if (first.generation === second.generation) {
+            require(first.arena === second.arena,
+                    'mirrored V4 phases disagree');
+          } else {
+            const older = first.generation < second.generation ? first : second;
+            const newer = first.generation < second.generation ? second : first;
+            require(newer.generation === older.generation + 1,
+                    'V4 phases do not form a recovery split');
+            selected = older;
+          }
+          const descriptor0 = parseDescriptor(
+            control, view, selected.generation, selected.arena, 0);
+          const descriptor1 = parseDescriptor(
+            control, view, selected.generation, selected.arena, 1);
+          require(descriptor0.manifestOffset === descriptor1.manifestOffset &&
+                  descriptor0.manifestSize === descriptor1.manifestSize &&
+                  descriptor0.highWater[0] === descriptor1.highWater[0] &&
+                  descriptor0.highWater[1] === descriptor1.highWater[1],
+                  'mirrored V4 descriptors disagree');
+          return {...descriptor0, generation: selected.generation,
+                  arena: selected.arena};
+        }
+
+        async function readPhysicalLayout(profile) {
+          // This observer never mutates OPFS. Native V4 code selects and
+          // validates records; the parent witnesses physical reachability
+          // only after the relevant iframe has released its profile lease.
+          const root = await navigator.storage.getDirectory();
+          const stem = '.wasmfs-profile-log-v4-fs-' + profile.length + '-' +
+                       profile;
+          async function readFile(name) {
+            const handle = await root.getFileHandle(name);
+            return new Uint8Array(await (await handle.getFile()).arrayBuffer());
+          }
+          const control = await readFile(stem + '-control');
+          const selected = parseSelectedDescriptor(control);
+          const arenas = await Promise.all([0, 1].map(
+            (arena) => readFile(stem + '-arena-' + arena)));
+          return {...selected, arenas, physical: arenas.map((arena) =>
+            arena.byteLength)};
+        }
+
+        async function waitForPhysicalLayout(profile, description) {
+          let lastError;
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            try {
+              return await readPhysicalLayout(profile);
+            } catch (error) {
+              lastError = error;
+              await delay(100);
+            }
+          }
+          throw new Error(description + ' could not read test artifacts: ' +
+                          lastError);
+        }
+
+        function requireExactPhysicalBounds(layout, description) {
+          require(layout.physical[0] === layout.highWater[0] &&
+                  layout.physical[1] === layout.highWater[1],
+                  description + ' did not trim arena files to selected high water');
+        }
+
+        function requireSelectedFilesystemExtents(layout, description) {
+          const bytes = layout.arenas[layout.arena];
+          const outerOffset = layout.manifestOffset;
+          require(outerOffset + kManifestHeaderSize + layout.manifestSize <=
+                    bytes.byteLength,
+                  description + ' selected outer manifest is outside its arena');
+          requireMagic(bytes, outerOffset, 'WFSLG4M0', description + ' outer');
+          const outer = new DataView(bytes.buffer,
+                                     bytes.byteOffset + outerOffset,
+                                     kManifestHeaderSize);
+          require(outer.getUint32(8, true) === 4 &&
+                  outer.getUint32(12, true) === kManifestHeaderSize &&
+                  readU64(outer, 16, description + ' outer') ===
+                    layout.generation &&
+                  readU64(outer, 24, description + ' outer') ===
+                    layout.manifestSize,
+                  description + ' has an invalid selected outer manifest');
+          const payloadOffset = outerOffset + kManifestHeaderSize;
+          const payload = bytes.subarray(payloadOffset,
+                                         payloadOffset + layout.manifestSize);
+          require(payload.byteLength >= kFilesystemHeaderSize,
+                  description + ' filesystem payload is truncated');
+          requireMagic(payload, 0, 'WFSV4FS1', description + ' filesystem');
+          const view = new DataView(payload.buffer, payload.byteOffset,
+                                    payload.byteLength);
+          require(view.getUint32(8, true) === 1 &&
+                  view.getUint32(12, true) === kFilesystemHeaderSize &&
+                  readU64(view, 16, description + ' filesystem') ===
+                    layout.generation,
+                  description + ' has an invalid filesystem manifest');
+          const extentOffset = readU64(view, 80, description + ' filesystem');
+          const extentCount = readU64(view, 88, description + ' filesystem');
+          require(extentOffset <= payload.byteLength &&
+                  extentCount <=
+                    Math.floor((payload.byteLength - extentOffset) /
+                               kFilesystemExtentSize),
+                  description + ' extent table is outside its manifest');
+          for (let index = 0; index < extentCount; ++index) {
+            const offset = extentOffset + index * kFilesystemExtentSize;
+            require(view.getUint32(offset + 16, true) === layout.arena,
+                    description + ' retains a live extent in the retired arena');
+          }
+        }
+
+        function requireCompactedLayout(layout, generation, arena, description) {
+          const retired = arena ^ 1;
+          require(layout.generation === generation && layout.arena === arena,
+                  description + ' selected the wrong checkpoint generation');
+          require(layout.highWater[retired] === 0 &&
+                  layout.physical[retired] === 0,
+                  description + ' did not retire its source arena');
+          requireExactPhysicalBounds(layout, description);
+          requireSelectedFilesystemExtents(layout, description);
+        }
+
+        function requireInterruptedCheckpoint(layout, phase, description) {
+          if (phase === 1) {
+            require(layout.generation === 5 && layout.arena === 1,
+                    description + ' did not retain the old selected state');
+            require(layout.physical[0] > layout.highWater[0] &&
+                    layout.physical[1] === layout.highWater[1],
+                    description + ' did not retain only an unreachable target tail');
+          } else {
+            require(layout.generation === 6 && layout.arena === 0 &&
+                    layout.highWater[1] === 0 &&
+                    layout.physical[0] === layout.highWater[0] &&
+                    layout.physical[1] > 0,
+                    description + ' did not expose the self-contained checkpoint');
+          }
+          requireSelectedFilesystemExtents(layout, description);
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function interruptAfterLeaseRelease(path, checkpoint, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.event !== 'interrupt' ||
+                message.checkpoint !== checkpoint) {
+              throw new Error(description + ' did not reach phase ' +
+                              checkpoint + ': role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          await runAfterLeaseRelease('v4fs-checkpoint-production.html',
+                                     kProduction,
+                                     'production-cadence checkpoint run');
+          const production = await waitForPhysicalLayout(
+            '%(production_profile)s', 'production-cadence checkpoint layout');
+          requireCompactedLayout(production, 62, 0,
+                                 'production-cadence checkpoint run');
+          await runAfterLeaseRelease(
+            'v4fs-checkpoint-production-reload.html', kProductionReload,
+            'production-cadence fresh reload');
+          await runAfterLeaseRelease('v4fs-checkpoint-clean-seed.html', kSeed,
+                                     'clean checkpoint seed');
+          await runAfterLeaseRelease('v4fs-checkpoint-clean-round-one.html',
+                                     kRoundOne, 'first checkpoint');
+          const first = await waitForPhysicalLayout(
+            '%(clean_profile)s', 'first checkpoint layout');
+          requireCompactedLayout(first, 6, 0, 'first checkpoint');
+          await runAfterLeaseRelease('v4fs-checkpoint-clean-round-two.html',
+                                     kRoundTwo, 'second checkpoint');
+          const second = await waitForPhysicalLayout(
+            '%(clean_profile)s', 'second checkpoint layout');
+          requireCompactedLayout(second, 9, 1, 'second checkpoint');
+          await runAfterLeaseRelease('v4fs-checkpoint-clean-verifier.html',
+                                     kVerifier, 'checkpoint fresh verifier');
+%(phase_script)s
+          await runAfterLeaseRelease('v4fs-checkpoint-orphan-seed.html', kSeed,
+                                     'orphan checkpoint seed');
+          await runAfterLeaseRelease('v4fs-checkpoint-orphan.html', kOrphan,
+                                     'open-unlink checkpoint boundary');
+          const orphan = await waitForPhysicalLayout(
+            '%(orphan_profile)s', 'open-unlink checkpoint layout');
+          requireCompactedLayout(orphan, 9, 1,
+                                 'open-unlink checkpoint boundary');
+          await runAfterLeaseRelease('v4fs-checkpoint-orphan-reload.html',
+                                     kOrphanReload,
+                                     'open-unlink fresh reload');
+          await runAfterLeaseRelease('v4fs-checkpoint-replacement-seed.html',
+                                     kSeed, 'replacement checkpoint seed');
+          await runAfterLeaseRelease('v4fs-checkpoint-replacement.html',
+                                     kReplacement,
+                                     'open-replacement checkpoint boundary');
+          const replacement = await waitForPhysicalLayout(
+            '%(replacement_profile)s',
+            'open-replacement checkpoint layout');
+          requireCompactedLayout(replacement, 12, 0,
+                                 'open-replacement checkpoint boundary');
+          await runAfterLeaseRelease(
+            'v4fs-checkpoint-replacement-reload.html', kReplacementReload,
+            'open-replacement fresh reload');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''' % {
+      'clean_profile': clean_profile,
+      'phase_script': phase_script,
+      'orphan_profile': orphan_profile,
+      'production_profile': production_profile,
+      'replacement_profile': replacement_profile,
+    })
+    self.run_browser('a.html', '/report_result?0', timeout=300)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_quota_recovery(self):
     # The quota role maps a test-only browser QuotaExceededError to ENOSPC on
     # a real V4 data transaction. It must not report successful persistence,
