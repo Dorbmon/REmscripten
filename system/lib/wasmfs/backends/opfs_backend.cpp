@@ -6090,6 +6090,14 @@ constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
 #define WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION 0
 #endif
 
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION 0
+#endif
+
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION 0
+#endif
+
 #ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST
 #define WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST 0
 #endif
@@ -6115,6 +6123,16 @@ constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION < 0 || \
   WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION > 2
 #error "invalid profile-log V4 live corruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION > 1
+#error "invalid profile-log V4 historical parent corruption selector"
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION > 1
+#error "invalid profile-log V4 historical extent corruption selector"
 #endif
 
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST < 0 || \
@@ -6238,6 +6256,27 @@ struct ProfileLogV4Descriptor {
   uint64_t recordChecksum;
 };
 
+// A logical delta names its immediately preceding sealed outer manifest by
+// this exact, self-authenticating locator. Keep it smaller than a descriptor:
+// the selected descriptor remains the sole authority for the high-water
+// bounds that make a historical record reachable.
+struct ProfileLogV4ManifestReference {
+  uint64_t generation;
+  uint32_t arena;
+  uint64_t manifestOffset;
+  uint64_t manifestSize;
+  uint64_t manifestRecordChecksum;
+};
+
+ProfileLogV4ManifestReference profileLogV4ManifestReference(
+  const ProfileLogV4Descriptor& descriptor) {
+  return {descriptor.generation,
+          descriptor.arena,
+          descriptor.manifestOffset,
+          descriptor.manifestSize,
+          descriptor.manifestRecordChecksum};
+}
+
 struct ProfileLogV4Phase {
   uint64_t generation;
   uint32_t arena;
@@ -6300,6 +6339,7 @@ protected:
     uint64_t nextGeneration;
     uint32_t nextArena;
     std::array<uint64_t, 2> nextHighWater;
+    ProfileLogV4ManifestReference parent;
     bool discardInactiveArena = false;
 
     friend class ProfileLogV4Store;
@@ -6307,15 +6347,20 @@ protected:
 
     Transaction(ProfileLogV4Store& store,
                 uint64_t generation,
-                std::array<uint64_t, 2> highWater)
+                std::array<uint64_t, 2> highWater,
+                ProfileLogV4ManifestReference parent)
       : store(store),
         nextGeneration(generation),
         nextArena(generation & 1),
-        nextHighWater(highWater) {}
+        nextHighWater(highWater),
+        parent(parent) {}
 
   public:
     uint64_t generation() const { return nextGeneration; }
     uint32_t arena() const { return nextArena; }
+    const ProfileLogV4ManifestReference& parentReference() const {
+      return parent;
+    }
 
   private:
     // The caller has copied every live reference into |arena()| and may
@@ -7117,7 +7162,8 @@ protected:
   }
 
   int validatePhaseManifestLocked(const ProfileLogV4Phase& phase,
-                                  ProfileLogV4Descriptor* result) {
+                                  ProfileLogV4Descriptor* result,
+                                  bool validatePayload = true) {
     if (!result || phase.arena != (phase.generation & 1)) {
       return -EIO;
     }
@@ -7183,16 +7229,18 @@ protected:
         parsed->recordChecksum != descriptor.manifestRecordChecksum) {
       return -EIO;
     }
-    uint64_t payloadChecksum = 0;
-    if (int error = streamChecksumLocked(
-          arenas[descriptor.arena],
-          descriptor.manifestOffset + kProfileLogV4ManifestHeaderSize,
-          descriptor.manifestSize,
-          &payloadChecksum)) {
-      return error;
-    }
-    if (payloadChecksum != parsed->payloadChecksum) {
-      return -EIO;
+    if (validatePayload) {
+      uint64_t payloadChecksum = 0;
+      if (int error = streamChecksumLocked(
+            arenas[descriptor.arena],
+            descriptor.manifestOffset + kProfileLogV4ManifestHeaderSize,
+            descriptor.manifestSize,
+            &payloadChecksum)) {
+        return error;
+      }
+      if (payloadChecksum != parsed->payloadChecksum) {
+        return -EIO;
+      }
     }
     *result = descriptor;
     return 0;
@@ -7517,7 +7565,7 @@ protected:
     return fatalError ? fatalError : hasSelectedDescriptor ? 0 : -ESHUTDOWN;
   }
 
-  int validateSelectedManifestLocked() {
+  int validateSelectedManifestLocked(bool validatePayload = true) {
     if (!hasSelectedDescriptor) {
       return -ESHUTDOWN;
     }
@@ -7573,7 +7621,8 @@ protected:
       return -EIO;
     }
     ProfileLogV4Descriptor validated;
-    if (int error = validatePhaseManifestLocked(*selectedPhase, &validated)) {
+    if (int error = validatePhaseManifestLocked(
+          *selectedPhase, &validated, validatePayload)) {
       return error;
     }
     return profileLogV4SameDescriptor(validated, selectedDescriptor) ? 0
@@ -7739,6 +7788,115 @@ protected:
     return 0;
   }
 
+  int readSelectedBytesFromValidatedSnapshot(uint64_t expectedGeneration,
+                                             uint32_t arena,
+                                             uint64_t offset,
+                                             uint8_t* buffer,
+                                             size_t size) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (!buffer && size) {
+      return -EINVAL;
+    }
+    if (expectedGeneration != selectedDescriptor.generation ||
+        !expectedGeneration) {
+      return poisonLocked(-EIO);
+    }
+    if (int error = validateSelectedManifestLocked(false)) {
+      return poisonLocked(error);
+    }
+    if (arena >= arenas.size() || offset > selectedDescriptor.highWater[arena] ||
+        size > selectedDescriptor.highWater[arena] - offset) {
+      return poisonLocked(-EIO);
+    }
+    if (int error = readBytesLocked(arenas[arena], offset, buffer, size)) {
+      return poisonLocked(error);
+    }
+    return 0;
+  }
+
+  // Read one historical manifest that remains reachable under the current
+  // selected descriptor. A delta carries this locator verbatim; the selected
+  // descriptor's high-water marks, the historical outer header, and the
+  // historical payload checksum are all revalidated before it is returned.
+  int readSelectedHistoricalManifest(
+    const ProfileLogV4ManifestReference& reference,
+    std::vector<uint8_t>* manifest) {
+    ProfileLeaseState::InternalOperation operation(*profileLeaseState);
+    if (!operation) {
+      return operation.getError();
+    }
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    if (int error = operationErrorLocked()) {
+      return error;
+    }
+    if (!manifest || !reference.generation ||
+        reference.arena >= arenas.size() ||
+        reference.arena != (reference.generation & 1) ||
+        reference.generation >= selectedDescriptor.generation ||
+        reference.manifestOffset >
+          kProfileLogV4MaxSafeOffset - kProfileLogV4ManifestHeaderSize ||
+        reference.manifestSize > kProfileLogV4MaxSafeOffset -
+          reference.manifestOffset - kProfileLogV4ManifestHeaderSize) {
+      return poisonLocked(-EIO);
+    }
+    if (int error = validateSelectedManifestLocked(false)) {
+      return poisonLocked(error);
+    }
+    const uint64_t end = reference.manifestOffset +
+                         kProfileLogV4ManifestHeaderSize +
+                         reference.manifestSize;
+    if (end > selectedDescriptor.highWater[reference.arena] ||
+        reference.manifestSize >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      return poisonLocked(-EIO);
+    }
+    std::array<uint8_t, kProfileLogV4ManifestHeaderSize> header;
+    if (int error = readBytesLocked(arenas[reference.arena],
+                                    reference.manifestOffset,
+                                    header.data(),
+                                    header.size())) {
+      return poisonLocked(error);
+    }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION
+    // Schema-2 replay is the sole current caller. Fault only this stack-local
+    // historical header after the selected envelope has authenticated; no
+    // OPFS byte, descriptor, or phase witness is modified by this test hook.
+    header[0] ^= 1;
+#endif
+    const auto parsed = parseManifestHeader(header);
+    if (!parsed || parsed->generation != reference.generation ||
+        parsed->size != reference.manifestSize ||
+        parsed->recordChecksum != reference.manifestRecordChecksum) {
+      return poisonLocked(-EIO);
+    }
+    uint64_t payloadChecksum = 0;
+    if (int error = streamChecksumLocked(
+          arenas[reference.arena],
+          reference.manifestOffset + kProfileLogV4ManifestHeaderSize,
+          reference.manifestSize,
+          &payloadChecksum)) {
+      return poisonLocked(error);
+    }
+    if (payloadChecksum != parsed->payloadChecksum) {
+      return poisonLocked(-EIO);
+    }
+    manifest->resize(static_cast<size_t>(reference.manifestSize));
+    if (int error = readBytesLocked(
+          arenas[reference.arena],
+          reference.manifestOffset + kProfileLogV4ManifestHeaderSize,
+          manifest->data(), manifest->size())) {
+      return poisonLocked(error);
+    }
+    return 0;
+  }
+
   int commitManifest(const uint8_t* data, size_t size) {
     ProfileLeaseState::InternalOperation operation(*profileLeaseState);
     if (!operation) {
@@ -7797,7 +7955,10 @@ protected:
     if (int error = trimUnreachableArenaTailsLocked()) {
       return poisonLocked(error);
     }
-    Transaction transaction(*this, generation + 1, highWater);
+    Transaction transaction(*this,
+                            generation + 1,
+                            highWater,
+                            profileLogV4ManifestReference(selectedDescriptor));
     std::vector<uint8_t> manifest;
     if (int error = builder(transaction, &manifest)) {
       return poisonLocked(error);
@@ -8015,7 +8176,12 @@ public:
 // manifest experiment above. Its logical state is one strictly validated
 // inode manifest, while regular-file data lives in immutable copy-on-write
 // chunk records appended through ProfileLogV4Store::Transaction.
-constexpr uint32_t kProfileLogV4FilesystemSchema = 1;
+// The logical namespace and immutable data-record formats evolve
+// independently. In particular, Schema-2 logical deltas still reference the
+// original WFSV4DA1 chunk record format.
+constexpr uint32_t kProfileLogV4FilesystemLogicalSchema1 = 1;
+constexpr uint32_t kProfileLogV4FilesystemLogicalSchema2 = 2;
+constexpr uint32_t kProfileLogV4FilesystemDataSchema1 = 1;
 constexpr uint32_t kProfileLogV4FilesystemChunkShift = 16;
 constexpr size_t kProfileLogV4FilesystemChunkSize =
   size_t(1) << kProfileLogV4FilesystemChunkShift;
@@ -8024,14 +8190,18 @@ constexpr size_t kProfileLogV4FilesystemInodeSize = 112;
 constexpr size_t kProfileLogV4FilesystemDirectoryEntrySize = 40;
 constexpr size_t kProfileLogV4FilesystemExtentSize = 48;
 constexpr size_t kProfileLogV4FilesystemDataHeaderSize = 96;
+constexpr size_t kProfileLogV4FilesystemDeltaOperationSize = 32;
+constexpr size_t kProfileLogV4FilesystemDeltaInodeHeaderSize = 128;
+constexpr size_t kProfileLogV4FilesystemDeltaDirectoryEntrySize = 32;
+constexpr size_t kProfileLogV4FilesystemDeltaExtentSize = 40;
 constexpr size_t kProfileLogV4FilesystemNameMax = 255;
 // A self-contained checkpoint is intentionally a bounded-retention building
 // block, not the eventual scalable mutation format. It copies the current
 // live tree into the next parity arena and lets the selector release the old
 // arena only after both phase witnesses are durable. The cadence must be odd:
 // an even period would always select the same generation-parity arena and
-// could never reclaim the other one. Schema-2 delta records will remove the
-// remaining O(namespace) work between these checkpoints.
+// could never reclaim the other one. Schema-2 delta records remove the
+// full-namespace serialization work between these checkpoints.
 constexpr uint64_t kProfileLogV4FilesystemCheckpointInterval =
   WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL
     ? WASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL
@@ -8039,6 +8209,8 @@ constexpr uint64_t kProfileLogV4FilesystemCheckpointInterval =
 static_assert(kProfileLogV4FilesystemCheckpointInterval & 1);
 constexpr std::array<uint8_t, 8> kProfileLogV4FilesystemMagic = {
   'W', 'F', 'S', 'V', '4', 'F', 'S', '1'};
+constexpr std::array<uint8_t, 8> kProfileLogV4FilesystemDeltaMagic = {
+  'W', 'F', 'S', 'V', '4', 'F', 'S', '2'};
 constexpr std::array<uint8_t, 8> kProfileLogV4FilesystemDataMagic = {
   'W', 'F', 'S', 'V', '4', 'D', 'A', '1'};
 
@@ -8075,7 +8247,29 @@ struct ProfileLogV4FilesystemState {
   uint64_t generation = 0;
   uint64_t root = 0;
   uint64_t nextInode = 1;
+  uint32_t deltaDepth = 0;
   std::map<uint64_t, ProfileLogV4FilesystemInode> inodes;
+};
+
+enum class ProfileLogV4FilesystemDeltaOpcode : uint32_t {
+  Set = 1,
+  Delete = 2,
+};
+
+struct ProfileLogV4FilesystemDeltaOperation {
+  uint64_t inode = 0;
+  ProfileLogV4FilesystemDeltaOpcode opcode =
+    ProfileLogV4FilesystemDeltaOpcode::Set;
+  ProfileLogV4FilesystemInode value;
+};
+
+struct ProfileLogV4FilesystemDelta {
+  uint64_t generation = 0;
+  uint64_t root = 0;
+  uint64_t nextInode = 0;
+  uint32_t depth = 0;
+  ProfileLogV4ManifestReference parent = {};
+  std::vector<ProfileLogV4FilesystemDeltaOperation> operations;
 };
 
 bool profileLogV4FilesystemCheckedAdd(size_t lhs, size_t rhs, size_t* result) {
@@ -8214,12 +8408,23 @@ class ProfileLogV4FilesystemBackend final : public ProfileLogV4Store {
   int parseLogicalStateLocked(const std::vector<uint8_t>& manifest,
                               uint64_t generation,
                               ProfileLogV4FilesystemState* result);
+  int parseLogicalDeltaLocked(const std::vector<uint8_t>& manifest,
+                              uint64_t generation,
+                              ProfileLogV4FilesystemDelta* result);
   int validateLogicalStateLocked(const ProfileLogV4FilesystemState& value,
                                  uint64_t generation,
-                                 bool validateExtents);
+                                 bool validateExtents,
+                                 uint64_t selectedGeneration = 0);
   int serializeLogicalStateLocked(const ProfileLogV4FilesystemState& value,
                                   uint64_t generation,
                                   std::vector<uint8_t>* manifest);
+  int serializeLogicalDeltaLocked(
+    const ProfileLogV4FilesystemState& value,
+    uint64_t generation,
+    const ProfileLogV4ManifestReference& parent,
+    const std::vector<uint64_t>& changed,
+    const std::vector<uint64_t>& deleted,
+    std::vector<uint8_t>* manifest);
   int appendImmutableChunkLocked(
     Transaction& transaction,
     uint64_t inode,
@@ -8228,15 +8433,18 @@ class ProfileLogV4FilesystemBackend final : public ProfileLogV4Store {
     ProfileLogV4FilesystemExtent* result);
   int copyLiveCheckpointExtentsLocked(ProfileLogV4FilesystemState* value,
                                       Transaction& transaction);
-  int commitLogicalStateLocked(ProfileLogV4FilesystemState value,
+  int commitLogicalStateLocked(const std::vector<uint64_t>& changed,
+                               const std::vector<uint64_t>& deleted,
                                std::vector<PendingChunk> pending,
-                               bool allowCheckpoint = true);
+                               bool allowReclamation = true,
+                               bool forceCheckpoint = false);
   int readExtentLocked(const ProfileLogV4FilesystemExtent& extent,
                        uint64_t inode,
                        uint64_t chunk,
-                       uint64_t generation,
+                       uint64_t selectedGeneration,
                        std::vector<uint8_t>* bytes,
-                       bool selectedAlreadyValidated = false);
+                       bool selectedAlreadyValidated = false,
+                       uint64_t maxRecordGeneration = 0);
   int readChunkLocked(const ProfileLogV4FilesystemInode& inode,
                       uint64_t chunk,
                       uint64_t generation,
@@ -8773,28 +8981,28 @@ int ProfileLogV4FilesystemBackend::validateCurrentStateLocked() {
     return error;
   }
   reapOrphansLocked();
+  if (!logicalStateLoaded || !state.generation ||
+      (state.generation == 1 &&
+       (state.root || state.nextInode != 1 || !state.inodes.empty() ||
+        !orphans.empty() || !orphanFiles.empty()))) {
+    return poisonFilesystemLocked(-EIO);
+  }
+  // Preserve the live fail-closed boundary: before serving cached namespace
+  // state, reauthenticate the selected outer payload.  This is intentionally
+  // cheaper than the schema-1 path because it does not reconstruct or
+  // globally validate the logical tree on every operation; ordinary schema-2
+  // commits carry only their changed inode postimages.  The selected full
+  // checkpoint is still checksummed, as required to reject same-origin OPFS
+  // corruption before it can be observed through cached metadata.
   size_t manifestSize = 0;
   uint64_t manifestGeneration = 0;
-  // A cached inode tree must not answer a stat, readdir, synthetic sparse
-  // read, or mutation after the V4 envelope that selected it no longer
-  // validates. This experimental profile backend deliberately pays the
-  // validation cost on every visible filesystem operation.
   if (int error = readManifest(
         nullptr, 0, &manifestSize, &manifestGeneration)) {
     return poisonFilesystemLocked(error);
   }
-  if (manifestGeneration != state.generation) {
+  if (manifestGeneration != state.generation ||
+      ((manifestGeneration == 1) != (manifestSize == 0))) {
     return poisonFilesystemLocked(-EIO);
-  }
-  if (!manifestSize) {
-    return !state.root && state.nextInode == 1 && state.inodes.empty() &&
-           orphans.empty() && orphanFiles.empty()
-             ? 0
-             : poisonFilesystemLocked(-EIO);
-  }
-  if (int error = validateLogicalStateLocked(
-        state, manifestGeneration, false)) {
-    return poisonFilesystemLocked(error);
   }
   return 0;
 }
@@ -8924,10 +9132,9 @@ ProfileLogV4FilesystemBackend::createMountRootDirectory(mode_t mode) {
     auto root = std::shared_ptr<ProfileLogV4FilesystemDirectory>(
       new ProfileLogV4FilesystemDirectory(this, mode));
     auto metadata = root->locked().getMetadata();
-    ProfileLogV4FilesystemState next;
-    next.root = 1;
-    next.nextInode = 2;
-    next.inodes.emplace(
+    state.root = 1;
+    state.nextInode = 2;
+    state.inodes.emplace(
       1,
       ProfileLogV4FilesystemInode{1,
                                    ProfileLogV4FilesystemInodeKind::Directory,
@@ -8937,7 +9144,7 @@ ProfileLogV4FilesystemBackend::createMountRootDirectory(mode_t mode) {
                                    {},
                                    {},
                                    {}});
-    if (commitLogicalStateLocked(std::move(next), {})) {
+    if (commitLogicalStateLocked({1}, {}, {}, true, true)) {
       return nullptr;
     }
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST && \
@@ -8988,7 +9195,7 @@ profileLogV4FilesystemMakeDataHeader(uint64_t generation,
   std::copy(kProfileLogV4FilesystemDataMagic.begin(),
             kProfileLogV4FilesystemDataMagic.end(),
             header.begin());
-  writeProfileLogV4U32(header, 8, kProfileLogV4FilesystemSchema);
+  writeProfileLogV4U32(header, 8, kProfileLogV4FilesystemDataSchema1);
   writeProfileLogV4U32(header, 12, kProfileLogV4FilesystemDataHeaderSize);
   writeProfileLogV4U64(header, 16, generation);
   writeProfileLogV4U64(header, 24, inode);
@@ -9012,7 +9219,8 @@ bool profileLogV4FilesystemParseDataHeader(
       !std::equal(kProfileLogV4FilesystemDataMagic.begin(),
                   kProfileLogV4FilesystemDataMagic.end(),
                   header.begin()) ||
-      readProfileLogV4U32(header, 8) != kProfileLogV4FilesystemSchema ||
+      readProfileLogV4U32(header, 8) !=
+        kProfileLogV4FilesystemDataSchema1 ||
       readProfileLogV4U32(header, 12) !=
         kProfileLogV4FilesystemDataHeaderSize ||
       readProfileLogV4U32(header, 44) != 0 ||
@@ -9027,6 +9235,309 @@ bool profileLogV4FilesystemParseDataHeader(
   *payloadSize = readProfileLogV4U32(header, 40);
   *payloadChecksum = readProfileLogV4U64(header, 48);
   return *generation != 0;
+}
+
+// A Schema-2 Set operation stores a complete post-image for exactly one
+// inode. The tables use offsets local to this blob, so a one-file metadata
+// change never requires rewriting unrelated inode, directory, or extent
+// tables from the Schema-1 checkpoint.
+int profileLogV4FilesystemSerializeDeltaInode(
+  const ProfileLogV4FilesystemInode& inode,
+  std::vector<uint8_t>* blob) {
+  if (!blob || !inode.id ||
+      inode.id > static_cast<uint64_t>(std::numeric_limits<ino_t>::max()) ||
+      !profileLogV4FilesystemValidMetadata(inode.metadata, inode.kind) ||
+      !inode.volatileChunks.empty()) {
+    return -EIO;
+  }
+  if ((inode.kind == ProfileLogV4FilesystemInodeKind::Directory &&
+       (inode.size || !inode.extents.empty() || !inode.target.empty())) ||
+      (inode.kind == ProfileLogV4FilesystemInodeKind::Regular &&
+       (!inode.entries.empty() || !inode.target.empty() ||
+        inode.size > kProfileLogV4MaxSafeOffset)) ||
+      (inode.kind == ProfileLogV4FilesystemInodeKind::Symlink &&
+       (inode.size || !inode.entries.empty() || !inode.extents.empty() ||
+        inode.target.find('\0') != std::string::npos))) {
+    return -EIO;
+  }
+
+  std::vector<uint8_t> strings;
+  if (inode.kind == ProfileLogV4FilesystemInodeKind::Directory) {
+    for (const auto& [name, child] : inode.entries) {
+      if (!child || !profileLogV4FilesystemValidName(name) ||
+          strings.size() > kProfileLogV4MaxSafeOffset - name.size()) {
+        return -EIO;
+      }
+      strings.insert(strings.end(), name.begin(), name.end());
+    }
+  } else if (inode.kind == ProfileLogV4FilesystemInodeKind::Symlink) {
+    if (inode.target.size() > kProfileLogV4MaxSafeOffset - strings.size()) {
+      return -EFBIG;
+    }
+    strings.insert(strings.end(), inode.target.begin(), inode.target.end());
+  }
+
+  if (inode.kind == ProfileLogV4FilesystemInodeKind::Regular) {
+    uint64_t previousChunk = 0;
+    bool haveChunk = false;
+    for (const auto& [chunk, extent] : inode.extents) {
+      if ((haveChunk && chunk <= previousChunk) || extent.chunk != chunk ||
+          extent.arena >= 2 ||
+          extent.payloadSize != kProfileLogV4FilesystemChunkSize ||
+          !inode.size ||
+          chunk > ((inode.size - 1) >> kProfileLogV4FilesystemChunkShift)) {
+        return -EIO;
+      }
+      previousChunk = chunk;
+      haveChunk = true;
+    }
+  }
+
+  size_t entryBytes = 0;
+  size_t extentBytes = 0;
+  size_t extentOffset = 0;
+  size_t stringOffset = 0;
+  size_t total = 0;
+  if (!profileLogV4FilesystemCheckedMultiply(
+        inode.entries.size(), kProfileLogV4FilesystemDeltaDirectoryEntrySize,
+        &entryBytes) ||
+      !profileLogV4FilesystemCheckedMultiply(
+        inode.extents.size(), kProfileLogV4FilesystemDeltaExtentSize,
+        &extentBytes) ||
+      !profileLogV4FilesystemCheckedAdd(
+        kProfileLogV4FilesystemDeltaInodeHeaderSize, entryBytes,
+        &extentOffset) ||
+      !profileLogV4FilesystemCheckedAdd(extentOffset, extentBytes,
+                                         &stringOffset) ||
+      !profileLogV4FilesystemCheckedAdd(stringOffset, strings.size(),
+                                         &total)) {
+    return -EFBIG;
+  }
+  blob->assign(total, 0);
+  profileLogV4FilesystemWriteU64(*blob, 0, inode.id);
+  profileLogV4FilesystemWriteU32(
+    *blob, 8, static_cast<uint32_t>(inode.kind));
+  profileLogV4FilesystemWriteU32(*blob, 16, inode.metadata.mode);
+  profileLogV4FilesystemWriteU64(
+    *blob, 24, profileLogV4FilesystemDoubleBits(inode.metadata.atime));
+  profileLogV4FilesystemWriteU64(
+    *blob, 32, profileLogV4FilesystemDoubleBits(inode.metadata.mtime));
+  profileLogV4FilesystemWriteU64(
+    *blob, 40, profileLogV4FilesystemDoubleBits(inode.metadata.ctime));
+  profileLogV4FilesystemWriteU64(*blob, 48, inode.size);
+  profileLogV4FilesystemWriteU64(
+    *blob, 56, kProfileLogV4FilesystemDeltaInodeHeaderSize);
+  profileLogV4FilesystemWriteU64(*blob, 64, inode.entries.size());
+  profileLogV4FilesystemWriteU64(*blob, 72, extentOffset);
+  profileLogV4FilesystemWriteU64(*blob, 80, inode.extents.size());
+  profileLogV4FilesystemWriteU64(*blob, 88, 0);
+  profileLogV4FilesystemWriteU64(*blob, 96,
+                                  inode.kind ==
+                                      ProfileLogV4FilesystemInodeKind::Symlink
+                                    ? inode.target.size()
+                                    : 0);
+
+  size_t entryCursor = kProfileLogV4FilesystemDeltaInodeHeaderSize;
+  size_t stringCursor = 0;
+  for (const auto& [name, child] : inode.entries) {
+    profileLogV4FilesystemWriteU64(*blob, entryCursor, child);
+    profileLogV4FilesystemWriteU64(*blob, entryCursor + 8, stringCursor);
+    profileLogV4FilesystemWriteU32(*blob, entryCursor + 16, name.size());
+    entryCursor += kProfileLogV4FilesystemDeltaDirectoryEntrySize;
+    stringCursor += name.size();
+  }
+  size_t extentCursor = extentOffset;
+  for (const auto& [chunk, extent] : inode.extents) {
+    profileLogV4FilesystemWriteU64(*blob, extentCursor, chunk);
+    profileLogV4FilesystemWriteU32(*blob, extentCursor + 8, extent.arena);
+    profileLogV4FilesystemWriteU32(
+      *blob, extentCursor + 12, extent.payloadSize);
+    profileLogV4FilesystemWriteU64(*blob, extentCursor + 16, extent.offset);
+    profileLogV4FilesystemWriteU64(*blob, extentCursor + 24, extent.checksum);
+    extentCursor += kProfileLogV4FilesystemDeltaExtentSize;
+  }
+  if (!strings.empty()) {
+    memcpy(blob->data() + stringOffset, strings.data(), strings.size());
+  }
+  return 0;
+}
+
+int profileLogV4FilesystemParseDeltaInode(
+  const uint8_t* data,
+  size_t size,
+  uint64_t expectedID,
+  ProfileLogV4FilesystemInode* result) {
+  if (!data || !result || !expectedID ||
+      size < kProfileLogV4FilesystemDeltaInodeHeaderSize) {
+    return -EIO;
+  }
+  const auto read32 = [&](size_t offset, uint32_t* value) {
+    return profileLogV4FilesystemReadU32(data, size, offset, value);
+  };
+  const auto read64 = [&](size_t offset, uint64_t* value) {
+    return profileLogV4FilesystemReadU64(data, size, offset, value);
+  };
+  uint64_t id = 0;
+  uint32_t kindRaw = 0;
+  uint32_t reserved12 = 0;
+  uint32_t mode = 0;
+  uint32_t reserved20 = 0;
+  uint64_t atime = 0;
+  uint64_t mtime = 0;
+  uint64_t ctime = 0;
+  uint64_t inodeSize = 0;
+  uint64_t entryOffset64 = 0;
+  uint64_t entryCount64 = 0;
+  uint64_t extentOffset64 = 0;
+  uint64_t extentCount64 = 0;
+  uint64_t targetOffset = 0;
+  uint64_t targetSize64 = 0;
+  uint64_t reserved104 = 0;
+  uint64_t reserved112 = 0;
+  uint64_t reserved120 = 0;
+  if (!read64(0, &id) || !read32(8, &kindRaw) ||
+      !read32(12, &reserved12) || !read32(16, &mode) ||
+      !read32(20, &reserved20) || !read64(24, &atime) ||
+      !read64(32, &mtime) || !read64(40, &ctime) ||
+      !read64(48, &inodeSize) || !read64(56, &entryOffset64) ||
+      !read64(64, &entryCount64) || !read64(72, &extentOffset64) ||
+      !read64(80, &extentCount64) || !read64(88, &targetOffset) ||
+      !read64(96, &targetSize64) || !read64(104, &reserved104) ||
+      !read64(112, &reserved112) || !read64(120, &reserved120) ||
+      id != expectedID ||
+      id > static_cast<uint64_t>(std::numeric_limits<ino_t>::max()) ||
+      reserved12 || reserved20 || reserved104 || reserved112 || reserved120 ||
+      entryCount64 > std::numeric_limits<size_t>::max() ||
+      extentCount64 > std::numeric_limits<size_t>::max()) {
+    return -EIO;
+  }
+  ProfileLogV4FilesystemInodeKind kind;
+  switch (kindRaw) {
+    case static_cast<uint32_t>(ProfileLogV4FilesystemInodeKind::Regular):
+      kind = ProfileLogV4FilesystemInodeKind::Regular;
+      break;
+    case static_cast<uint32_t>(ProfileLogV4FilesystemInodeKind::Directory):
+      kind = ProfileLogV4FilesystemInodeKind::Directory;
+      break;
+    case static_cast<uint32_t>(ProfileLogV4FilesystemInodeKind::Symlink):
+      kind = ProfileLogV4FilesystemInodeKind::Symlink;
+      break;
+    default:
+      return -EIO;
+  }
+  const File::Metadata metadata = {
+    static_cast<mode_t>(mode),
+    profileLogV4FilesystemDoubleFromBits(atime),
+    profileLogV4FilesystemDoubleFromBits(mtime),
+    profileLogV4FilesystemDoubleFromBits(ctime)};
+  if (!profileLogV4FilesystemValidMetadata(metadata, kind) ||
+      inodeSize > kProfileLogV4MaxSafeOffset) {
+    return -EIO;
+  }
+  const size_t entryCount = static_cast<size_t>(entryCount64);
+  const size_t extentCount = static_cast<size_t>(extentCount64);
+  size_t entryBytes = 0;
+  size_t extentBytes = 0;
+  size_t expectedExtentOffset = 0;
+  size_t expectedStringOffset = 0;
+  if (!profileLogV4FilesystemCheckedMultiply(
+        entryCount, kProfileLogV4FilesystemDeltaDirectoryEntrySize,
+        &entryBytes) ||
+      !profileLogV4FilesystemCheckedMultiply(
+        extentCount, kProfileLogV4FilesystemDeltaExtentSize, &extentBytes) ||
+      !profileLogV4FilesystemCheckedAdd(
+        kProfileLogV4FilesystemDeltaInodeHeaderSize, entryBytes,
+        &expectedExtentOffset) ||
+      !profileLogV4FilesystemCheckedAdd(expectedExtentOffset, extentBytes,
+                                         &expectedStringOffset) ||
+      entryOffset64 != kProfileLogV4FilesystemDeltaInodeHeaderSize ||
+      extentOffset64 != expectedExtentOffset ||
+      expectedStringOffset > size) {
+    return -EIO;
+  }
+  const size_t stringSize = size - expectedStringOffset;
+  ProfileLogV4FilesystemInode inode;
+  inode.id = id;
+  inode.kind = kind;
+  inode.metadata = metadata;
+  inode.size = inodeSize;
+
+  if (kind == ProfileLogV4FilesystemInodeKind::Directory) {
+    if (inodeSize || extentCount || targetOffset || targetSize64) {
+      return -EIO;
+    }
+    size_t stringCursor = 0;
+    std::string previousName;
+    for (size_t index = 0; index != entryCount; ++index) {
+      const size_t offset = kProfileLogV4FilesystemDeltaInodeHeaderSize +
+                            index *
+                              kProfileLogV4FilesystemDeltaDirectoryEntrySize;
+      uint64_t child = 0;
+      uint64_t nameOffset = 0;
+      uint32_t nameSize = 0;
+      uint32_t reserved20 = 0;
+      uint64_t reserved24 = 0;
+      if (!read64(offset, &child) || !read64(offset + 8, &nameOffset) ||
+          !read32(offset + 16, &nameSize) || !read32(offset + 20, &reserved20) ||
+          !read64(offset + 24, &reserved24) || !child || reserved20 ||
+          reserved24 || nameOffset != stringCursor ||
+          nameSize > stringSize - stringCursor) {
+        return -EIO;
+      }
+      std::string name(reinterpret_cast<const char*>(
+                         data + expectedStringOffset + stringCursor),
+                       nameSize);
+      if (!profileLogV4FilesystemValidName(name) ||
+          (index && !(previousName < name)) ||
+          !inode.entries.emplace(name, child).second) {
+        return -EIO;
+      }
+      previousName = std::move(name);
+      stringCursor += nameSize;
+    }
+    if (stringCursor != stringSize) {
+      return -EIO;
+    }
+  } else if (kind == ProfileLogV4FilesystemInodeKind::Regular) {
+    if (entryCount || targetOffset || targetSize64 || stringSize) {
+      return -EIO;
+    }
+    uint64_t previousChunk = 0;
+    for (size_t index = 0; index != extentCount; ++index) {
+      const size_t offset = expectedExtentOffset +
+                            index * kProfileLogV4FilesystemDeltaExtentSize;
+      ProfileLogV4FilesystemExtent extent;
+      uint64_t reserved32 = 0;
+      if (!read64(offset, &extent.chunk) || !read32(offset + 8, &extent.arena) ||
+          !read32(offset + 12, &extent.payloadSize) ||
+          !read64(offset + 16, &extent.offset) ||
+          !read64(offset + 24, &extent.checksum) ||
+          !read64(offset + 32, &reserved32) || reserved32 ||
+          extent.arena >= 2 ||
+          extent.payloadSize != kProfileLogV4FilesystemChunkSize ||
+          !inodeSize ||
+          (index && extent.chunk <= previousChunk) ||
+          extent.chunk >
+            ((inodeSize - 1) >> kProfileLogV4FilesystemChunkShift) ||
+          !inode.extents.emplace(extent.chunk, extent).second) {
+        return -EIO;
+      }
+      previousChunk = extent.chunk;
+    }
+  } else {
+    if (inodeSize || entryCount || extentCount || targetOffset ||
+        targetSize64 != stringSize ||
+        targetSize64 > std::numeric_limits<size_t>::max()) {
+      return -EIO;
+    }
+    inode.target.assign(reinterpret_cast<const char*>(data + expectedStringOffset),
+                        stringSize);
+    if (inode.target.find('\0') != std::string::npos) {
+      return -EIO;
+    }
+  }
+  *result = std::move(inode);
+  return 0;
 }
 
 int ProfileLogV4FilesystemBackend::serializeLogicalStateLocked(
@@ -9121,7 +9632,7 @@ int ProfileLogV4FilesystemBackend::serializeLogicalStateLocked(
             kProfileLogV4FilesystemMagic.end(),
             manifest->begin());
   profileLogV4FilesystemWriteU32(
-    *manifest, 8, kProfileLogV4FilesystemSchema);
+    *manifest, 8, kProfileLogV4FilesystemLogicalSchema1);
   profileLogV4FilesystemWriteU32(
     *manifest, 12, kProfileLogV4FilesystemHeaderSize);
   profileLogV4FilesystemWriteU64(*manifest, 16, generation);
@@ -9205,6 +9716,123 @@ int ProfileLogV4FilesystemBackend::serializeLogicalStateLocked(
   return 0;
 }
 
+int ProfileLogV4FilesystemBackend::serializeLogicalDeltaLocked(
+  const ProfileLogV4FilesystemState& value,
+  uint64_t generation,
+  const ProfileLogV4ManifestReference& parent,
+  const std::vector<uint64_t>& changed,
+  const std::vector<uint64_t>& deleted,
+  std::vector<uint8_t>* manifest) {
+  if (!manifest || !generation || value.generation != generation ||
+      value.root != 1 || value.nextInode <= value.root ||
+      !parent.generation || parent.generation + 1 != generation ||
+      parent.arena >= 2 || parent.arena != (parent.generation & 1) ||
+      !value.deltaDepth ||
+      value.deltaDepth > kProfileLogV4FilesystemCheckpointInterval - 1) {
+    return -EIO;
+  }
+
+  struct OutputOperation {
+    ProfileLogV4FilesystemDeltaOpcode opcode;
+    std::vector<uint8_t> blob;
+  };
+  std::map<uint64_t, OutputOperation> operations;
+  for (uint64_t id : changed) {
+    const auto inode = value.inodes.find(id);
+    if (!id || id >= value.nextInode || inode == value.inodes.end() ||
+        inode->second.id != id ||
+        !operations.emplace(
+          id, OutputOperation{ProfileLogV4FilesystemDeltaOpcode::Set, {}})
+          .second) {
+      return -EIO;
+    }
+    if (int error = profileLogV4FilesystemSerializeDeltaInode(
+          inode->second, &operations.at(id).blob)) {
+      return error;
+    }
+  }
+  for (uint64_t id : deleted) {
+    if (!id || id >= value.nextInode ||
+        value.inodes.find(id) != value.inodes.end() ||
+        !operations.emplace(
+          id, OutputOperation{ProfileLogV4FilesystemDeltaOpcode::Delete, {}})
+          .second) {
+      return -EIO;
+    }
+  }
+  if (operations.empty()) {
+    return -EIO;
+  }
+
+  size_t operationBytes = 0;
+  size_t blobOffset = 0;
+  size_t blobSize = 0;
+  size_t total = 0;
+  if (!profileLogV4FilesystemCheckedMultiply(
+        operations.size(), kProfileLogV4FilesystemDeltaOperationSize,
+        &operationBytes) ||
+      !profileLogV4FilesystemCheckedAdd(
+        kProfileLogV4FilesystemHeaderSize, operationBytes, &blobOffset)) {
+    return -EFBIG;
+  }
+  for (const auto& [_, operation] : operations) {
+    if (operation.blob.size() > kProfileLogV4MaxSafeOffset - blobSize) {
+      return -EFBIG;
+    }
+    blobSize += operation.blob.size();
+  }
+  if (!profileLogV4FilesystemCheckedAdd(blobOffset, blobSize, &total)) {
+    return -EFBIG;
+  }
+
+  manifest->assign(total, 0);
+  std::copy(kProfileLogV4FilesystemDeltaMagic.begin(),
+            kProfileLogV4FilesystemDeltaMagic.end(),
+            manifest->begin());
+  profileLogV4FilesystemWriteU32(
+    *manifest, 8, kProfileLogV4FilesystemLogicalSchema2);
+  profileLogV4FilesystemWriteU32(
+    *manifest, 12, kProfileLogV4FilesystemHeaderSize);
+  profileLogV4FilesystemWriteU64(*manifest, 16, generation);
+  profileLogV4FilesystemWriteU64(*manifest, 24, value.root);
+  profileLogV4FilesystemWriteU64(*manifest, 32, value.nextInode);
+  profileLogV4FilesystemWriteU32(
+    *manifest, 40, kProfileLogV4FilesystemChunkShift);
+  profileLogV4FilesystemWriteU32(*manifest, 44, 0);
+  profileLogV4FilesystemWriteU64(*manifest, 48, parent.generation);
+  profileLogV4FilesystemWriteU32(*manifest, 56, parent.arena);
+  profileLogV4FilesystemWriteU32(*manifest, 60, value.deltaDepth);
+  profileLogV4FilesystemWriteU64(*manifest, 64, parent.manifestOffset);
+  profileLogV4FilesystemWriteU64(*manifest, 72, parent.manifestSize);
+  profileLogV4FilesystemWriteU64(*manifest, 80, parent.manifestRecordChecksum);
+  profileLogV4FilesystemWriteU64(
+    *manifest, 88, kProfileLogV4FilesystemHeaderSize);
+  profileLogV4FilesystemWriteU64(*manifest, 96, operations.size());
+  profileLogV4FilesystemWriteU64(*manifest, 104, blobOffset);
+  profileLogV4FilesystemWriteU64(*manifest, 112, blobSize);
+
+  size_t operationCursor = kProfileLogV4FilesystemHeaderSize;
+  size_t blobCursor = blobOffset;
+  for (const auto& [id, operation] : operations) {
+    profileLogV4FilesystemWriteU64(*manifest, operationCursor, id);
+    profileLogV4FilesystemWriteU32(
+      *manifest, operationCursor + 8,
+      static_cast<uint32_t>(operation.opcode));
+    profileLogV4FilesystemWriteU64(
+      *manifest, operationCursor + 16, blobCursor);
+    profileLogV4FilesystemWriteU64(
+      *manifest, operationCursor + 24, operation.blob.size());
+    if (!operation.blob.empty()) {
+      memcpy(manifest->data() + blobCursor,
+             operation.blob.data(),
+             operation.blob.size());
+      blobCursor += operation.blob.size();
+    }
+    operationCursor += kProfileLogV4FilesystemDeltaOperationSize;
+  }
+  return 0;
+}
+
 int ProfileLogV4FilesystemBackend::parseLogicalStateLocked(
   const std::vector<uint8_t>& manifest,
   uint64_t generation,
@@ -9248,7 +9876,8 @@ int ProfileLogV4FilesystemBackend::parseLogicalStateLocked(
       !read64(72, &directoryCount64) || !read64(80, &extentOffset) ||
       !read64(88, &extentCount64) || !read64(96, &stringOffset64) ||
       !read64(104, &stringSize64) || !read64(112, &reserved112) ||
-      !read64(120, &reserved120) || schema != kProfileLogV4FilesystemSchema ||
+      !read64(120, &reserved120) ||
+      schema != kProfileLogV4FilesystemLogicalSchema1 ||
       headerSize != kProfileLogV4FilesystemHeaderSize ||
       encodedGeneration != generation || !generation || root != 1 ||
       !nextInode || chunkShift != kProfileLogV4FilesystemChunkShift || flags ||
@@ -9567,10 +10196,157 @@ int ProfileLogV4FilesystemBackend::parseLogicalStateLocked(
       }
     }
   }
-  if (int error = validateLogicalStateLocked(value, generation, true)) {
+  // A Schema-1 payload can be an ancestor of a selected Schema-2 delta.
+  // Its structural namespace is checked here; the loader later validates
+  // each reachable snapshot's extents against that snapshot's generation
+  // while retaining the selected descriptor's high-water bounds.
+  if (int error = validateLogicalStateLocked(value, generation, false)) {
     return error;
   }
   *result = std::move(value);
+  return 0;
+}
+
+int ProfileLogV4FilesystemBackend::parseLogicalDeltaLocked(
+  const std::vector<uint8_t>& manifest,
+  uint64_t generation,
+  ProfileLogV4FilesystemDelta* result) {
+  if (!result || manifest.size() < kProfileLogV4FilesystemHeaderSize ||
+      !std::equal(kProfileLogV4FilesystemDeltaMagic.begin(),
+                  kProfileLogV4FilesystemDeltaMagic.end(),
+                  manifest.begin())) {
+    return -EIO;
+  }
+  const auto read32 = [&](size_t offset, uint32_t* value) {
+    return profileLogV4FilesystemReadU32(
+      manifest.data(), manifest.size(), offset, value);
+  };
+  const auto read64 = [&](size_t offset, uint64_t* value) {
+    return profileLogV4FilesystemReadU64(
+      manifest.data(), manifest.size(), offset, value);
+  };
+  uint32_t schema = 0;
+  uint32_t headerSize = 0;
+  uint64_t encodedGeneration = 0;
+  uint64_t root = 0;
+  uint64_t nextInode = 0;
+  uint32_t chunkShift = 0;
+  uint32_t flags = 0;
+  uint64_t parentGeneration = 0;
+  uint32_t parentArena = 0;
+  uint32_t depth = 0;
+  uint64_t parentManifestOffset = 0;
+  uint64_t parentManifestSize = 0;
+  uint64_t parentManifestRecordChecksum = 0;
+  uint64_t operationOffset = 0;
+  uint64_t operationCount64 = 0;
+  uint64_t blobOffset64 = 0;
+  uint64_t blobSize64 = 0;
+  uint64_t reserved120 = 0;
+  if (!read32(8, &schema) || !read32(12, &headerSize) ||
+      !read64(16, &encodedGeneration) || !read64(24, &root) ||
+      !read64(32, &nextInode) || !read32(40, &chunkShift) ||
+      !read32(44, &flags) || !read64(48, &parentGeneration) ||
+      !read32(56, &parentArena) || !read32(60, &depth) ||
+      !read64(64, &parentManifestOffset) ||
+      !read64(72, &parentManifestSize) ||
+      !read64(80, &parentManifestRecordChecksum) ||
+      !read64(88, &operationOffset) || !read64(96, &operationCount64) ||
+      !read64(104, &blobOffset64) || !read64(112, &blobSize64) ||
+      !read64(120, &reserved120) ||
+      schema != kProfileLogV4FilesystemLogicalSchema2 ||
+      headerSize != kProfileLogV4FilesystemHeaderSize ||
+      encodedGeneration != generation || !generation || root != 1 ||
+      nextInode <= root ||
+      chunkShift != kProfileLogV4FilesystemChunkShift || flags ||
+      !parentGeneration || parentGeneration + 1 != generation ||
+      parentArena >= 2 || parentArena != (parentGeneration & 1) || !depth ||
+      depth > kProfileLogV4FilesystemCheckpointInterval - 1 ||
+      parentManifestOffset >
+        kProfileLogV4MaxSafeOffset - kProfileLogV4ManifestHeaderSize ||
+      parentManifestSize > kProfileLogV4MaxSafeOffset -
+        parentManifestOffset - kProfileLogV4ManifestHeaderSize ||
+      reserved120 || !operationCount64 ||
+      operationCount64 > std::numeric_limits<size_t>::max()) {
+    return -EIO;
+  }
+  const size_t operationCount = static_cast<size_t>(operationCount64);
+  size_t operationBytes = 0;
+  size_t expectedBlobOffset = 0;
+  if (!profileLogV4FilesystemCheckedMultiply(
+        operationCount, kProfileLogV4FilesystemDeltaOperationSize,
+        &operationBytes) ||
+      !profileLogV4FilesystemCheckedAdd(
+        kProfileLogV4FilesystemHeaderSize, operationBytes,
+        &expectedBlobOffset) ||
+      operationOffset != kProfileLogV4FilesystemHeaderSize ||
+      blobOffset64 != expectedBlobOffset ||
+      expectedBlobOffset > manifest.size() ||
+      blobSize64 != manifest.size() - expectedBlobOffset) {
+    return -EIO;
+  }
+
+  ProfileLogV4FilesystemDelta delta;
+  delta.generation = generation;
+  delta.root = root;
+  delta.nextInode = nextInode;
+  delta.depth = depth;
+  delta.parent = {parentGeneration,
+                  parentArena,
+                  parentManifestOffset,
+                  parentManifestSize,
+                  parentManifestRecordChecksum};
+  size_t blobCursor = expectedBlobOffset;
+  uint64_t previousInode = 0;
+  for (size_t index = 0; index != operationCount; ++index) {
+    const size_t offset = kProfileLogV4FilesystemHeaderSize +
+                          index * kProfileLogV4FilesystemDeltaOperationSize;
+    uint64_t inode = 0;
+    uint32_t opcodeRaw = 0;
+    uint32_t reserved12 = 0;
+    uint64_t blobOffset = 0;
+    uint64_t blobSize = 0;
+    if (!read64(offset, &inode) || !read32(offset + 8, &opcodeRaw) ||
+        !read32(offset + 12, &reserved12) || !read64(offset + 16, &blobOffset) ||
+        !read64(offset + 24, &blobSize) || !inode ||
+        inode <= previousInode || reserved12 || blobOffset != blobCursor) {
+      return -EIO;
+    }
+    ProfileLogV4FilesystemDeltaOperation operation;
+    operation.inode = inode;
+    switch (opcodeRaw) {
+      case static_cast<uint32_t>(ProfileLogV4FilesystemDeltaOpcode::Set): {
+        if (blobSize < kProfileLogV4FilesystemDeltaInodeHeaderSize ||
+            blobSize > manifest.size() - blobCursor) {
+          return -EIO;
+        }
+        operation.opcode = ProfileLogV4FilesystemDeltaOpcode::Set;
+        if (int error = profileLogV4FilesystemParseDeltaInode(
+              manifest.data() + blobCursor,
+              static_cast<size_t>(blobSize),
+              inode,
+              &operation.value)) {
+          return error;
+        }
+        blobCursor += static_cast<size_t>(blobSize);
+        break;
+      }
+      case static_cast<uint32_t>(ProfileLogV4FilesystemDeltaOpcode::Delete):
+        if (blobSize) {
+          return -EIO;
+        }
+        operation.opcode = ProfileLogV4FilesystemDeltaOpcode::Delete;
+        break;
+      default:
+        return -EIO;
+    }
+    delta.operations.push_back(std::move(operation));
+    previousInode = inode;
+  }
+  if (blobCursor != manifest.size()) {
+    return -EIO;
+  }
+  *result = std::move(delta);
   return 0;
 }
 
@@ -9578,15 +10354,22 @@ int ProfileLogV4FilesystemBackend::readExtentLocked(
   const ProfileLogV4FilesystemExtent& extent,
   uint64_t inode,
   uint64_t chunk,
-  uint64_t generation,
+  uint64_t selectedGeneration,
   std::vector<uint8_t>* bytes,
-  bool selectedAlreadyValidated) {
+  bool selectedAlreadyValidated,
+  uint64_t maxRecordGeneration) {
   if (!bytes || !inode || extent.arena >= 2 ||
       extent.payloadSize != kProfileLogV4FilesystemChunkSize ||
       extent.offset > kProfileLogV4MaxSafeOffset -
                         kProfileLogV4FilesystemDataHeaderSize ||
       extent.payloadSize > kProfileLogV4MaxSafeOffset - extent.offset -
                              kProfileLogV4FilesystemDataHeaderSize) {
+    return -EIO;
+  }
+  if (!maxRecordGeneration) {
+    maxRecordGeneration = selectedGeneration;
+  }
+  if (!selectedGeneration || !maxRecordGeneration) {
     return -EIO;
   }
   std::array<uint8_t, kProfileLogV4FilesystemDataHeaderSize> header;
@@ -9597,12 +10380,25 @@ int ProfileLogV4FilesystemBackend::readExtentLocked(
     return selectedAlreadyValidated
              ? readSelectedBytesDuringValidatedTransaction(
                  arena, offset, destination, size)
-             : readSelectedBytes(arena, offset, destination, size);
+             : readSelectedBytesFromValidatedSnapshot(
+                 selectedGeneration, arena, offset, destination, size);
   };
   if (int error = readSelected(
         extent.arena, extent.offset, header.data(), header.size())) {
     return error;
   }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION
+  // The selected outer descriptor still authenticates this byte range.  For
+  // the chronology test, alter only the stack-local historical data header
+  // into a syntactically valid record from the selected future generation.
+  // A normal mount can then prove that no OPFS byte or selected descriptor
+  // was changed by the failed replay.
+  if (!selectedAlreadyValidated && maxRecordGeneration < selectedGeneration) {
+    writeProfileLogV4U64(header, 16, selectedGeneration);
+    writeProfileLogV4U64(
+      header, 56, profileLogV4ChecksumWithZeroedRange(header, 56, 8));
+  }
+#endif
   uint64_t recordGeneration = 0;
   uint64_t recordInode = 0;
   uint64_t recordChunk = 0;
@@ -9614,7 +10410,7 @@ int ProfileLogV4FilesystemBackend::readExtentLocked(
                                               &recordChunk,
                                               &payloadSize,
                                               &payloadChecksum) ||
-      recordGeneration > generation ||
+      recordGeneration > maxRecordGeneration ||
       static_cast<uint32_t>(recordGeneration & 1) != extent.arena ||
       recordInode != inode || recordChunk != chunk ||
       payloadSize != extent.payloadSize || payloadChecksum != extent.checksum) {
@@ -9723,12 +10519,19 @@ int ProfileLogV4FilesystemBackend::copyLiveCheckpointExtentsLocked(
 int ProfileLogV4FilesystemBackend::validateLogicalStateLocked(
   const ProfileLogV4FilesystemState& value,
   uint64_t generation,
-  bool validateExtents) {
+  bool validateExtents,
+  uint64_t selectedGeneration) {
   if (!generation || value.generation != generation || value.root != 1 ||
       value.nextInode <= value.root || value.inodes.empty() ||
       value.inodes.find(value.root) == value.inodes.end() ||
       value.inodes.at(value.root).kind !=
         ProfileLogV4FilesystemInodeKind::Directory) {
+    return -EIO;
+  }
+  if (!selectedGeneration) {
+    selectedGeneration = generation;
+  }
+  if (!selectedGeneration || selectedGeneration < generation) {
     return -EIO;
   }
   std::map<uint64_t, size_t> parents;
@@ -9770,7 +10573,13 @@ int ProfileLogV4FilesystemBackend::validateLogicalStateLocked(
         }
         if (validateExtents) {
           std::vector<uint8_t> bytes;
-          if (int error = readExtentLocked(extent, id, chunk, generation, &bytes)) {
+          if (int error = readExtentLocked(extent,
+                                           id,
+                                           chunk,
+                                           selectedGeneration,
+                                           &bytes,
+                                           false,
+                                           generation)) {
             return error;
           }
         }
@@ -9860,9 +10669,98 @@ int ProfileLogV4FilesystemBackend::loadLogicalStateLocked() {
   if (size != manifest.size() || payloadGeneration != generation) {
     return -EIO;
   }
+  std::vector<ProfileLogV4FilesystemDelta> deltas;
+  std::vector<uint8_t> current = std::move(manifest);
+  uint64_t currentGeneration = generation;
+  std::optional<uint32_t> expectedParentDepth;
   ProfileLogV4FilesystemState loaded;
-  if (int error = parseLogicalStateLocked(manifest, generation, &loaded)) {
-    return error;
+  for (;;) {
+    if (current.size() >= kProfileLogV4FilesystemMagic.size() &&
+        std::equal(kProfileLogV4FilesystemMagic.begin(),
+                   kProfileLogV4FilesystemMagic.end(), current.begin())) {
+      if (int error = parseLogicalStateLocked(
+            current, currentGeneration, &loaded)) {
+        return error;
+      }
+      break;
+    }
+    if (current.size() < kProfileLogV4FilesystemDeltaMagic.size() ||
+        !std::equal(kProfileLogV4FilesystemDeltaMagic.begin(),
+                    kProfileLogV4FilesystemDeltaMagic.end(),
+                    current.begin())) {
+      return -EIO;
+    }
+    ProfileLogV4FilesystemDelta delta;
+    if (int error = parseLogicalDeltaLocked(
+          current, currentGeneration, &delta)) {
+      return error;
+    }
+    if ((expectedParentDepth && delta.depth != *expectedParentDepth) ||
+        delta.depth > kProfileLogV4FilesystemCheckpointInterval - 1 ||
+        deltas.size() >= kProfileLogV4FilesystemCheckpointInterval - 1) {
+      return -EIO;
+    }
+    expectedParentDepth = delta.depth - 1;
+    deltas.push_back(std::move(delta));
+    const auto& parent = deltas.back().parent;
+    if (int error = readSelectedHistoricalManifest(parent, &current)) {
+      return error;
+    }
+    currentGeneration = parent.generation;
+  }
+  if ((expectedParentDepth && *expectedParentDepth != 0) ||
+      (!deltas.empty() && deltas.front().depth != deltas.size())) {
+    return -EIO;
+  }
+  // A historical checkpoint is still an authenticated filesystem state in
+  // its own right.  Validate its data records before a later delta can
+  // replace or delete a bad extent and hide corruption in its ancestor.
+  // The selected descriptor admits the byte ranges; currentGeneration sets
+  // the upper bound for immutable data-record generations in this snapshot.
+  if (!deltas.empty()) {
+    if (int error = validateLogicalStateLocked(
+          loaded, currentGeneration, true, generation)) {
+      return error;
+    }
+  }
+  loaded.deltaDepth = 0;
+  for (auto delta = deltas.rbegin(); delta != deltas.rend(); ++delta) {
+    if (delta->parent.generation != loaded.generation ||
+        delta->depth != loaded.deltaDepth + 1 ||
+        delta->root != loaded.root ||
+        delta->nextInode < loaded.nextInode) {
+      return -EIO;
+    }
+    for (const auto& operation : delta->operations) {
+      if (operation.opcode == ProfileLogV4FilesystemDeltaOpcode::Set) {
+        loaded.inodes[operation.inode] = operation.value;
+      } else if (operation.opcode == ProfileLogV4FilesystemDeltaOpcode::Delete) {
+        if (loaded.inodes.erase(operation.inode) != 1) {
+          return -EIO;
+        }
+      } else {
+        return -EIO;
+      }
+    }
+    loaded.generation = delta->generation;
+    loaded.nextInode = delta->nextInode;
+    loaded.deltaDepth = delta->depth;
+    // Every ancestor was once a selected filesystem state. Reject a chain
+    // that reaches a valid final tree only by passing through an invalid
+    // intermediate namespace or extent, rather than accepting it merely
+    // because a later delta happens to repair the damage.  The selected
+    // descriptor admits the historical bytes, while this state generation
+    // prevents a future data record from validating an older snapshot.
+    if (int error = validateLogicalStateLocked(
+          loaded, delta->generation, true, generation)) {
+      return error;
+    }
+  }
+  if (loaded.generation != generation ||
+      (deltas.empty() && loaded.deltaDepth) ||
+      (!deltas.empty() && loaded.deltaDepth != deltas.front().depth) ||
+      validateLogicalStateLocked(loaded, generation, true)) {
+    return -EIO;
   }
   state = std::move(loaded);
   logicalStateLoaded = true;
@@ -9873,8 +10771,21 @@ int ProfileLogV4FilesystemBackend::flushLocked() {
   if (int error = validateCurrentStateLocked()) {
     return error;
   }
+  // A drain is a durability boundary, not a hot path. Reauthenticate the
+  // complete selected payload before releasing the profile lease.
+  size_t manifestSize = 0;
+  uint64_t manifestGeneration = 0;
+  if (int error = readManifest(
+        nullptr, 0, &manifestSize, &manifestGeneration)) {
+    return poisonFilesystemLocked(error);
+  }
+  if (manifestGeneration != state.generation ||
+      ((manifestGeneration == 1) != (manifestSize == 0))) {
+    return poisonFilesystemLocked(-EIO);
+  }
   if (!state.root) {
-    return 0;
+    return state.nextInode == 1 && state.inodes.empty() ? 0
+                                                         : poisonFilesystemLocked(-EIO);
   }
   if (int error = validateLogicalStateLocked(
         state, state.generation, true)) {
@@ -9901,37 +10812,42 @@ int ProfileLogV4FilesystemBackend::commitMetadataLocked(
       !profileLogV4FilesystemValidMetadata(metadata, found->second.kind)) {
     return -ENOENT;
   }
-  auto next = state;
-  next.inodes.at(id).metadata = metadata;
-  return commitLogicalStateLocked(std::move(next), {});
+  found->second.metadata = metadata;
+  return commitLogicalStateLocked({id}, {}, {});
 }
 
 int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
-  ProfileLogV4FilesystemState value,
+  const std::vector<uint64_t>& changed,
+  const std::vector<uint64_t>& deleted,
   std::vector<PendingChunk> pending,
-  bool allowCheckpoint) {
-  if (int error = validateCurrentStateLocked()) {
-    return error;
+  bool allowReclamation,
+  bool forceCheckpoint) {
+  if (!state.generation ||
+      state.generation == std::numeric_limits<uint64_t>::max()) {
+    return poisonFilesystemLocked(-EIO);
   }
   // An unlinked-but-open inode is intentionally absent from |state|. Do not
   // retire either arena while such a live descriptor could still read an old
-  // extent; reapOrphansLocked() will make a later checkpoint eligible. A
-  // namespace mutation that will add a new orphan after this commit likewise
-  // passes |allowCheckpoint| false, so the post-image cannot make its live
-  // descriptor's old extent unreachable before the orphan is installed.
-  const bool checkpoint = allowCheckpoint && orphans.empty() &&
-                          state.generation %
-                              kProfileLogV4FilesystemCheckpointInterval ==
-                            kProfileLogV4FilesystemCheckpointInterval - 1;
+  // extent. A scheduled or depth-forced checkpoint must still be written as
+  // a parent-free Schema-1 snapshot in that case; only physical retirement is
+  // deferred until there are no old open descriptors.
+  const uint64_t nextGeneration = state.generation + 1;
+  const bool checkpoint =
+    forceCheckpoint ||
+    state.deltaDepth >= kProfileLogV4FilesystemCheckpointInterval - 1 ||
+    nextGeneration % kProfileLogV4FilesystemCheckpointInterval == 0;
+  const bool reclaim = checkpoint && allowReclamation && orphans.empty();
   std::set<std::pair<uint64_t, uint64_t>> writtenChunks;
   const int result = commitTransaction(
     [&](Transaction& transaction, std::vector<uint8_t>* manifest) {
-      value.generation = transaction.generation();
-      if (checkpoint) {
+      if (transaction.generation() != nextGeneration) {
+        return -EIO;
+      }
+      if (reclaim) {
         // Copy durable extents first. Pending writes below are new records in
         // the target arena and cannot be read through the old selected
         // descriptor until this transaction's witness quorum is complete.
-        if (int error = copyLiveCheckpointExtentsLocked(&value, transaction)) {
+        if (int error = copyLiveCheckpointExtentsLocked(&state, transaction)) {
           return error;
         }
       }
@@ -9941,9 +10857,10 @@ int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
             !writtenChunks.emplace(pendingChunk.inode, pendingChunk.chunk).second) {
           return -EIO;
         }
-        auto inode = value.inodes.find(pendingChunk.inode);
-        if (inode == value.inodes.end() ||
+        auto inode = state.inodes.find(pendingChunk.inode);
+        if (inode == state.inodes.end() ||
             inode->second.kind != ProfileLogV4FilesystemInodeKind::Regular ||
+            !inode->second.size ||
             pendingChunk.chunk >
               ((inode->second.size - 1) >> kProfileLogV4FilesystemChunkShift)) {
           return -EIO;
@@ -9959,6 +10876,8 @@ int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
         }
         inode->second.extents[pendingChunk.chunk] = written;
       }
+      state.generation = transaction.generation();
+      state.deltaDepth = checkpoint ? 0 : state.deltaDepth + 1;
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST
       // Controlled selected-record fault for the reload guard below. It
       // publishes an otherwise valid outer g=2 envelope with an empty logical
@@ -9969,7 +10888,12 @@ int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
       }
 #endif
       if (checkpoint) {
-        for (const auto& [_, inode] : value.inodes) {
+        if (int error = validateLogicalStateLocked(
+              state, transaction.generation(), false)) {
+          return error;
+        }
+        if (reclaim) {
+          for (const auto& [_, inode] : state.inodes) {
           if (inode.kind != ProfileLogV4FilesystemInodeKind::Regular) {
             continue;
           }
@@ -9979,18 +10903,24 @@ int ProfileLogV4FilesystemBackend::commitLogicalStateLocked(
             }
           }
         }
-        if (int error = transaction.discardInactiveArenaAfterPublish()) {
-          return error;
+          if (int error = transaction.discardInactiveArenaAfterPublish()) {
+            return error;
+          }
         }
+        return serializeLogicalStateLocked(
+          state, transaction.generation(), manifest);
       }
-      return serializeLogicalStateLocked(
-        value, transaction.generation(), manifest);
+      return serializeLogicalDeltaLocked(state,
+                                         transaction.generation(),
+                                         transaction.parentReference(),
+                                         changed,
+                                         deleted,
+                                         manifest);
     });
   if (result) {
     return poisonFilesystemLocked(result);
   }
-  state = std::move(value);
-  if (checkpoint) {
+  if (reclaim) {
     // commitTransaction() has already published the self-contained outer
     // descriptor. Keep the in-memory tree synchronized with that selected
     // generation before attempting post-quorum physical cleanup; a cleanup
@@ -10071,12 +11001,12 @@ ssize_t ProfileLogV4FilesystemBackend::writeFileLocked(
       !profileLogV4FilesystemValidMetadata(metadata, found->second.kind)) {
     return -ENOENT;
   }
-  auto next = state;
   std::vector<PendingChunk> pending;
-  if (int error = writeChunks(next.inodes.at(id), &pending, true)) {
+  if (int error = writeChunks(state.inodes.at(id), &pending, true)) {
     return poisonFilesystemLocked(error);
   }
-  if (int error = commitLogicalStateLocked(std::move(next), std::move(pending))) {
+  if (int error = commitLogicalStateLocked(
+        {id}, {}, std::move(pending))) {
     return error;
   }
   return static_cast<ssize_t>(length);
@@ -10153,12 +11083,11 @@ int ProfileLogV4FilesystemBackend::resizeFileLocked(
   if (state.inodes.find(id) == state.inodes.end()) {
     return -ENOENT;
   }
-  auto next = state;
   std::vector<PendingChunk> pending;
-  if (int error = resize(next.inodes.at(id), &pending, true)) {
+  if (int error = resize(state.inodes.at(id), &pending, true)) {
     return poisonFilesystemLocked(error);
   }
-  return commitLogicalStateLocked(std::move(next), std::move(pending));
+  return commitLogicalStateLocked({id}, {}, std::move(pending));
 }
 
 int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
@@ -10242,19 +11171,19 @@ int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
       if (!profileLogV4FilesystemValidMetadata(*mutation.subjectPostImage, kind)) {
         return -EIO;
       }
-      auto next = state;
-      const uint64_t newID = next.nextInode++;
+      const uint64_t newID = state.nextInode++;
       ProfileLogV4FilesystemInode inode;
       inode.id = newID;
       inode.kind = kind;
       inode.metadata = *mutation.subjectPostImage;
       inode.target = std::move(target);
-      next.inodes.emplace(newID, std::move(inode));
-      next.inodes.at(destinationID).entries.emplace(mutation.destinationName,
-                                                     newID);
-      next.inodes.at(destinationID).metadata =
+      state.inodes.emplace(newID, std::move(inode));
+      state.inodes.at(destinationID).entries.emplace(mutation.destinationName,
+                                                      newID);
+      state.inodes.at(destinationID).metadata =
         *mutation.destinationParentPostImage;
-      if (int error = commitLogicalStateLocked(std::move(next), {})) {
+      if (int error = commitLogicalStateLocked(
+            {destinationID, newID}, {}, {})) {
         return error;
       }
       if (kind == ProfileLogV4FilesystemInodeKind::Regular) {
@@ -10298,11 +11227,11 @@ int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
       }
       auto removed = subject;
       removed.metadata = *mutation.subjectPostImage;
-      auto next = state;
-      next.inodes.at(sourceID).entries.erase(mutation.sourceName);
-      next.inodes.at(sourceID).metadata = *mutation.sourceParentPostImage;
-      next.inodes.erase(subjectID);
-      if (int error = commitLogicalStateLocked(std::move(next), {}, false)) {
+      state.inodes.at(sourceID).entries.erase(mutation.sourceName);
+      state.inodes.at(sourceID).metadata = *mutation.sourceParentPostImage;
+      state.inodes.erase(subjectID);
+      if (int error = commitLogicalStateLocked(
+            {sourceID}, {subjectID}, {}, false)) {
         return error;
       }
       orphans.emplace(subjectID, std::move(removed));
@@ -10337,6 +11266,40 @@ int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
                            ProfileLogV4FilesystemInodeKind::Directory))) {
         return -EIO;
       }
+      // A full Schema-1 serializer used to catch this through a global graph
+      // walk. Normal Schema-2 commits intentionally avoid that O(namespace)
+      // pass, so preserve the one affected invariant locally before moving a
+      // directory beneath one of its own descendants.
+      if (subject.kind == ProfileLogV4FilesystemInodeKind::Directory) {
+        std::vector<uint64_t> pendingDirectories = {subjectID};
+        std::set<uint64_t> visitedDirectories;
+        while (!pendingDirectories.empty()) {
+          const uint64_t current = pendingDirectories.back();
+          pendingDirectories.pop_back();
+          if (!visitedDirectories.emplace(current).second) {
+            return -EIO;
+          }
+          if (current == destinationID) {
+            return -EIO;
+          }
+          const auto currentInode = state.inodes.find(current);
+          if (currentInode == state.inodes.end() ||
+              currentInode->second.kind !=
+                ProfileLogV4FilesystemInodeKind::Directory) {
+            return -EIO;
+          }
+          for (const auto& [_, child] : currentInode->second.entries) {
+            const auto childInode = state.inodes.find(child);
+            if (childInode == state.inodes.end()) {
+              return -EIO;
+            }
+            if (childInode->second.kind ==
+                ProfileLogV4FilesystemInodeKind::Directory) {
+              pendingDirectories.push_back(child);
+            }
+          }
+        }
+      }
       const auto destinationEntry = destination.entries.find(mutation.destinationName);
       uint64_t removedID = 0;
       std::optional<ProfileLogV4FilesystemInode> removed;
@@ -10358,22 +11321,25 @@ int ProfileLogV4FilesystemBackend::commitNamespaceMutationLocked(
       } else if (mutation.replacement || replacementID) {
         return -EIO;
       }
-      auto next = state;
-      next.inodes.at(sourceID).entries.erase(mutation.sourceName);
-      next.inodes.at(destinationID).entries.erase(mutation.destinationName);
-      next.inodes.at(destinationID).entries.emplace(mutation.destinationName,
-                                                     subjectID);
-      next.inodes.at(sourceID).metadata = *mutation.sourceParentPostImage;
+      state.inodes.at(sourceID).entries.erase(mutation.sourceName);
+      state.inodes.at(destinationID).entries.erase(mutation.destinationName);
+      state.inodes.at(destinationID).entries.emplace(mutation.destinationName,
+                                                      subjectID);
+      state.inodes.at(sourceID).metadata = *mutation.sourceParentPostImage;
       if (sourceID != destinationID) {
-        next.inodes.at(destinationID).metadata =
+        state.inodes.at(destinationID).metadata =
           *mutation.destinationParentPostImage;
       }
-      next.inodes.at(subjectID).metadata = *mutation.subjectPostImage;
+      state.inodes.at(subjectID).metadata = *mutation.subjectPostImage;
       if (removedID) {
-        next.inodes.erase(removedID);
+        state.inodes.erase(removedID);
       }
+      std::vector<uint64_t> changed = {sourceID, destinationID, subjectID};
+      std::sort(changed.begin(), changed.end());
+      changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
       if (int error = commitLogicalStateLocked(
-            std::move(next), {}, !removedID)) {
+            changed, removedID ? std::vector<uint64_t>{removedID}
+                               : std::vector<uint64_t>{}, {}, !removedID)) {
         return error;
       }
       if (removedID) {

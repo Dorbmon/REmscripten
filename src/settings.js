@@ -1940,6 +1940,20 @@ var WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION = 0;
 
+// Test-only selector that corrupts a native read buffer containing a
+// Schema-2 historical-parent outer-manifest header during mount/replay. It
+// never writes OPFS or exposes a host JavaScript route, so a following normal
+// mount can prove that the selected root was left intact.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION = 0;
+
+// Test-only selector that rewrites the generation in a native read buffer for
+// a historical Schema-2 ancestor data record during mount/replay. It never
+// writes OPFS or exposes a host JavaScript route, so a following normal mount
+// can prove that the selected root was left intact.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION = 0;
+
 // Test-only selector that publishes a selected outer V4 generation 2 with an
 // empty logical filesystem payload after root creation. It proves reload
 // rejects a corrupt post-root empty manifest instead of replacing the root.

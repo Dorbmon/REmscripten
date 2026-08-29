@@ -2054,6 +2054,10 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
         'opfs_profile_log_v4_test_selected_corruption')
     self.opfs_profile_log_v4_test_live_corruption = kwargs.pop(
         'opfs_profile_log_v4_test_live_corruption')
+    self.opfs_profile_log_v4_test_historical_parent_corruption = kwargs.pop(
+        'opfs_profile_log_v4_test_historical_parent_corruption')
+    self.opfs_profile_log_v4_test_historical_extent_corruption = kwargs.pop(
+        'opfs_profile_log_v4_test_historical_extent_corruption')
     self.opfs_profile_log_v4_test_empty_post_root_manifest = kwargs.pop(
         'opfs_profile_log_v4_test_empty_post_root_manifest')
     self.opfs_profile_log_v4_test_checkpoint_interval = kwargs.pop(
@@ -2109,6 +2113,12 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     if self.opfs_profile_log_v4_test_live_corruption:
       cflags += ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION=' +
                  str(self.opfs_profile_log_v4_test_live_corruption)]
+    if self.opfs_profile_log_v4_test_historical_parent_corruption:
+      cflags += [
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION=1']
+    if self.opfs_profile_log_v4_test_historical_extent_corruption:
+      cflags += [
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION=1']
     if self.opfs_profile_log_v4_test_empty_post_root_manifest:
       cflags += ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST=1']
     if self.opfs_profile_log_v4_test_checkpoint_interval:
@@ -2162,6 +2172,10 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     if self.opfs_profile_log_v4_test_live_corruption:
       name += '-opfs-profile-log-v4-live-corruption-' + str(
           self.opfs_profile_log_v4_test_live_corruption)
+    if self.opfs_profile_log_v4_test_historical_parent_corruption:
+      name += '-opfs-profile-log-v4-historical-parent-corruption'
+    if self.opfs_profile_log_v4_test_historical_extent_corruption:
+      name += '-opfs-profile-log-v4-historical-extent-corruption'
     if self.opfs_profile_log_v4_test_empty_post_root_manifest:
       name += '-opfs-profile-log-v4-empty-post-root-manifest'
     if self.opfs_profile_log_v4_test_checkpoint_interval:
@@ -2190,6 +2204,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       'opfs_profile_log_v4_test_interrupt',
       'opfs_profile_log_v4_test_selected_corruption',
       'opfs_profile_log_v4_test_live_corruption',
+      'opfs_profile_log_v4_test_historical_parent_corruption',
+      'opfs_profile_log_v4_test_historical_extent_corruption',
       'opfs_profile_log_v4_test_empty_post_root_manifest',
       'opfs_profile_log_v4_test_checkpoint_interval',
       'opfs_get_child_proxy_failure_test',
@@ -2225,6 +2241,10 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION),
         opfs_profile_log_v4_test_live_corruption=(
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION),
+        opfs_profile_log_v4_test_historical_parent_corruption=bool(
+            settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION),
+        opfs_profile_log_v4_test_historical_extent_corruption=bool(
+            settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION),
         opfs_profile_log_v4_test_empty_post_root_manifest=bool(
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_EMPTY_POST_ROOT_MANIFEST),
         opfs_profile_log_v4_test_checkpoint_interval=(
