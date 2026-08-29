@@ -27,6 +27,11 @@ struct wasmfs_opfs_profile_drain_result;
 
 namespace wasmfs {
 
+enum class OPFSProfileDrainDisposition {
+  kReleaseLeaseAfterCleanDrain,
+  kRetainLeaseAfterFailedHandoff,
+};
+
 class WasmFS {
 public:
   class Operation;
@@ -146,9 +151,11 @@ public:
   // See wasmfs_terminal_drain().
   int terminalDrain(wasmfs_terminal_drain_result* result);
 
-  // See wasmfs_drain_opfs_profile_backend().
+  // See wasmfs_drain_opfs_profile_backend() and
+  // wasmfs_fail_closed_opfs_profile_backend().
   int drainOPFSProfileBackend(backend_t backend,
-                              wasmfs_opfs_profile_drain_result* result);
+                              wasmfs_opfs_profile_drain_result* result,
+                              OPFSProfileDrainDisposition disposition);
 
   // Admit a backend reached by an active public WasmFS operation. Path and fd
   // helpers call this before inspecting backend-owned metadata or forwarding

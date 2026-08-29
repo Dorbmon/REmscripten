@@ -8570,6 +8570,225 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_fail_closed_retirement(self):
+    # A higher-level profile owner can reject its own close/fence result after
+    # all WasmFS writes succeeded. The explicit failure-retirement ABI must
+    # close V4's private physical OPFS files without releasing the Web Lock,
+    # survive the holder's actual EXIT_RUNTIME destruction, then allow a fresh
+    # document to recover the already-synced marker and drain normally.
+    test = 'wasmfs/wasmfs_opfs_profile_fail_closed_retirement.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = ('wasmfs_profile_fail_closed_retirement_%016x' %
+               random.getrandbits(64))
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_FAIL_CLOSED_RETIREMENT_TEST_PROFILE_NAME=' +
+      profile)
+
+    create_file('profile-fail-closed-holder-pre.js', r'''
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-profile-fail-closed-retirement',
+          },
+          window.location.origin);
+      };
+      Module['onAbort'] = (reason) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-abort',
+            reason: String(reason),
+            type: 'wasmfs-opfs-profile-fail-closed-retirement',
+          },
+          window.location.origin);
+      };
+    ''')
+
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_FAIL_CLOSED_RETIREMENT_TEST_HOLDER',
+        '-sEXIT_RUNTIME',
+        '--pre-js',
+        'profile-fail-closed-holder-pre.js',
+        '-o',
+        'profile-fail-closed-holder.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_FAIL_CLOSED_RETIREMENT_TEST_CONTENDER',
+        '-o',
+        'profile-fail-closed-contender.html',
+      ],
+      reporting=Reporting.NONE)
+    self.compile_btest(
+      test,
+      common_args + [
+        profile_arg,
+        '-DWASMFS_OPFS_PROFILE_FAIL_CLOSED_RETIREMENT_TEST_VERIFIER',
+        '-o',
+        'profile-fail-closed-verifier.html',
+      ],
+      reporting=Reporting.NONE)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kHolder = 0;
+        const kContender = 1;
+        const kVerifier = 2;
+        const kReady = 0;
+        const kBusy = 1;
+        const kWitnessType = 'wasmfs-opfs-profile-fail-closed-retirement';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pendingModules = new Map();
+        const pendingHolderExits = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kEventTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, reject, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for holder exit'));
+            }, kEventTimeoutMs);
+            pendingHolderExits.set(frame.contentWindow, {resolve, reject, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          if (event.data.event === 'holder-exit') {
+            const pending = pendingHolderExits.get(event.source);
+            if (!pending) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pending.timeout);
+            if (event.data.status !== 0) {
+              pending.reject(new Error('holder exited with status ' +
+                                       event.data.status));
+            } else {
+              pending.resolve();
+            }
+            return;
+          }
+          const pendingExit = pendingHolderExits.get(event.source);
+          if (event.data.event === 'holder-abort' && pendingExit) {
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pendingExit.timeout);
+            pendingExit.reject(new Error('holder aborted: ' +
+                                         event.data.reason));
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          if (event.data.event === 'holder-abort') {
+            pending.frame.remove();
+            pending.reject(new Error('holder aborted: ' + event.data.reason));
+            return;
+          }
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function expectBusyContender() {
+          const contender = await startModule('profile-fail-closed-contender.html');
+          try {
+            if (contender.message.role !== kContender ||
+                contender.message.result !== kBusy ||
+                contender.message.error === 0) {
+              throw new Error('contender acquired a retained failure lease');
+            }
+          } finally {
+            contender.frame.remove();
+          }
+        }
+
+        async function runVerifierAfterHolderDestruction() {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const verifier = await startModule('profile-fail-closed-verifier.html');
+            try {
+              if (verifier.message.role !== kVerifier) {
+                throw new Error('verifier reported role ' + verifier.message.role);
+              }
+              if (verifier.message.result === kBusy) {
+                await delay(100);
+                continue;
+              }
+              if (verifier.message.result !== kReady ||
+                  verifier.message.error !== 0) {
+                throw new Error('verifier failed: result=' +
+                                verifier.message.result + ', errno=' +
+                                verifier.message.error);
+              }
+              return;
+            } finally {
+              verifier.frame.remove();
+            }
+          }
+          throw new Error('retained failure lease never left destroyed holder');
+        }
+
+        (async () => {
+          const holder = await startModule('profile-fail-closed-holder.html');
+          if (holder.message.role !== kHolder ||
+              holder.message.result !== kReady || holder.message.error !== 0) {
+            holder.frame.remove();
+            throw new Error('holder failure retirement failed: result=' +
+                            holder.message.result + ', errno=' +
+                            holder.message.error);
+          }
+          await expectBusyContender();
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_opfs_profile_fail_closed_retirement_holder_shutdown();
+          await holderExit;
+          holder.frame.remove();
+          await runVerifierAfterHolderDestruction();
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_bootstrap_recovery(self):
     # Every safe native bootstrap cut point runs in a fresh iframe. The parent
     # discards that document at the exact durable witness checkpoint and proves

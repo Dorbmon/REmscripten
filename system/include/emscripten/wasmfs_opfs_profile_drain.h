@@ -19,11 +19,12 @@ extern "C" {
 typedef struct Backend* backend_t;
 #endif
 
-// The outcome of wasmfs_drain_opfs_profile_backend(). All error values are
-// negative errno values. `error` is the first error observed. The descriptor
-// count includes every target fd-table slot, including dup aliases and
-// directory descriptors; `data_file_states` counts only final physical
-// DataFile open-file states that needed flush/close.
+// The outcome of wasmfs_drain_opfs_profile_backend() or
+// wasmfs_fail_closed_opfs_profile_backend(). All error values are negative
+// errno values. `error` is the first error observed. The descriptor count
+// includes every target fd-table slot, including dup aliases and directory
+// descriptors; `data_file_states` counts only final physical DataFile
+// open-file states that needed flush/close.
 //
 // `backend_sealed` is set once the exact leased OPFS backend entered its
 // one-way sealed state. `lease_released` is set only after the OPFS worker
@@ -31,7 +32,10 @@ typedef struct Backend* backend_t;
 // after that release and the dedicated OPFS worker has cleared its OPFS state,
 // stopped its heartbeat, and been joined and quarantined from the pthread
 // worker pool on the calling application pthread. A sealed backend remains
-// unavailable after either success or failure.
+// unavailable after either success or failure. An intentional fail-closed
+// retirement returns -ESHUTDOWN after clean local cleanup and must leave both
+// `lease_released` and `backend_retired` clear; its retained lease is not an
+// orderly handoff.
 //
 // A failure without `lease_released` has no acknowledged safe release and must
 // not be retried. In the exceptional case where a worker transaction is
@@ -92,6 +96,31 @@ typedef struct wasmfs_opfs_profile_drain_result {
 // write. This primitive is not a substitute for database or application
 // shutdown coordination.
 int wasmfs_drain_opfs_profile_backend(
+  backend_t backend, wasmfs_opfs_profile_drain_result* result);
+
+// Intentionally fail-close a profile handoff after the embedding application
+// has quiesced its profile work but cannot certify a clean profile result. It
+// accepts the same exact leased backend and application-pthread-only calling
+// context as wasmfs_drain_opfs_profile_backend(). It seals that backend,
+// attempts to flush and close its detached descriptors, and runs backend
+// retirement preparation with resource-success checks disabled so private
+// browser-owned OPFS handles cannot reach raw runtime destruction still open.
+//
+// This is not a release operation and never reports a durable handoff. After
+// it successfully seals the backend, it returns -ESHUTDOWN if local cleanup
+// has no more specific error, retains the Web Lock, abandons the dedicated
+// OPFS worker, and leaves `lease_released` and `backend_retired` clear. A
+// later scoped or terminal drain cannot retry that one-way failure state. If
+// validation or sealing cannot begin, it returns the corresponding error
+// instead. Callers must inspect the result and preserve their higher-level
+// failure; this API only makes the native failure teardown explicit and
+// destructor-safe.
+//
+// Like the successful drain, callers must quiesce profile application work
+// first. It is not a substitute for database or application shutdown
+// coordination, and it intentionally makes no persistence, recovery, or lock
+// release claim.
+int wasmfs_fail_closed_opfs_profile_backend(
   backend_t backend, wasmfs_opfs_profile_drain_result* result);
 
 #ifdef __cplusplus

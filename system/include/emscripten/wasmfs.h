@@ -118,13 +118,16 @@ backend_t wasmfs_create_opfs_backend(void);
 //
 // An active leased backend must complete the result-bearing
 // `wasmfs_terminal_drain` or `wasmfs_drain_opfs_profile_backend` on an
-// application pthread before normal EXIT_RUNTIME. `wasmfs_unmount` does not
+// application pthread before normal EXIT_RUNTIME. If its higher-level owner
+// cannot certify a clean handoff after quiescing application work, it must use
+// `wasmfs_fail_closed_opfs_profile_backend` instead so private OPFS handles
+// are retired without falsely releasing the lease. `wasmfs_unmount` does not
 // release it, because WasmFS retains created backends until teardown. There is
 // intentionally no API to release it while the backend can still service
 // filesystem operations. Raw EXIT_RUNTIME without one of those explicit
-// drains is not a supported orderly leased-profile lifecycle: browser-context
-// Web Locks cleanup may occur, but establishes neither durability nor worker
-// retirement evidence.
+// dispositions is not a supported orderly leased-profile lifecycle:
+// browser-context Web Locks cleanup may occur, but establishes neither
+// durability nor worker retirement evidence.
 backend_t wasmfs_create_opfs_backend_with_profile_lease(
   const char* profile_name);
 
@@ -150,10 +153,12 @@ backend_t wasmfs_create_opfs_backend_with_profile_lease(
 // directory fsync is therefore not a claim of complete POSIX metadata
 // durability. Callers must still use
 // wasmfs_drain_opfs_profile_backend (or wasmfs_terminal_drain) for the leased
-// backend's orderly handoff. One namespace backend supports one logical mount
-// for its lifetime; a caller must not alias or remount it in the same WasmFS
-// instance, because WasmFS File identity carries append and record-lock state.
-// Complete the drain and create a fresh backend instead.
+// backend's orderly handoff. An owner that cannot certify that handoff must
+// use wasmfs_fail_closed_opfs_profile_backend after application quiescence
+// instead. One namespace backend supports one logical mount for its lifetime;
+// a caller must not alias or remount it in the same WasmFS instance, because
+// WasmFS File identity carries append and record-lock state. Complete the
+// drain and create a fresh backend instead.
 //
 // The same profile-name validation, pthread requirement, cooperative Web Lock
 // ownership, and one-leased-backend-per-WasmFS-instance rules as

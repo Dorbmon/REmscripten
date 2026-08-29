@@ -589,7 +589,9 @@ int WasmFS::terminalDrain(wasmfs_terminal_drain_result* result) {
 }
 
 int WasmFS::drainOPFSProfileBackend(
-  backend_t backend, wasmfs_opfs_profile_drain_result* result) {
+  backend_t backend,
+  wasmfs_opfs_profile_drain_result* result,
+  OPFSProfileDrainDisposition disposition) {
   if (!result) {
     return -EINVAL;
   }
@@ -633,6 +635,13 @@ int WasmFS::drainOPFSProfileBackend(
     return returnError(beginError);
   }
   result->backend_sealed = 1;
+
+  // A higher-level profile owner can explicitly refuse a clean handoff even
+  // when its raw file close happens to succeed. Keep that disposition separate
+  // from result.error until local cleanup has reported its own concrete error:
+  // a clean forced retirement becomes -ESHUTDOWN only at the end.
+  const bool retainLease =
+    disposition == OPFSProfileDrainDisposition::kRetainLeaseAfterFailedHandoff;
 
 #ifdef WASMFS_OPFS_PROFILE_DRAIN_TEST
   pauseProfileDrainAfterSealForTesting();
@@ -687,44 +696,79 @@ int WasmFS::drainOPFSProfileBackend(
   // preflight failure is an ordinary failed drain: the backend retains its
   // lease rather than clearing handles or reporting a handoff that did not
   // happen.
-  bool cleanupSucceeded = result->error == 0;
+  bool cleanupSucceeded = !retainLease && result->error == 0;
   {
     if (int error = backend->prepareOPFSProfileRetirement(cleanupSucceeded)) {
       recordProfileDrainError(*result, error, result->backend_retire_failures);
     }
   }
 
-  // The backend executes release, OPFS-context reset, and heartbeat stop in
-  // one dedicated-worker transaction. `leaseReleased` is separate because a
-  // later cleanup error can occur only after Web Locks has already
-  // acknowledged release. Native worker retirement still runs in that case
-  // so a non-success result never defers a join to browser-main destruction.
+  // A successful handoff executes release, OPFS-context reset, and heartbeat
+  // stop in one dedicated-worker transaction. `leaseReleased` is separate
+  // because a later cleanup error can occur only after Web Locks has already
+  // acknowledged release. The normal disposition retires that worker even
+  // after such a non-success result; the explicit failure disposition below
+  // instead retains its lease and abandons the worker tombstone.
   bool leaseReleased = false;
-  int finishError = backend->finishOPFSProfileDrain(
-    result->error == 0, &leaseReleased);
-  if (!leaseReleased) {
-    // A leased backend must never turn an absent acknowledgement into a
-    // zero-result handoff merely because an implementation forgot to surface
-    // its own error. Keep this defense at the generic ABI boundary rather
-    // than relying on one JavaScript callback's current error mapping.
-    if (finishError == 0 && result->error == 0) {
-      finishError = -EIO;
-    }
-    if (finishError) {
-      recordProfileDrainError(
-        *result, finishError, result->lease_release_failures);
+  if (retainLease) {
+    // The embedding owner already rejected its profile result. Do not turn a
+    // physically clean close into a Web Locks release: finish(false) keeps
+    // the lease in a terminal failed state and abandons the worker only after
+    // backend preparation has made private OPFS wrappers destructor-safe.
+    const int finishError =
+      backend->finishOPFSProfileDrain(false, &leaseReleased);
+    if (leaseReleased) {
+      // A backend that releases on the explicit failure path violates this
+      // API's fail-closed contract. Surface it, and attempt native retirement
+      // so an unexpected released worker is not deferred to browser-main
+      // destruction. The result remains a failed handoff.
+      result->lease_released = 1;
+      recordProfileDrainError(*result, -EIO, result->backend_retire_failures);
+      if (int error = backend->retireOPFSProfileBackend(false)) {
+        recordProfileDrainError(
+          *result, error, result->backend_retire_failures);
+      }
+    } else if (finishError) {
+      recordProfileDrainError(*result,
+                              finishError,
+                              result->backend_retire_failures);
     }
   } else {
-    result->lease_released = 1;
-    if (finishError) {
-      recordProfileDrainError(
-        *result, finishError, result->backend_retire_failures);
+    const int finishError = backend->finishOPFSProfileDrain(
+      result->error == 0, &leaseReleased);
+    if (!leaseReleased) {
+      // A leased backend must never turn an absent acknowledgement into a
+      // zero-result handoff merely because an implementation forgot to surface
+      // its own error. Keep this defense at the generic ABI boundary rather
+      // than relying on one JavaScript callback's current error mapping.
+      int reportedFinishError = finishError;
+      if (reportedFinishError == 0 && result->error == 0) {
+        reportedFinishError = -EIO;
+      }
+      if (reportedFinishError) {
+        recordProfileDrainError(
+          *result, reportedFinishError, result->lease_release_failures);
+      }
+    } else {
+      result->lease_released = 1;
+      if (finishError) {
+        recordProfileDrainError(
+          *result, finishError, result->backend_retire_failures);
+      }
+      if (int error = backend->retireOPFSProfileBackend(finishError == 0)) {
+        recordProfileDrainError(
+          *result, error, result->backend_retire_failures);
+      } else if (finishError == 0) {
+        result->backend_retired = 1;
+      }
     }
-    if (int error = backend->retireOPFSProfileBackend(finishError == 0)) {
-      recordProfileDrainError(*result, error, result->backend_retire_failures);
-    } else if (finishError == 0) {
-      result->backend_retired = 1;
-    }
+  }
+
+  // A forced failure disposition is never an orderly handoff, even when every
+  // local close acknowledged successfully. Preserve a more specific local
+  // cleanup error if one was already recorded.
+  if (retainLease && result->error == 0) {
+    setProfileDrainError(*result, -ESHUTDOWN);
   }
 
   endScopedOPFSProfileDrain();
@@ -742,7 +786,20 @@ extern "C" int wasmfs_drain_opfs_profile_backend(
   // distinct declarations. They are ABI-identical opaque pointers, but keep
   // the conversion at this C bridge rather than exposing C types internally.
   return wasmFS.drainOPFSProfileBackend(
-    reinterpret_cast<wasmfs::backend_t>(backend), result);
+    reinterpret_cast<wasmfs::backend_t>(backend),
+    result,
+    wasmfs::OPFSProfileDrainDisposition::kReleaseLeaseAfterCleanDrain);
+}
+
+extern "C" int wasmfs_fail_closed_opfs_profile_backend(
+  ::backend_t backend, wasmfs_opfs_profile_drain_result* result) {
+  // This uses the same opaque-pointer validation as the successful scoped
+  // drain, but commits a one-way retained-lease failure disposition after
+  // sealing rather than allowing clean physical cleanup to release the lease.
+  return wasmFS.drainOPFSProfileBackend(
+    reinterpret_cast<wasmfs::backend_t>(backend),
+    result,
+    wasmfs::OPFSProfileDrainDisposition::kRetainLeaseAfterFailedHandoff);
 }
 
 WasmFS::~WasmFS() {
