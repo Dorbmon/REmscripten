@@ -9682,7 +9682,8 @@ Module["preRun"] = () => {
                   description + ' did not trim arena files to selected high water');
         }
 
-        function requireSelectedFilesystemExtents(layout, description) {
+        function requireSelectedFilesystemExtents(layout, description,
+                                                  requireCheckpoint = false) {
           const bytes = layout.arenas[layout.arena];
           const outerOffset = layout.manifestOffset;
           require(outerOffset + kManifestHeaderSize + layout.manifestSize <=
@@ -9704,9 +9705,34 @@ Module["preRun"] = () => {
                                          payloadOffset + layout.manifestSize);
           require(payload.byteLength >= kFilesystemHeaderSize,
                   description + ' filesystem payload is truncated');
-          requireMagic(payload, 0, 'WFSV4FS1', description + ' filesystem');
           const view = new DataView(payload.buffer, payload.byteOffset,
                                     payload.byteLength);
+          if (String.fromCharCode(...payload.subarray(0, 8)) === 'WFSV4FS2') {
+            require(!requireCheckpoint &&
+                    view.getUint32(8, true) === 2 &&
+                    view.getUint32(12, true) === kFilesystemHeaderSize &&
+                    readU64(view, 16, description + ' filesystem') ===
+                      layout.generation &&
+                    readU64(view, 48, description + ' filesystem') ===
+                      layout.generation - 1 &&
+                    view.getUint32(56, true) ===
+                      ((layout.generation - 1) & 1) &&
+                    view.getUint32(60, true) > 0,
+                    description + ' has an invalid filesystem delta');
+            const operationOffset = readU64(
+              view, 88, description + ' filesystem');
+            const operationCount = readU64(
+              view, 96, description + ' filesystem');
+            const blobOffset = readU64(view, 104, description + ' filesystem');
+            const blobSize = readU64(view, 112, description + ' filesystem');
+            require(operationOffset === kFilesystemHeaderSize &&
+                    operationCount > 0 &&
+                    blobOffset === operationOffset + operationCount * 32 &&
+                    blobOffset + blobSize === payload.byteLength,
+                    description + ' has an invalid filesystem delta layout');
+            return;
+          }
+          requireMagic(payload, 0, 'WFSV4FS1', description + ' filesystem');
           require(view.getUint32(8, true) === 1 &&
                   view.getUint32(12, true) === kFilesystemHeaderSize &&
                   readU64(view, 16, description + ' filesystem') ===
@@ -9734,7 +9760,7 @@ Module["preRun"] = () => {
                   layout.physical[retired] === 0,
                   description + ' did not retire its source arena');
           requireExactPhysicalBounds(layout, description);
-          requireSelectedFilesystemExtents(layout, description);
+          requireSelectedFilesystemExtents(layout, description, true);
         }
 
         function requireInterruptedCheckpoint(layout, phase, description) {
@@ -9751,7 +9777,7 @@ Module["preRun"] = () => {
                     layout.physical[1] > 0,
                     description + ' did not expose the self-contained checkpoint');
           }
-          requireSelectedFilesystemExtents(layout, description);
+          requireSelectedFilesystemExtents(layout, description, phase === 2);
         }
 
         function launchModule(path) {
@@ -9913,6 +9939,1098 @@ Module["preRun"] = () => {
       'replacement_profile': replacement_profile,
     })
     self.run_browser('a.html', '/report_result?0', timeout=300)
+
+  @only_chromium
+  @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_delta_recovery(self):
+    # The interval-five seed forms a broad 128-file namespace. The parent then
+    # observes at most one cadence window of fresh target-mode advances until
+    # it sees a self-contained Schema-1 checkpoint. One more advance must
+    # select a compact Schema-2 delta pointing at that observed checkpoint.
+    # The parent only reads named test artifacts after checked native drains;
+    # fresh WasmFS documents perform both replays. This is not a power-loss or
+    # Chromium-profile persistence claim.
+    test = ('wasmfs/'
+            'wasmfs_opfs_profile_log_v4_filesystem_delta_recovery.c')
+    profile = ('wasmfs_profile_log_v4_filesystem_delta_recovery_%016x' %
+               random.getrandbits(64))
+    common_args = [
+      '-sWASMFS',
+      '-pthread',
+      '-sPROXY_TO_PTHREAD',
+      '-lopfs.js',
+      '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_CHECKPOINT_INTERVAL=5',
+    ]
+
+    def profile_arg(current_profile):
+      return (
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_PROFILE_NAME=' +
+        current_profile)
+
+    def compile_role(output, current_profile, role, extra_args=None):
+      self.compile_btest(
+        test, common_args + [profile_arg(current_profile), role] +
+          (extra_args or []) + ['-o', output],
+        reporting=Reporting.NONE)
+
+    def expected_mode_arg(mode):
+      return ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_' +
+              'EXPECT_TARGET_MODE=0%o' % mode)
+
+    def compile_mode_roles(prefix,
+                           current_profile,
+                           include_replay=True,
+                           include_recovery=False):
+      for mode in (0o600, 0o640):
+        suffix = '%o' % mode
+        if include_replay:
+          compile_role(
+            prefix + '-replay-' + suffix + '.html', current_profile,
+            '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_REPLAY',
+            [expected_mode_arg(mode)])
+          compile_role(
+            prefix + '-reload-' + suffix + '.html', current_profile,
+            '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_RELOAD',
+            [expected_mode_arg(mode)])
+        if include_recovery:
+          compile_role(
+            prefix + '-recovery-' + suffix + '.html', current_profile,
+            '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_RECOVERY',
+            [expected_mode_arg(mode)])
+          compile_role(
+            prefix + '-recovery-reload-' + suffix + '.html', current_profile,
+            ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_' +
+             'RECOVERY_RELOAD'), [expected_mode_arg(mode)])
+
+    def compile_extent_mode_roles(prefix, current_profile):
+      for mode in (0o600, 0o640):
+        suffix = '%o' % mode
+        compile_role(
+          prefix + '-replay-' + suffix + '.html', current_profile,
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_EXTENT_REPLAY',
+          [expected_mode_arg(mode)])
+        compile_role(
+          prefix + '-reload-' + suffix + '.html', current_profile,
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_EXTENT_RELOAD',
+          [expected_mode_arg(mode)])
+
+    compile_role(
+      'v4fs-delta-seed.html', profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_SEED')
+    compile_role(
+      'v4fs-delta-advance.html', profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_ADVANCE')
+    compile_mode_roles('v4fs-delta', profile)
+    compile_role(
+      'v4fs-delta-parent-corruptor.html', profile,
+      ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_' +
+       'PARENT_CORRUPTOR'),
+      ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_PARENT_CORRUPTION=1'])
+
+    extent_profile = (
+      'wasmfs_profile_log_v4_filesystem_delta_extent_%016x' %
+      random.getrandbits(64))
+    compile_role(
+      'v4fs-delta-extent-seed.html', extent_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_EXTENT_SEED')
+    compile_role(
+      'v4fs-delta-extent-advance.html', extent_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_EXTENT_ADVANCE')
+    compile_extent_mode_roles('v4fs-delta-extent', extent_profile)
+    compile_role(
+      'v4fs-delta-extent-corruptor.html', extent_profile,
+      ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_' +
+       'EXTENT_CORRUPTOR'),
+      ['-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_HISTORICAL_EXTENT_CORRUPTION=1'])
+
+    phase_cases = []
+    for phase in (1, 2):
+      phase_profile = (
+        'wasmfs_profile_log_v4_filesystem_delta_recovery_phase_%d_%016x' %
+        (phase, random.getrandbits(64)))
+      prefix = 'v4fs-delta-phase-%d' % phase
+      seed = prefix + '-seed.html'
+      advance = prefix + '-advance.html'
+      interruptor = prefix + '-interruptor.html'
+      compile_role(
+        seed, phase_profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_SEED')
+      compile_role(
+        advance, phase_profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_ADVANCE')
+      compile_role(
+        interruptor, phase_profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_INTERRUPTOR',
+        [
+          ('-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_DELTA_TEST_' +
+           'INTERRUPT_PHASE=%d' % phase),
+          '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1',
+        ])
+      compile_mode_roles(prefix, phase_profile, include_replay=False,
+                         include_recovery=True)
+      phase_cases.append((phase, phase_profile, seed, advance, interruptor))
+
+    phase_script = '\n'.join(
+      "          await runAfterLeaseRelease('%s', kSeed, "
+      "'Schema-2 phase %d checkpoint seed');\n"
+      "          const phase%dCheckpoint = await prepareCheckpoint(\n"
+      "            '%s', '%s', 'Schema-2 phase %d checkpoint preparation');\n"
+      "          await interruptAfterLeaseRelease('%s', %d, "
+      "'Schema-2 phase %d delta interruption');\n"
+      "          const phase%dInterrupted = requireInterruptedDelta(\n"
+      "            await waitForPhysicalLayout('%s', "
+      "'Schema-2 phase %d interrupted layout'),\n"
+      "            %d, phase%dCheckpoint);\n"
+      "          await runAfterLeaseRelease(\n"
+      "            targetModeModule('v4fs-delta-phase-%d-recovery',\n"
+      "                             phase%dInterrupted.targetMode),\n"
+      "            kRecovery, 'Schema-2 phase %d fresh recovery');\n"
+      "          await runAfterLeaseRelease(\n"
+      "            targetModeModule('v4fs-delta-phase-%d-recovery-reload',\n"
+      "                             phase%dInterrupted.targetMode),\n"
+      "            kRecoveryReload, 'Schema-2 phase %d recovery reload');" %
+      (seed, phase, phase, phase_profile, advance, phase, interruptor, phase,
+       phase, phase, phase_profile, phase, phase, phase, phase, phase, phase,
+       phase, phase, phase)
+      for phase, phase_profile, seed, advance, interruptor in phase_cases)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kSeed = 0;
+        const kAdvance = 1;
+        const kReplay = 2;
+        const kReload = 3;
+        const kInterruptor = 4;
+        const kRecovery = 5;
+        const kRecoveryReload = 6;
+        const kParentCorruptor = 7;
+        const kExtentSeed = 8;
+        const kExtentAdvance = 9;
+        const kExtentReplay = 10;
+        const kExtentReload = 11;
+        const kExtentCorruptor = 12;
+        const kBusy = 16;
+        const kProfile = '__PROFILE__';
+        const kExtentProfile = '__EXTENT_PROFILE__';
+        const kRecordSize = 128;
+        const kControlSize = 6 * kRecordSize;
+        const kManifestHeaderSize = 96;
+        const kFilesystemHeaderSize = 128;
+        const kFilesystemInodeSize = 112;
+        const kFilesystemExtentSize = 48;
+        const kDataHeaderSize = 96;
+        const kChunkSize = 64 * 1024;
+        const kDeltaOperationSize = 32;
+        const kTargetInode = 39;
+        const kExpectedInodeCount = 129;
+        const kExpectedNextInode = 130;
+        const kTargetModes = [0o600, 0o640];
+        const kExtentPayload = new Uint8Array([
+          0x75, 0x18, 0xb4, 0x3e, 0x92, 0x4f, 0xd1, 0x0b,
+          0xe6, 0x39, 0x5a, 0xc7, 0x21, 0x8d, 0xf0, 0x64,
+          0x0e, 0xa3, 0x57, 0xcc, 0x19, 0x76, 0xe1, 0x4a,
+          0xbd, 0x02, 0x98, 0x35, 0x6f, 0xd8, 0x41, 0xae,
+        ]);
+        const kCheckpointPreparationAttempts = 5;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v4-filesystem-delta-recovery';
+        const kEventTimeoutMs = 30000;
+        const kReleaseAttempts = 100;
+        const kFnvOffset = 1469598103934665603n;
+        const kFnvPrime = 1099511628211n;
+        const kU64Mask = (1n << 64n) - 1n;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function require(condition, description) {
+          if (!condition) {
+            throw new Error(description);
+          }
+        }
+
+        function requireMagic(bytes, offset, magic, description) {
+          require(offset + magic.length <= bytes.byteLength,
+                  description + ' is truncated');
+          for (let index = 0; index < magic.length; ++index) {
+            require(bytes[offset + index] === magic.charCodeAt(index),
+                    description + ' has the wrong magic');
+          }
+        }
+
+        function readU64(view, offset, description) {
+          const value = view.getBigUint64(offset, true);
+          require(value <= BigInt(Number.MAX_SAFE_INTEGER),
+                  description + ' is not a safe integer');
+          return Number(value);
+        }
+
+        function checksum(bytes, zeroOffset = -1, zeroLength = 0) {
+          let value = kFnvOffset;
+          for (let index = 0; index < bytes.byteLength; ++index) {
+            const byte = index >= zeroOffset && index < zeroOffset + zeroLength
+              ? 0 : bytes[index];
+            value ^= BigInt(byte);
+            value = (value * kFnvPrime) & kU64Mask;
+          }
+          return value;
+        }
+
+        function parsePhase(control, view, offset, description) {
+          const record = control.subarray(offset, offset + kRecordSize);
+          requireMagic(control, offset, 'WFSLG4P0', description);
+          require(view.getUint32(offset + 8, true) === 4 &&
+                  view.getUint32(offset + 12, true) === kRecordSize &&
+                  checksum(record, 48, 8) ===
+                    view.getBigUint64(offset + 48, true),
+                  description + ' has an invalid phase witness');
+          const generation = readU64(view, offset + 16, description);
+          const arena = view.getUint32(offset + 24, true);
+          require(generation !== 0 && arena < 2 && arena === (generation & 1) &&
+                  view.getUint32(offset + 28, true) === 1,
+                  description + ' has an invalid selected phase');
+          return {
+            generation,
+            arena,
+            descriptorChecksum: view.getBigUint64(offset + 32, true),
+          };
+        }
+
+        function parseDescriptor(control, view, generation, arena, copy) {
+          const offset = (((generation & 1) * 2 + copy) * kRecordSize);
+          const description = 'descriptor ' + generation + '/' + copy;
+          const record = control.subarray(offset, offset + kRecordSize);
+          requireMagic(control, offset, 'WFSLG4D0', description);
+          require(view.getUint32(offset + 8, true) === 4 &&
+                  view.getUint32(offset + 12, true) === kRecordSize &&
+                  readU64(view, offset + 16, description) === generation &&
+                  view.getUint32(offset + 24, true) === arena &&
+                  checksum(record, 88, 8) ===
+                    view.getBigUint64(offset + 88, true),
+                  description + ' has an invalid descriptor record');
+          return {
+            manifestOffset: readU64(view, offset + 32, description),
+            manifestSize: readU64(view, offset + 40, description),
+            manifestRecordChecksum: view.getBigUint64(offset + 48, true),
+            highWater: [
+              readU64(view, offset + 56, description),
+              readU64(view, offset + 64, description),
+            ],
+            recordChecksum: view.getBigUint64(offset + 88, true),
+          };
+        }
+
+        function parseSelectedDescriptor(control) {
+          require(control.byteLength === kControlSize,
+                  'V4 control file has the wrong fixed size');
+          const view = new DataView(control.buffer, control.byteOffset,
+                                    control.byteLength);
+          const first = parsePhase(control, view, 4 * kRecordSize, 'phase 0');
+          const second = parsePhase(control, view, 5 * kRecordSize, 'phase 1');
+          let selected = first;
+          if (first.generation === second.generation) {
+            require(first.arena === second.arena &&
+                    first.descriptorChecksum === second.descriptorChecksum,
+                    'mirrored V4 phases disagree');
+          } else {
+            const older = first.generation < second.generation ? first : second;
+            const newer = first.generation < second.generation ? second : first;
+            require(newer.generation === older.generation + 1,
+                    'V4 phases do not form a recovery split');
+            selected = older;
+          }
+          const descriptor0 = parseDescriptor(
+            control, view, selected.generation, selected.arena, 0);
+          const descriptor1 = parseDescriptor(
+            control, view, selected.generation, selected.arena, 1);
+          require(descriptor0.manifestOffset === descriptor1.manifestOffset &&
+                  descriptor0.manifestSize === descriptor1.manifestSize &&
+                  descriptor0.manifestRecordChecksum ===
+                    descriptor1.manifestRecordChecksum &&
+                  descriptor0.highWater[0] === descriptor1.highWater[0] &&
+                  descriptor0.highWater[1] === descriptor1.highWater[1] &&
+                  descriptor0.recordChecksum === selected.descriptorChecksum &&
+                  descriptor1.recordChecksum === selected.descriptorChecksum,
+                  'mirrored V4 descriptors disagree');
+          return {...descriptor0, generation: selected.generation,
+                  arena: selected.arena};
+        }
+
+        async function readPhysicalLayout(profile) {
+          // This observer never mutates OPFS.  Native V4 code owns selection,
+          // validation, replay, and every write; the parent only reads fixed
+          // test artifacts after the iframe has released its lease.
+          const root = await navigator.storage.getDirectory();
+          const stem = '.wasmfs-profile-log-v4-fs-' + profile.length + '-' +
+                       profile;
+          async function readFile(name) {
+            const handle = await root.getFileHandle(name);
+            return new Uint8Array(await (await handle.getFile()).arrayBuffer());
+          }
+          const control = await readFile(stem + '-control');
+          const selected = parseSelectedDescriptor(control);
+          const arenas = await Promise.all([0, 1].map(
+            (arena) => readFile(stem + '-arena-' + arena)));
+          return {...selected, arenas, physical: arenas.map(
+            (arena) => arena.byteLength)};
+        }
+
+        async function waitForPhysicalLayout(profile, description) {
+          let lastError;
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            try {
+              return await readPhysicalLayout(profile);
+            } catch (error) {
+              lastError = error;
+              await delay(100);
+            }
+          }
+          throw new Error(description + ' could not read test artifacts: ' +
+                          lastError);
+        }
+
+        function requireExactPhysicalBounds(layout, description) {
+          require(layout.physical[0] === layout.highWater[0] &&
+                  layout.physical[1] === layout.highWater[1],
+                  description + ' did not trim arena files to selected high water');
+        }
+
+        function parseOuterManifest(layout, arena, offset, size, generation,
+                                    expectedRecordChecksum, description) {
+          require(arena < 2 && offset + kManifestHeaderSize + size <=
+                    layout.highWater[arena] &&
+                    offset + kManifestHeaderSize + size <=
+                    layout.arenas[arena].byteLength,
+                  description + ' lies outside selected V4 high water');
+          const bytes = layout.arenas[arena];
+          const header = bytes.subarray(offset, offset + kManifestHeaderSize);
+          requireMagic(bytes, offset, 'WFSLG4M0', description + ' outer');
+          const view = new DataView(header.buffer, header.byteOffset,
+                                    header.byteLength);
+          require(view.getUint32(8, true) === 4 &&
+                  view.getUint32(12, true) === kManifestHeaderSize &&
+                  readU64(view, 16, description + ' outer') === generation &&
+                  readU64(view, 24, description + ' outer') === size &&
+                  checksum(header, 56, 8) === view.getBigUint64(56, true) &&
+                  view.getBigUint64(56, true) === expectedRecordChecksum,
+                  description + ' has an invalid outer manifest header');
+          const payload = bytes.subarray(offset + kManifestHeaderSize,
+                                         offset + kManifestHeaderSize + size);
+          require(checksum(payload) === view.getBigUint64(32, true),
+                  description + ' has an invalid outer payload checksum');
+          return {arena, offset, size, generation, payload,
+                  recordChecksum: view.getBigUint64(56, true)};
+        }
+
+        function describeLayout(layout) {
+          return 'g=' + layout.generation + ', a=' + layout.arena +
+            ', highWater=' + layout.highWater + ', physical=' + layout.physical;
+        }
+
+        function hasMagic(bytes, magic) {
+          if (bytes.byteLength < magic.length) {
+            return false;
+          }
+          for (let index = 0; index < magic.length; ++index) {
+            if (bytes[index] !== magic.charCodeAt(index)) {
+              return false;
+            }
+          }
+          return true;
+        }
+
+        function requireTargetMode(mode, description) {
+          require(kTargetModes.includes(mode),
+                  description + ' has an unexpected target mode ' +
+                    mode.toString(8));
+          return mode;
+        }
+
+        function requireSameSelectedTuple(layout, checkpoint, description) {
+          require(layout.generation === checkpoint.generation &&
+                  layout.arena === checkpoint.arena &&
+                  layout.manifestOffset === checkpoint.manifestOffset &&
+                  layout.manifestSize === checkpoint.manifestSize &&
+                  layout.manifestRecordChecksum ===
+                    checkpoint.manifestRecordChecksum &&
+                  layout.recordChecksum === checkpoint.recordChecksum &&
+                  layout.highWater[0] === checkpoint.highWater[0] &&
+                  layout.highWater[1] === checkpoint.highWater[1],
+                  description + ' changed the selected checkpoint tuple (' +
+                    describeLayout(layout) + ')');
+        }
+
+        function targetModeFromFullCheckpoint(payload, description) {
+          const offset = kFilesystemHeaderSize +
+            (kTargetInode - 1) * kFilesystemInodeSize;
+          require(offset + kFilesystemInodeSize <= payload.byteLength,
+                  description + ' target inode lies outside its full checkpoint');
+          const view = new DataView(payload.buffer, payload.byteOffset,
+                                    payload.byteLength);
+          require(readU64(view, offset, description + ' target inode') ===
+                    kTargetInode &&
+                  view.getUint32(offset + 8, true) === 1,
+                  description + ' does not contain the expected target inode');
+          return requireTargetMode(view.getUint32(offset + 16, true) & 0o777,
+                                   description + ' target inode');
+        }
+
+        function requireFullCheckpoint(layout, description, expected = null,
+                                       allowUnreachableTargetTail = false) {
+          const retiredArena = layout.arena ^ 1;
+          require(layout.generation !== 0 &&
+                  layout.arena === (layout.generation & 1) &&
+                  layout.highWater[retiredArena] === 0,
+                  description + ' is not a selected self-contained checkpoint (' +
+                    describeLayout(layout) + ')');
+          if (expected) {
+            requireSameSelectedTuple(layout, expected, description);
+          }
+          if (allowUnreachableTargetTail) {
+            require(layout.physical[layout.arena] ===
+                      layout.highWater[layout.arena] &&
+                    layout.physical[retiredArena] >
+                      layout.highWater[retiredArena],
+                    description + ' did not retain only an unreachable next-arena tail');
+          } else {
+            requireExactPhysicalBounds(layout, description);
+          }
+          const outer = parseOuterManifest(
+            layout, layout.arena, layout.manifestOffset, layout.manifestSize,
+            layout.generation, layout.manifestRecordChecksum, description);
+          const payload = outer.payload;
+          const view = new DataView(payload.buffer, payload.byteOffset,
+                                    payload.byteLength);
+          requireMagic(payload, 0, 'WFSV4FS1', description + ' filesystem');
+          require(view.getUint32(8, true) === 1 &&
+                  view.getUint32(12, true) === kFilesystemHeaderSize &&
+                  readU64(view, 16, description + ' filesystem') ===
+                    layout.generation &&
+                  readU64(view, 24, description + ' filesystem') === 1 &&
+                  readU64(view, 32, description + ' filesystem') ===
+                    kExpectedNextInode &&
+                  view.getUint32(40, true) === 16 &&
+                  view.getUint32(44, true) === 0 &&
+                  readU64(view, 48, description + ' filesystem') ===
+                    kFilesystemHeaderSize &&
+                  readU64(view, 56, description + ' filesystem') ===
+                    kExpectedInodeCount,
+                  description + ' is not the expected self-contained Schema-1 tree');
+          const targetMode = targetModeFromFullCheckpoint(payload, description);
+          return {
+            outer,
+            payloadSize: payload.byteLength,
+            targetMode,
+            generation: layout.generation,
+            arena: layout.arena,
+            manifestOffset: layout.manifestOffset,
+            manifestSize: layout.manifestSize,
+            manifestRecordChecksum: layout.manifestRecordChecksum,
+            recordChecksum: layout.recordChecksum,
+            highWater: layout.highWater,
+            layout,
+          };
+        }
+
+        function maybeFullCheckpoint(layout, description) {
+          const outer = parseOuterManifest(
+            layout, layout.arena, layout.manifestOffset, layout.manifestSize,
+            layout.generation, layout.manifestRecordChecksum, description);
+          if (hasMagic(outer.payload, 'WFSV4FS2')) {
+            return null;
+          }
+          requireMagic(outer.payload, 0, 'WFSV4FS1',
+                       description + ' selected filesystem');
+          return requireFullCheckpoint(layout, description);
+        }
+
+        async function prepareCheckpoint(profile,
+                                         advancePath,
+                                         description,
+                                         advanceRole = kAdvance) {
+          let layout;
+          for (let attempt = 0; attempt <= kCheckpointPreparationAttempts;
+               ++attempt) {
+            layout = await waitForPhysicalLayout(profile, description);
+            const checkpoint = maybeFullCheckpoint(layout, description);
+            if (checkpoint) {
+              return checkpoint;
+            }
+            if (attempt !== kCheckpointPreparationAttempts) {
+              await runAfterLeaseRelease(
+                advancePath, advanceRole,
+                description + ' target-mode advance ' + (attempt + 1));
+            }
+          }
+          throw new Error(description + ' did not reach a Schema-1 checkpoint (' +
+                          describeLayout(layout) + ')');
+        }
+
+        function targetModeModule(prefix, targetMode) {
+          return prefix + '-' + requireTargetMode(
+            targetMode, prefix + ' selected mode').toString(8) + '.html';
+        }
+
+        function requireTinyDelta(layout, checkpoint, description) {
+          require(layout.generation === checkpoint.generation + 1 &&
+                  layout.arena === (layout.generation & 1),
+                  description + ' did not select the checkpoint successor (' +
+                    describeLayout(layout) + ')');
+          requireExactPhysicalBounds(layout, description);
+          const outer = parseOuterManifest(
+            layout, layout.arena, layout.manifestOffset, layout.manifestSize,
+            layout.generation, layout.manifestRecordChecksum,
+            description);
+          const payload = outer.payload;
+          const view = new DataView(payload.buffer, payload.byteOffset,
+                                    payload.byteLength);
+          requireMagic(payload, 0, 'WFSV4FS2', description + ' filesystem');
+          require(view.getUint32(8, true) === 2 &&
+                  view.getUint32(12, true) === kFilesystemHeaderSize &&
+                  readU64(view, 16, description + ' filesystem') ===
+                    layout.generation &&
+                  readU64(view, 24, description + ' filesystem') === 1 &&
+                  readU64(view, 32, description + ' filesystem') ===
+                    kExpectedNextInode &&
+                  view.getUint32(40, true) === 16 &&
+                  view.getUint32(44, true) === 0 &&
+                  readU64(view, 48, description + ' filesystem') ===
+                    checkpoint.generation &&
+                  view.getUint32(56, true) === checkpoint.arena &&
+                  view.getUint32(60, true) === 1,
+                  'selected Schema-2 header is not a depth-one delta');
+          const parentOffset = readU64(view, 64, description + ' filesystem');
+          const parentSize = readU64(view, 72, description + ' filesystem');
+          const parentChecksum = view.getBigUint64(80, true);
+          const operationOffset = readU64(
+            view, 88, description + ' filesystem');
+          const operationCount = readU64(
+            view, 96, description + ' filesystem');
+          const blobOffset = readU64(view, 104, description + ' filesystem');
+          const blobSize = readU64(view, 112, description + ' filesystem');
+          require(parentOffset === checkpoint.outer.offset &&
+                  parentSize === checkpoint.outer.size &&
+                  parentChecksum === checkpoint.outer.recordChecksum,
+                  description + ' parent locator does not name its checkpoint');
+          const parent = parseOuterManifest(
+            layout, checkpoint.arena, parentOffset, parentSize,
+            checkpoint.generation, parentChecksum,
+            description + ' parent locator');
+          requireMagic(parent.payload, 0, 'WFSV4FS1',
+                       description + ' parent filesystem');
+          const parentView = new DataView(parent.payload.buffer,
+                                           parent.payload.byteOffset,
+                                           parent.payload.byteLength);
+          require(parentView.getUint32(8, true) === 1 &&
+                  readU64(parentView, 16, description + ' parent filesystem') ===
+                    checkpoint.generation,
+                  description + ' parent is not a self-contained checkpoint');
+          require(operationOffset === kFilesystemHeaderSize &&
+                  operationCount === 1 &&
+                  blobOffset === operationOffset + kDeltaOperationSize &&
+                  blobSize >= kFilesystemHeaderSize &&
+                  blobOffset + blobSize === payload.byteLength,
+                  'Schema-2 delta does not have one bounded inode operation');
+          require(readU64(view, operationOffset, description + ' operation') ===
+                    kTargetInode &&
+                  view.getUint32(operationOffset + 8, true) === 1 &&
+                  view.getUint32(operationOffset + 12, true) === 0 &&
+                  readU64(view, operationOffset + 16,
+                          description + ' operation') === blobOffset &&
+                  readU64(view, operationOffset + 24, description + ' operation') ===
+                    blobSize,
+                  'Schema-2 delta changed more than the target inode');
+          const inode = new DataView(payload.buffer,
+                                     payload.byteOffset + blobOffset, blobSize);
+          const targetMode = requireTargetMode(
+            inode.getUint32(16, true) & 0o777,
+            description + ' target inode');
+          require(readU64(inode, 0, description + ' target inode') ===
+                    kTargetInode &&
+                  inode.getUint32(8, true) === 1 &&
+                  targetMode !== checkpoint.targetMode &&
+                  readU64(inode, 64, description + ' target inode') === 0 &&
+                  readU64(inode, 80, description + ' target inode') === 0,
+                  'Schema-2 target inode is not the tiny mode post-image');
+          require(payload.byteLength * 16 < checkpoint.payloadSize,
+                  description +
+                    ' wire record is not materially smaller than its checkpoint');
+          return {outer, payloadSize: payload.byteLength, targetMode};
+        }
+
+        function requireEqualBytes(before, after, description) {
+          require(before.byteLength === after.byteLength,
+                  description + ' has a different byte length');
+          for (let index = 0; index < before.byteLength; ++index) {
+            require(before[index] === after[index],
+                    description + ' changed at byte ' + index);
+          }
+        }
+
+        function requireSameSelectedDelta(before, after, checkpoint) {
+          const beforeDelta = requireTinyDelta(
+            before, checkpoint, 'Schema-2 delta before historical-parent fault');
+          const afterDelta = requireTinyDelta(
+            after, checkpoint, 'Schema-2 delta after historical-parent fault');
+          requireSameSelectedTuple(
+            after, before, 'historical-parent fault observer');
+          const beforeWire = before.arenas[before.arena].subarray(
+            before.manifestOffset,
+            before.manifestOffset + kManifestHeaderSize + before.manifestSize);
+          const afterWire = after.arenas[after.arena].subarray(
+            after.manifestOffset,
+            after.manifestOffset + kManifestHeaderSize + after.manifestSize);
+          requireEqualBytes(beforeWire, afterWire,
+                            'historical-parent fault selected manifest wire');
+          require(beforeDelta.targetMode === afterDelta.targetMode,
+                  'historical-parent fault changed the selected target mode');
+          return afterDelta;
+        }
+
+        function requireHistoricalExtentCheckpoint(layout, checkpoint,
+                                                   description) {
+          const outer = parseOuterManifest(
+            layout, checkpoint.arena, checkpoint.outer.offset,
+            checkpoint.outer.size, checkpoint.generation,
+            checkpoint.outer.recordChecksum, description + ' full checkpoint');
+          const payload = outer.payload;
+          const view = new DataView(payload.buffer, payload.byteOffset,
+                                    payload.byteLength);
+          requireMagic(payload, 0, 'WFSV4FS1',
+                       description + ' full filesystem');
+          const targetOffset = kFilesystemHeaderSize +
+            (kTargetInode - 1) * kFilesystemInodeSize;
+          require(targetOffset + kFilesystemInodeSize <= payload.byteLength &&
+                  readU64(view, targetOffset, description + ' target inode') ===
+                    kTargetInode &&
+                  view.getUint32(targetOffset + 8, true) === 1 &&
+                  readU64(view, targetOffset + 48,
+                          description + ' target inode') ===
+                    kExtentPayload.byteLength &&
+                  readU64(view, targetOffset + 80,
+                          description + ' target inode') === 1,
+                  description + ' full checkpoint lacks the target extent');
+          const extentOffset = readU64(
+            view, 80, description + ' full filesystem');
+          const extentCount = readU64(
+            view, 88, description + ' full filesystem');
+          require(extentCount === 1 &&
+                  extentOffset + extentCount * kFilesystemExtentSize <=
+                    payload.byteLength,
+                  description + ' full checkpoint does not have one bounded extent');
+          require(readU64(view, extentOffset,
+                          description + ' full extent') === kTargetInode &&
+                  readU64(view, extentOffset + 8,
+                          description + ' full extent') === 0,
+                  description + ' full checkpoint extent is not target chunk zero');
+          const extent = {
+            arena: view.getUint32(extentOffset + 16, true),
+            payloadSize: view.getUint32(extentOffset + 20, true),
+            offset: readU64(view, extentOffset + 24,
+                            description + ' full extent'),
+            checksum: view.getBigUint64(extentOffset + 32, true),
+          };
+          require(extent.arena === checkpoint.arena &&
+                  extent.arena === (checkpoint.generation & 1) &&
+                  extent.payloadSize === kChunkSize &&
+                  extent.offset + kDataHeaderSize + extent.payloadSize <=
+                    layout.highWater[extent.arena],
+                  description +
+                    ' historical extent does not occupy the checkpoint parity');
+          const arena = layout.arenas[extent.arena];
+          const header = arena.subarray(extent.offset,
+                                        extent.offset + kDataHeaderSize);
+          const headerView = new DataView(header.buffer, header.byteOffset,
+                                          header.byteLength);
+          requireMagic(arena, extent.offset, 'WFSV4DA1',
+                       description + ' historical data record');
+          require(headerView.getUint32(8, true) === 1 &&
+                  headerView.getUint32(12, true) === kDataHeaderSize &&
+                  readU64(headerView, 16,
+                          description + ' historical data record') ===
+                    checkpoint.generation &&
+                  readU64(headerView, 24,
+                          description + ' historical data record') ===
+                    kTargetInode &&
+                  readU64(headerView, 32,
+                          description + ' historical data record') === 0 &&
+                  headerView.getUint32(40, true) === kChunkSize &&
+                  headerView.getUint32(44, true) === 0 &&
+                  checksum(header, 56, 8) === headerView.getBigUint64(56, true) &&
+                  headerView.getBigUint64(48, true) === extent.checksum,
+                  description + ' historical data record is invalid');
+          const data = arena.subarray(extent.offset + kDataHeaderSize,
+                                      extent.offset + kDataHeaderSize +
+                                        extent.payloadSize);
+          require(checksum(data) === extent.checksum,
+                  description + ' historical data payload checksum is invalid');
+          requireEqualBytes(data.subarray(0, kExtentPayload.byteLength),
+                            kExtentPayload,
+                            description + ' historical data payload prefix');
+          return extent;
+        }
+
+        function parseExtentDelta(layout, outer, description) {
+          const payload = outer.payload;
+          const view = new DataView(payload.buffer, payload.byteOffset,
+                                    payload.byteLength);
+          requireMagic(payload, 0, 'WFSV4FS2', description + ' filesystem');
+          require(view.getUint32(8, true) === 2 &&
+                  view.getUint32(12, true) === kFilesystemHeaderSize &&
+                  readU64(view, 16, description + ' filesystem') ===
+                    outer.generation &&
+                  readU64(view, 24, description + ' filesystem') === 1 &&
+                  readU64(view, 32, description + ' filesystem') ===
+                    kExpectedNextInode &&
+                  view.getUint32(40, true) === 16 &&
+                  view.getUint32(44, true) === 0,
+                  description + ' is not a valid Schema-2 filesystem record');
+          const parent = {
+            generation: readU64(view, 48, description + ' filesystem'),
+            arena: view.getUint32(56, true),
+            offset: readU64(view, 64, description + ' filesystem'),
+            size: readU64(view, 72, description + ' filesystem'),
+            recordChecksum: view.getBigUint64(80, true),
+          };
+          const depth = view.getUint32(60, true);
+          const operationOffset = readU64(
+            view, 88, description + ' filesystem');
+          const operationCount = readU64(
+            view, 96, description + ' filesystem');
+          const blobOffset = readU64(view, 104, description + ' filesystem');
+          const blobSize = readU64(view, 112, description + ' filesystem');
+          require(parent.generation !== 0 &&
+                  parent.generation < outer.generation &&
+                  parent.arena < 2 &&
+                  parent.arena === (parent.generation & 1) && depth !== 0 &&
+                  operationOffset === kFilesystemHeaderSize &&
+                  operationCount === 1 &&
+                  blobOffset === operationOffset + kDeltaOperationSize &&
+                  blobSize === kFilesystemHeaderSize + 40 &&
+                  blobOffset + blobSize === payload.byteLength,
+                  description + ' does not have one bounded extent inode delta');
+          require(readU64(view, operationOffset,
+                          description + ' operation') === kTargetInode &&
+                  view.getUint32(operationOffset + 8, true) === 1 &&
+                  view.getUint32(operationOffset + 12, true) === 0 &&
+                  readU64(view, operationOffset + 16,
+                          description + ' operation') === blobOffset &&
+                  readU64(view, operationOffset + 24,
+                          description + ' operation') === blobSize,
+                  description + ' changes more than the target extent inode');
+          const inode = new DataView(payload.buffer,
+                                     payload.byteOffset + blobOffset, blobSize);
+          const targetMode = requireTargetMode(
+            inode.getUint32(16, true) & 0o777,
+            description + ' target inode');
+          require(readU64(inode, 0, description + ' target inode') ===
+                    kTargetInode &&
+                  inode.getUint32(8, true) === 1 &&
+                  readU64(inode, 48, description + ' target inode') ===
+                    kExtentPayload.byteLength &&
+                  readU64(inode, 56, description + ' target inode') ===
+                    kFilesystemHeaderSize &&
+                  readU64(inode, 64, description + ' target inode') === 0 &&
+                  readU64(inode, 72, description + ' target inode') ===
+                    kFilesystemHeaderSize &&
+                  readU64(inode, 80, description + ' target inode') === 1 &&
+                  readU64(inode, 88, description + ' target inode') === 0 &&
+                  readU64(inode, 96, description + ' target inode') === 0,
+                  description + ' target delta post-image lacks one extent');
+          const extent = {
+            arena: inode.getUint32(kFilesystemHeaderSize + 8, true),
+            payloadSize: inode.getUint32(kFilesystemHeaderSize + 12, true),
+            offset: readU64(inode, kFilesystemHeaderSize + 16,
+                            description + ' target extent'),
+            checksum: inode.getBigUint64(kFilesystemHeaderSize + 24, true),
+          };
+          require(readU64(inode, kFilesystemHeaderSize,
+                          description + ' target extent') === 0 &&
+                  extent.arena < 2 && extent.payloadSize === kChunkSize,
+                  description + ' target delta extent is invalid');
+          return {outer, generation: outer.generation, arena: outer.arena,
+                  parent, depth, targetMode, extent};
+        }
+
+        function requireParentReference(delta, parent, description) {
+          require(delta.parent.generation === parent.generation &&
+                  delta.parent.arena === parent.arena &&
+                  delta.parent.offset === parent.outer.offset &&
+                  delta.parent.size === parent.outer.size &&
+                  delta.parent.recordChecksum === parent.outer.recordChecksum,
+                  description + ' does not name its expected parent record');
+        }
+
+        function requireSameExtent(actual, expected, description) {
+          require(actual.arena === expected.arena &&
+                  actual.payloadSize === expected.payloadSize &&
+                  actual.offset === expected.offset &&
+                  actual.checksum === expected.checksum,
+                  description + ' did not retain the historical extent');
+        }
+
+        function requireExtentChronology(layout, checkpoint, description) {
+          requireExactPhysicalBounds(layout, description);
+          const fullExtent = requireHistoricalExtentCheckpoint(
+            layout, checkpoint, description);
+          const selected = parseOuterManifest(
+            layout, layout.arena, layout.manifestOffset, layout.manifestSize,
+            layout.generation, layout.manifestRecordChecksum,
+            description + ' selected delta');
+          const final = parseExtentDelta(layout, selected,
+                                         description + ' second delta');
+          require(final.generation === checkpoint.generation + 2 &&
+                  final.arena === checkpoint.arena &&
+                  final.depth >= 2 && final.depth === 2 &&
+                  final.extent.arena === (final.generation & 1) &&
+                  fullExtent.arena === (final.generation & 1),
+                  description +
+                    ' lacks a depth-two historical extent on selected parity');
+          const firstOuter = parseOuterManifest(
+            layout, final.parent.arena, final.parent.offset, final.parent.size,
+            final.parent.generation, final.parent.recordChecksum,
+            description + ' first delta parent');
+          const first = parseExtentDelta(layout, firstOuter,
+                                         description + ' first delta');
+          require(first.generation === checkpoint.generation + 1 &&
+                  first.depth === 1,
+                  description + ' does not retain the first Schema-2 successor');
+          requireParentReference(first, checkpoint,
+                                 description + ' first delta');
+          requireParentReference(final, first,
+                                 description + ' second delta');
+          requireSameExtent(first.extent, fullExtent,
+                            description + ' first delta');
+          requireSameExtent(final.extent, fullExtent,
+                            description + ' second delta');
+          return {fullExtent, first, final};
+        }
+
+        function requireSameSelectedExtentChronology(before, after, checkpoint) {
+          const beforeChronology = requireExtentChronology(
+            before, checkpoint,
+            'historical-extent fault selected chronology before factory');
+          const afterChronology = requireExtentChronology(
+            after, checkpoint,
+            'historical-extent fault selected chronology after factory');
+          requireSameSelectedTuple(after, before,
+                                   'historical-extent fault observer');
+          require(before.physical[0] === after.physical[0] &&
+                  before.physical[1] === after.physical[1],
+                  'historical-extent fault changed physical arena sizes');
+          const beforeWire = before.arenas[before.arena].subarray(
+            before.manifestOffset,
+            before.manifestOffset + kManifestHeaderSize + before.manifestSize);
+          const afterWire = after.arenas[after.arena].subarray(
+            after.manifestOffset,
+            after.manifestOffset + kManifestHeaderSize + after.manifestSize);
+          requireEqualBytes(beforeWire, afterWire,
+                            'historical-extent fault selected manifest wire');
+          require(beforeChronology.final.targetMode ===
+                    afterChronology.final.targetMode,
+                  'historical-extent fault changed the selected target mode');
+          return afterChronology;
+        }
+
+        function requireInterruptedDelta(layout, phase, checkpoint) {
+          if (phase === 1) {
+            // The first V4 witness does not expose the new descriptor.  The
+            // just-written Schema-2 bytes may remain only as an unreachable
+            // next-arena tail; native recovery must choose the old FS1 tree.
+            requireFullCheckpoint(layout, 'Schema-2 phase-1 interruption',
+                                  checkpoint, true);
+            return checkpoint;
+          }
+          require(phase === 2, 'unknown Schema-2 interruption phase');
+          // Both witnesses make the immediate Schema-2 successor
+          // authoritative. Its parent must still be reachable, so this
+          // validates the selected delta before the interrupted document is
+          // discarded.
+          return requireTinyDelta(layout, checkpoint,
+                                  'Schema-2 phase-2 interruption');
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function interruptAfterLeaseRelease(path, checkpoint, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              // The interruptor deliberately cannot drain.  Disposing only
+              // this fresh iframe supplies the recovery boundary; subsequent
+              // native roles retry until its profile lease has been released.
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.event !== 'interrupt' ||
+                message.checkpoint !== checkpoint) {
+              throw new Error(description + ' did not reach V4 phase ' +
+                              checkpoint + ': role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          await runAfterLeaseRelease('v4fs-delta-seed.html', kSeed,
+                                     'Schema-2 broad checkpoint seed');
+          const checkpoint = await prepareCheckpoint(
+            kProfile, 'v4fs-delta-advance.html',
+            'Schema-2 broad checkpoint preparation');
+          await runAfterLeaseRelease('v4fs-delta-advance.html', kAdvance,
+                                     'Schema-2 one-inode mutation');
+          const selectedDeltaBeforeFault = await waitForPhysicalLayout(
+            kProfile, 'Schema-2 selected delta before historical-parent fault');
+          const delta = requireTinyDelta(
+            selectedDeltaBeforeFault,
+            checkpoint, 'Schema-2 selected delta');
+          await runAfterLeaseRelease(
+            'v4fs-delta-parent-corruptor.html', kParentCorruptor,
+            'Schema-2 historical-parent fault rejects fresh mount EIO');
+          const selectedDeltaAfterFault = await waitForPhysicalLayout(
+            kProfile, 'Schema-2 selected delta after historical-parent fault');
+          requireSameSelectedDelta(selectedDeltaBeforeFault,
+                                   selectedDeltaAfterFault, checkpoint);
+          await runAfterLeaseRelease(
+            targetModeModule('v4fs-delta-replay', delta.targetMode), kReplay,
+            'Schema-2 clean fresh native replay after historical-parent fault');
+          await runAfterLeaseRelease(
+            targetModeModule('v4fs-delta-reload', delta.targetMode), kReload,
+            'Schema-2 second fresh native reload');
+          await runAfterLeaseRelease('v4fs-delta-extent-seed.html',
+                                     kExtentSeed,
+                                     'Schema-2 historical-extent seed');
+          const extentCheckpoint = await prepareCheckpoint(
+            kExtentProfile, 'v4fs-delta-extent-advance.html',
+            'Schema-2 historical-extent checkpoint preparation',
+            kExtentAdvance);
+          requireHistoricalExtentCheckpoint(
+            extentCheckpoint.layout, extentCheckpoint,
+            'Schema-2 historical-extent full checkpoint');
+          await runAfterLeaseRelease('v4fs-delta-extent-advance.html',
+                                     kExtentAdvance,
+                                     'Schema-2 historical-extent first delta');
+          await runAfterLeaseRelease('v4fs-delta-extent-advance.html',
+                                     kExtentAdvance,
+                                     'Schema-2 historical-extent second delta');
+          const extentBeforeFault = await waitForPhysicalLayout(
+            kExtentProfile, 'Schema-2 historical-extent selected chronology');
+          const extentChronology = requireExtentChronology(
+            extentBeforeFault, extentCheckpoint,
+            'Schema-2 historical-extent selected chronology');
+          await runAfterLeaseRelease(
+            'v4fs-delta-extent-corruptor.html', kExtentCorruptor,
+            'Schema-2 historical-extent fault rejects fresh mount EIO');
+          const extentAfterFault = await waitForPhysicalLayout(
+            kExtentProfile,
+            'Schema-2 historical-extent chronology after fault');
+          requireSameSelectedExtentChronology(
+            extentBeforeFault, extentAfterFault, extentCheckpoint);
+          await runAfterLeaseRelease(
+            targetModeModule('v4fs-delta-extent-replay',
+                             extentChronology.final.targetMode),
+            kExtentReplay,
+            'Schema-2 clean historical-extent binary replay');
+          await runAfterLeaseRelease(
+            targetModeModule('v4fs-delta-extent-reload',
+                             extentChronology.final.targetMode),
+            kExtentReload,
+            'Schema-2 historical-extent replay reload');
+__PHASE_SCRIPT__
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    '''.replace('__PROFILE__', profile).replace(
+      '__EXTENT_PROFILE__', extent_profile).replace('__PHASE_SCRIPT__',
+                                                   phase_script))
+    self.run_browser('a.html', '/report_result?0', timeout=600)
 
   @only_chromium
   @no_wasm64()
