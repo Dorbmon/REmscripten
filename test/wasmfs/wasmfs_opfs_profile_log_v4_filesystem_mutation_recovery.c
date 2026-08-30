@@ -5,11 +5,12 @@
 
 // Fresh-document recovery proof for a mounted V4 logical-profile filesystem.
 // A seed document commits a small inode tree. A second document stops after
-// either phase witness of a data overwrite or a replacement rename, and the
-// parent disposes that document. A fresh document must then expose precisely
-// the selected old or new tree, commit a further directory mutation, and a
-// final fresh document must reopen that result. This is a controlled
-// iframe-disposal test, not a physical-power-loss or Chrome-profile claim.
+// the durable descriptor pair or either phase witness of a data overwrite or
+// a replacement rename, and the parent disposes that document. A fresh
+// document must then expose precisely the selected old or new tree, commit a
+// further directory mutation, and a final fresh document must reopen that
+// result. This is a controlled iframe-disposal test, not a physical-power-loss
+// or Chrome-profile claim.
 
 #include <errno.h>
 #include <fcntl.h>

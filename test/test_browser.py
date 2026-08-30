@@ -9055,12 +9055,13 @@ Module["preRun"] = () => {
   @only_chromium
   @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_mutation_recovery(self):
-    # Interrupt real mounted-filesystem transactions at the V4 phase quorum,
-    # then reopen in fresh documents. Phase one must select the complete old
-    # data/tree; phase two must select the complete new data/tree. Every
-    # recovery result commits another directory mutation and reloads it. This
-    # is controlled iframe-disposal evidence, not a physical-crash, database,
-    # or Chromium-profile persistence claim.
+    # Interrupt real mounted-filesystem transactions after the durable
+    # descriptor pair or at the V4 phase quorum, then reopen in fresh
+    # documents. The descriptor-pair boundary and phase one must select the
+    # complete old data/tree; phase two must select the complete new data/tree.
+    # Every recovery result commits another directory mutation and reloads it.
+    # This is controlled iframe-disposal evidence, not a physical-crash,
+    # database, or Chromium-profile persistence claim.
     test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_mutation_recovery.c'
     common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
 
@@ -9088,7 +9089,7 @@ Module["preRun"] = () => {
     for mutation_name, mutation in (
         ('data', '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_DATA'),
         ('rename', '-DWASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_MUTATION_RECOVERY_TEST_RENAME')):
-      for phase in (1, 2):
+      for phase in (10, 1, 2):
         profile = ('wasmfs_profile_log_v4_filesystem_%s_recovery_%d_%016x' %
                    (mutation_name, phase, random.getrandbits(64)))
         prefix = 'v4fs-%s-recovery-%d' % (mutation_name, phase)

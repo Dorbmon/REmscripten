@@ -7132,6 +7132,13 @@ protected:
     if (int error = writeDescriptorPairLocked(descriptor, &descriptorChecksum)) {
       return error;
     }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT
+    // Both descriptor copies are durable here, but the previous equal phase
+    // pair remains the only selector authorization until a witness changes.
+    // Keep this test-only interruption boundary ahead of the first witness so
+    // recovery proves that the appended manifest is still unreachable.
+    wasmfs_opfs_profile_log_v4_test_maybe_interrupt(10);
+#endif
     if (int error = writePhaseWitnessLocked(
           0, recordGeneration, arena, descriptorChecksum)) {
       return error;
