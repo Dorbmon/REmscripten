@@ -75,6 +75,10 @@ constexpr char kOPFSGetChildProxyFailureTestName[] =
 #error "invalid profile-log V2 proxy completion failure selector"
 #endif
 
+#ifndef WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE
+#define WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE 0
+#endif
+
 #if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE
 // This is a narrow test trace: once V2 synthetically enters the terminal
 // post-acknowledgement-loss state, later Worker::proxy calls are counted. The
@@ -86,6 +90,20 @@ std::atomic<uint32_t> profileLogV2ProxiesAfterLatchForTesting = 0;
 
 void latchProfileLogV2ProxyCompletionForTesting() {
   profileLogV2ProxyCompletionLatchForTesting.store(true);
+}
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE
+// This is the V4 counterpart to the V2 terminal trace. The focused test
+// checks the explicit failed drain only; it cannot observe runtime destruction
+// after the holder document exits. Normal builds have neither this latch nor
+// these counters.
+std::atomic<bool> profileLogV4ProxyCompletionLatchForTesting = false;
+std::atomic<uint32_t> profileLogV4ProxyCompletionLatchCountForTesting = 0;
+std::atomic<uint32_t> profileLogV4ProxiesAfterLatchForTesting = 0;
+
+void latchProfileLogV4ProxyCompletionForTesting() {
+  profileLogV4ProxyCompletionLatchForTesting.store(true);
 }
 #endif
 
@@ -198,6 +216,11 @@ public:
 #if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE
     if (profileLogV2ProxyCompletionLatchForTesting.load()) {
       ++profileLogV2ProxiesAfterLatchForTesting;
+    }
+#endif
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE
+    if (profileLogV4ProxyCompletionLatchForTesting.load()) {
+      ++profileLogV4ProxiesAfterLatchForTesting;
     }
 #endif
     return proxy(func);
@@ -6120,6 +6143,11 @@ constexpr std::array<uint8_t, 8> kProfileLogV4ManifestMagic = {
 #error "invalid profile-log V4 selected corruption selector"
 #endif
 
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE < 0 || \
+  WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE > 1
+#error "invalid profile-log V4 proxy completion failure selector"
+#endif
+
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION < 0 || \
   WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION > 2
 #error "invalid profile-log V4 live corruption selector"
@@ -6399,6 +6427,17 @@ protected:
               store.arenas[nextArena], start, data, size)) {
           return error;
         }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
+        // Controlled acknowledgement-loss seam: this immutable arena record
+        // has really been written and flushed, but the transaction must enter
+        // the same terminal state as a lost native completion before it can
+        // construct or publish the outer manifest, descriptor, or witnesses.
+        // This is not a literal ProxyWorker failure or a crash simulation.
+        ++profileLogV4ProxyCompletionLatchCountForTesting;
+        latchProfileLogV4ProxyCompletionForTesting();
+        store.terminalCloseState->recordUnacknowledgedProxyCompletion();
+        return store.poisonLocked(-EIO);
+#endif
       }
       *offset = start;
       nextHighWater[nextArena] = start + size;
@@ -11416,6 +11455,16 @@ void wasmfs_opfs_direct_operation_admission_race_test_reset(void) {
 #if WASMFS_OPFS_PROFILE_LOG_V2_TEST_PROXY_COMPLETION_FAILURE
 int wasmfs_opfs_profile_log_v2_test_proxies_after_latch(void) {
   return profileLogV2ProxiesAfterLatchForTesting.load();
+}
+#endif
+
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE
+int wasmfs_opfs_profile_log_v4_test_proxy_completion_latch_count(void) {
+  return profileLogV4ProxyCompletionLatchCountForTesting.load();
+}
+
+int wasmfs_opfs_profile_log_v4_test_proxies_after_latch(void) {
+  return profileLogV4ProxiesAfterLatchForTesting.load();
 }
 #endif
 

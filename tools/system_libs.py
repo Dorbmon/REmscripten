@@ -2052,6 +2052,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
         'opfs_profile_log_v4_test_interrupt')
     self.opfs_profile_log_v4_test_selected_corruption = kwargs.pop(
         'opfs_profile_log_v4_test_selected_corruption')
+    self.opfs_profile_log_v4_test_proxy_completion_failure = kwargs.pop(
+        'opfs_profile_log_v4_test_proxy_completion_failure')
     self.opfs_profile_log_v4_test_live_corruption = kwargs.pop(
         'opfs_profile_log_v4_test_live_corruption')
     self.opfs_profile_log_v4_test_historical_parent_corruption = kwargs.pop(
@@ -2110,6 +2112,10 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       cflags += [
           '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION=' +
           str(self.opfs_profile_log_v4_test_selected_corruption)]
+    if self.opfs_profile_log_v4_test_proxy_completion_failure:
+      cflags += [
+          '-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE=' +
+          str(self.opfs_profile_log_v4_test_proxy_completion_failure)]
     if self.opfs_profile_log_v4_test_live_corruption:
       cflags += ['-DWASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION=' +
                  str(self.opfs_profile_log_v4_test_live_corruption)]
@@ -2169,6 +2175,9 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
     if self.opfs_profile_log_v4_test_selected_corruption:
       name += '-opfs-profile-log-v4-selected-corruption-' + str(
           self.opfs_profile_log_v4_test_selected_corruption)
+    if self.opfs_profile_log_v4_test_proxy_completion_failure:
+      name += '-opfs-profile-log-v4-proxy-completion-failure-' + str(
+          self.opfs_profile_log_v4_test_proxy_completion_failure)
     if self.opfs_profile_log_v4_test_live_corruption:
       name += '-opfs-profile-log-v4-live-corruption-' + str(
           self.opfs_profile_log_v4_test_live_corruption)
@@ -2203,6 +2212,7 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
       'opfs_profile_log_v3_test_forced_commit_error',
       'opfs_profile_log_v4_test_interrupt',
       'opfs_profile_log_v4_test_selected_corruption',
+      'opfs_profile_log_v4_test_proxy_completion_failure',
       'opfs_profile_log_v4_test_live_corruption',
       'opfs_profile_log_v4_test_historical_parent_corruption',
       'opfs_profile_log_v4_test_historical_extent_corruption',
@@ -2239,6 +2249,8 @@ class libwasmfs(DebugLibrary, AsanInstrumentedLibrary, MTLibrary):
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT),
         opfs_profile_log_v4_test_selected_corruption=(
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION),
+        opfs_profile_log_v4_test_proxy_completion_failure=(
+            settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE),
         opfs_profile_log_v4_test_live_corruption=(
             settings.WASMFS_OPFS_PROFILE_LOG_V4_TEST_LIVE_CORRUPTION),
         opfs_profile_log_v4_test_historical_parent_corruption=bool(

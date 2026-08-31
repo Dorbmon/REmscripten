@@ -1933,6 +1933,15 @@ var WASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT = 0;
 // [link]
 var WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION = 0;
 
+// Test-only selector that simulates loss of the native completion
+// acknowledgement after a V4 filesystem transaction has durably flushed one
+// immutable arena record, but before it can publish an outer manifest,
+// descriptor, or phase witness. It controls system-library source selection
+// only, exposes no production runtime API, and is not a browser-crash or
+// power-loss simulation.
+// [link]
+var WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE = 0;
+
 // Test-only selector that faults live V4 integrity revalidation after a
 // factory has accepted its on-disk state: phase quorum (1) or bootstrap
 // quorum (2). It is compiled into a system-library variation and never

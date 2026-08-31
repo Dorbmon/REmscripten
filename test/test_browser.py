@@ -8945,6 +8945,245 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_proxy_completion_failure(self):
+    # This controlled V4 acknowledgement-loss witness starts from a separately
+    # drained A, faults B exactly once only after its immutable record has
+    # really flushed but before outer V4 publication, then proves the failed
+    # holder retains its lease. After actual holder EXIT_RUNTIME, a fresh
+    # document must read A rather than B, publish C, and a further fresh
+    # reload must read C. This is not a literal ProxyWorker failure, browser
+    # crash, power loss, or OPFS-directory-durability simulation.
+    test = 'wasmfs/wasmfs_opfs_profile_fail_closed_retirement.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = ('wasmfs_profile_log_v4_proxy_completion_%016x' %
+               random.getrandbits(64))
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_FAIL_CLOSED_RETIREMENT_TEST_PROFILE_NAME=' +
+      profile)
+
+    create_file('profile-v4-proxy-completion-holder-pre.js', r'''
+      Module['onExit'] = (status) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-exit',
+            status,
+            type: 'wasmfs-opfs-profile-log-v4-proxy-completion',
+          },
+          window.location.origin);
+      };
+      Module['onAbort'] = (reason) => {
+        window.parent.postMessage(
+          {
+            event: 'holder-abort',
+            reason: String(reason),
+            type: 'wasmfs-opfs-profile-log-v4-proxy-completion',
+          },
+          window.location.origin);
+      };
+    ''')
+
+    def compile_role(output, role, extra_args=None):
+      args = common_args + [profile_arg, role]
+      if extra_args:
+        args += extra_args
+      self.compile_btest(
+        test, args + ['-o', output], reporting=Reporting.NONE)
+
+    compile_role(
+      'v4-proxy-completion-seed.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_SEED')
+    compile_role(
+      'v4-proxy-completion-holder.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_HOLDER',
+      [
+        '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE=1',
+        '-sEXIT_RUNTIME',
+        '--pre-js',
+        'profile-v4-proxy-completion-holder-pre.js',
+      ])
+    compile_role(
+      'v4-proxy-completion-contender.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_CONTENDER')
+    compile_role(
+      'v4-proxy-completion-verifier.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_VERIFIER')
+    compile_role(
+      'v4-proxy-completion-reload.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_RELOAD')
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kSeed = 3;
+        const kHolder = 4;
+        const kContender = 5;
+        const kVerifier = 6;
+        const kReload = 7;
+        const kReady = 0;
+        const kBusy = 1;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v4-proxy-completion';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pendingModules = new Map();
+        const pendingHolderExits = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function startModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingModules.delete(frame.contentWindow);
+              frame.remove();
+              reject(new Error('timed out waiting for ' + path));
+            }, kEventTimeoutMs);
+            pendingModules.set(frame.contentWindow, {frame, resolve, reject, timeout});
+            frame.src = path;
+          });
+        }
+
+        function waitForHolderExit(frame) {
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingHolderExits.delete(frame.contentWindow);
+              reject(new Error('timed out waiting for holder exit'));
+            }, kEventTimeoutMs);
+            pendingHolderExits.set(frame.contentWindow, {resolve, reject, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          if (event.data.event === 'holder-exit') {
+            const pending = pendingHolderExits.get(event.source);
+            if (!pending) {
+              return;
+            }
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pending.timeout);
+            if (event.data.status !== 0) {
+              pending.reject(new Error('holder exited with status ' +
+                                       event.data.status));
+            } else {
+              pending.resolve();
+            }
+            return;
+          }
+          const pendingExit = pendingHolderExits.get(event.source);
+          if (event.data.event === 'holder-abort' && pendingExit) {
+            pendingHolderExits.delete(event.source);
+            clearTimeout(pendingExit.timeout);
+            pendingExit.reject(new Error('holder aborted: ' +
+                                         event.data.reason));
+            return;
+          }
+          const pending = pendingModules.get(event.source);
+          if (!pending) {
+            return;
+          }
+          pendingModules.delete(event.source);
+          clearTimeout(pending.timeout);
+          if (event.data.event === 'holder-abort') {
+            pending.frame.remove();
+            pending.reject(new Error('holder aborted: ' + event.data.reason));
+            return;
+          }
+          pending.resolve({frame: pending.frame, message: event.data});
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = await startModule(path);
+            try {
+              if (module.message.role !== role) {
+                throw new Error(description + ' reported role ' +
+                                module.message.role);
+              }
+              // The native role reports kBusy only after it compared errno
+              // against EBUSY. Keep that ABI assertion in C rather than
+              // duplicating a host-side errno number here.
+              if (module.message.result === kBusy &&
+                  module.message.error !== 0) {
+                await delay(100);
+                continue;
+              }
+              if (module.message.result !== kReady ||
+                  module.message.error !== 0) {
+                throw new Error(description + ' failed: result=' +
+                                module.message.result + ', errno=' +
+                                module.message.error);
+              }
+              return;
+            } finally {
+              module.frame.remove();
+            }
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function expectBusyContender() {
+          const contender = await startModule('v4-proxy-completion-contender.html');
+          try {
+            if (contender.message.role !== kContender ||
+                contender.message.result !== kBusy ||
+                contender.message.error === 0) {
+              throw new Error('contender did not observe retained EBUSY lease: '
+                              + 'role=' + contender.message.role +
+                              ', result=' + contender.message.result +
+                              ', errno=' + contender.message.error);
+            }
+          } finally {
+            contender.frame.remove();
+          }
+        }
+
+        (async () => {
+          await runAfterLeaseRelease(
+            'v4-proxy-completion-seed.html', kSeed,
+            'durable A seed');
+          const holder =
+            await startModule('v4-proxy-completion-holder.html');
+          if (holder.message.role !== kHolder ||
+              holder.message.result !== kReady || holder.message.error !== 0) {
+            holder.frame.remove();
+            throw new Error('post-flush B holder failed: result=' +
+                            holder.message.result + ', errno=' +
+                            holder.message.error);
+          }
+          await expectBusyContender();
+          const holderExit = waitForHolderExit(holder.frame);
+          holder.frame.contentWindow.Module
+            ._wasmfs_opfs_profile_fail_closed_retirement_holder_shutdown();
+          await holderExit;
+          holder.frame.remove();
+          await runAfterLeaseRelease(
+            'v4-proxy-completion-verifier.html', kVerifier,
+            'fresh A recovery and C publication');
+          await runAfterLeaseRelease(
+            'v4-proxy-completion-reload.html', kReload,
+            'fresh C reload');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_bootstrap_recovery(self):
     # Every safe native bootstrap cut point runs in a fresh iframe. The parent
     # discards that document at the exact durable witness checkpoint and proves
