@@ -123,6 +123,26 @@ int wasmfs_drain_opfs_profile_backend(
 int wasmfs_fail_closed_opfs_profile_backend(
   backend_t backend, wasmfs_opfs_profile_drain_result* result);
 
+// Test-only controls for the selected V4 immutable-log acknowledgement-loss
+// witness. These symbols are present only in an artifact linked with
+// WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE. They are not a
+// general OPFS failure-injection interface.
+//
+// `wasmfs_opfs_profile_log_v4_test_proxy_completion_arm()` grants exactly one
+// pending fault to the calling application pthread and returns one on success.
+// Only that thread may consume the fault, which prevents unrelated profile
+// work on another thread from taking it before the selected operation reaches
+// the V4 post-flush, pre-publication boundary. It returns zero if the selected
+// module has already armed or consumed the one-shot control.
+int wasmfs_opfs_profile_log_v4_test_proxy_completion_arm(void);
+
+// These counters are meaningful only for the same selected V4 test artifact.
+// The latch count reaches one when the post-flush fault was consumed;
+// `proxies_after_latch` is an immediate diagnostic snapshot, not a lifetime
+// guarantee about later runtime teardown traffic.
+int wasmfs_opfs_profile_log_v4_test_proxy_completion_latch_count(void);
+int wasmfs_opfs_profile_log_v4_test_proxies_after_latch(void);
+
 #ifdef __cplusplus
 }
 #endif

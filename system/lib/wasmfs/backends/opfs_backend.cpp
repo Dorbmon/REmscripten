@@ -97,9 +97,11 @@ void latchProfileLogV2ProxyCompletionForTesting() {
 // This is the V4 counterpart to the V2 terminal trace. The focused test
 // checks the explicit failed drain only; it cannot observe runtime destruction
 // after the holder document exits. A selected test must explicitly arm this
-// one-shot seam after its setup work. That prevents unrelated mount or startup
-// transactions from consuming the fault before the operation under test.
-// Normal builds have neither this latch nor these counters or control.
+// one-shot seam after its setup work. Only the thread that armed it may
+// consume it, so an unrelated profile operation on another thread cannot
+// consume the fault between the target's arm and mutation. The global state
+// still permits only one arm per selected module. Normal builds have neither
+// this latch nor these counters or control.
 enum ProfileLogV4ProxyCompletionTestState {
   ProfileLogV4ProxyCompletionTestIdle,
   ProfileLogV4ProxyCompletionTestArmed,
@@ -108,22 +110,29 @@ enum ProfileLogV4ProxyCompletionTestState {
 
 std::atomic<int> profileLogV4ProxyCompletionStateForTesting =
   ProfileLogV4ProxyCompletionTestIdle;
+thread_local bool profileLogV4ProxyCompletionArmedOnThisThread = false;
 std::atomic<bool> profileLogV4ProxyCompletionLatchForTesting = false;
 std::atomic<uint32_t> profileLogV4ProxyCompletionLatchCountForTesting = 0;
 std::atomic<uint32_t> profileLogV4ProxiesAfterLatchForTesting = 0;
 
 int armProfileLogV4ProxyCompletionForTesting() {
   int expected = ProfileLogV4ProxyCompletionTestIdle;
-  return profileLogV4ProxyCompletionStateForTesting.compare_exchange_strong(
-           expected, ProfileLogV4ProxyCompletionTestArmed)
-           ? 1
-           : 0;
+  if (!profileLogV4ProxyCompletionStateForTesting.compare_exchange_strong(
+          expected, ProfileLogV4ProxyCompletionTestArmed)) {
+    return 0;
+  }
+  profileLogV4ProxyCompletionArmedOnThisThread = true;
+  return 1;
 }
 
 bool consumeProfileLogV4ProxyCompletionForTesting() {
+  if (!profileLogV4ProxyCompletionArmedOnThisThread) {
+    return false;
+  }
+  profileLogV4ProxyCompletionArmedOnThisThread = false;
   int expected = ProfileLogV4ProxyCompletionTestArmed;
   return profileLogV4ProxyCompletionStateForTesting.compare_exchange_strong(
-    expected, ProfileLogV4ProxyCompletionTestLatched);
+      expected, ProfileLogV4ProxyCompletionTestLatched);
 }
 
 void latchProfileLogV4ProxyCompletionForTesting() {

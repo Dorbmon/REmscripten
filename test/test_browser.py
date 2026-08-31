@@ -8997,6 +8997,11 @@ Module["preRun"] = () => {
       '-DWASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_HOLDER',
       [
         '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE=1',
+        # PROXY_TO_PTHREAD, the mounted V4 ProxyWorker, and the affinity
+        # probe's child each need a worker. Preallocate all three so the
+        # barrier protocol cannot rely on dynamic worker creation.
+        '-sPTHREAD_POOL_SIZE=3',
+        '-sPTHREAD_POOL_SIZE_STRICT=2',
         '-sEXIT_RUNTIME',
         '--pre-js',
         'profile-v4-proxy-completion-holder-pre.js',

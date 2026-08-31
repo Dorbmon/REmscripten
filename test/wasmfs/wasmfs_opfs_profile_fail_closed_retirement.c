@@ -24,6 +24,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@
 #include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
 #include <emscripten/wasmfs.h>
+#include <emscripten/wasmfs_opfs_profile_drain.h>
 
 #if !defined(WASMFS_OPFS_PROFILE_FAIL_CLOSED_RETIREMENT_TEST_HOLDER) && \
   !defined(WASMFS_OPFS_PROFILE_FAIL_CLOSED_RETIREMENT_TEST_CONTENDER) && \
@@ -103,9 +105,13 @@ static const uint8_t kMarker[] = {
 };
 static const char kProxyMountPath[] = "/v4fs-proxy-completion";
 static const char kProxyMarkerPath[] = "/v4fs-proxy-completion/marker";
+static const char kProxyThreadScratchPath[] =
+  "/v4fs-proxy-completion/thread-affinity";
 static const uint8_t kProxySeedMarker[] = "V4-proxy-completion-A";
 static const uint8_t kProxyRejectedMarker[] = "V4-proxy-completion-B";
 static const uint8_t kProxyRecoveredMarker[] = "V4-proxy-completion-C";
+static const uint8_t kProxyThreadScratchMarker[] =
+  "V4-proxy-completion-thread";
 
 static int ErrorOrEIO(void) { return errno ? errno : EIO; }
 
@@ -306,9 +312,80 @@ static int RunProxySeed(void) {
 }
 
 #if defined(WASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_HOLDER)
-extern int wasmfs_opfs_profile_log_v4_test_proxy_completion_arm(void);
-extern int wasmfs_opfs_profile_log_v4_test_proxy_completion_latch_count(void);
-extern int wasmfs_opfs_profile_log_v4_test_proxies_after_latch(void);
+struct ProxyThreadAffinityState {
+  pthread_barrier_t start_barrier;
+  int scratch;
+  int error;
+};
+
+static int WaitForProxyThreadBarrier(pthread_barrier_t* barrier) {
+  const int result = pthread_barrier_wait(barrier);
+  return result == 0 || result == PTHREAD_BARRIER_SERIAL_THREAD ? 0 : EIO;
+}
+
+static void* MutateProxyThreadScratch(void* opaque) {
+  struct ProxyThreadAffinityState* state = opaque;
+  int error = WaitForProxyThreadBarrier(&state->start_barrier);
+  if (!error &&
+      pwrite(state->scratch,
+             kProxyThreadScratchMarker,
+             sizeof(kProxyThreadScratchMarker),
+             0) != (ssize_t)sizeof(kProxyThreadScratchMarker)) {
+    error = ErrorOrEIO();
+  }
+  if (!error && fdatasync(state->scratch) != 0) {
+    error = ErrorOrEIO();
+  }
+  if (state->scratch >= 0) {
+    if (close(state->scratch) != 0 && !error) {
+      error = ErrorOrEIO();
+    }
+    state->scratch = -1;
+  }
+  state->error = error;
+  return NULL;
+}
+
+static int RunProxyThreadAffinityProbe(int scratch) {
+  struct ProxyThreadAffinityState state = {
+    .scratch = scratch,
+    .error = 0,
+  };
+  if (pthread_barrier_init(&state.start_barrier, NULL, 2) != 0) {
+    close(scratch);
+    return EIO;
+  }
+
+  pthread_t thread;
+  int error = 0;
+  if (pthread_create(&thread, NULL, MutateProxyThreadScratch, &state) != 0) {
+    error = EIO;
+    close(scratch);
+    state.scratch = -1;
+  } else {
+    // The parent owns the one global arm. The barrier makes the child's real
+    // V4 write, flush, and close happen after that arm but before the parent's
+    // rejected B write. A non-thread-affine seam would be consumed by the
+    // child, which this test rejects before it reaches B.
+    if (wasmfs_opfs_profile_log_v4_test_proxy_completion_arm() != 1) {
+      error = EIO;
+    }
+    if (WaitForProxyThreadBarrier(&state.start_barrier) != 0 && !error) {
+      error = EIO;
+    }
+    if (pthread_join(thread, NULL) != 0 && !error) {
+      error = EIO;
+    }
+    if (state.error && !error) {
+      error = state.error;
+    }
+  }
+
+  if (pthread_barrier_destroy(&state.start_barrier) != 0 && !error) {
+    error = EIO;
+  }
+  return error;
+}
 
 static int RunProxyHolder(void) {
   backend_t backend = NULL;
@@ -321,11 +398,12 @@ static int RunProxyHolder(void) {
     }
   }
   if (!error) {
-    // The selected V4 variation is deliberately inert through mount and open.
-    // Arm its one-shot post-flush seam only for this holder's rejected B
-    // mutation so the test proves a targeted acknowledgement-loss boundary.
-    if (wasmfs_opfs_profile_log_v4_test_proxy_completion_arm() != 1) {
-      error = EIO;
+    const int scratch =
+      open(kProxyThreadScratchPath, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (scratch < 0) {
+      error = ErrorOrEIO();
+    } else {
+      error = RunProxyThreadAffinityProbe(scratch);
     }
   }
   if (!error) {
