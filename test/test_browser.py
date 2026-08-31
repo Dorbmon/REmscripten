@@ -8570,6 +8570,162 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_format_namespace(self):
+    # The opaque V4 manifest and mountable V4 filesystem use one logical
+    # profile name in four fresh documents. A valid opaque manifest must not
+    # be parsed as filesystem state, filesystem writes must not overwrite it,
+    # and a later opaque mutation must not overwrite the filesystem sentinel.
+    # This is physical-format namespace isolation only, not a concurrent-
+    # writer, database, browser-crash, or Chromium-profile test.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_format_namespace.c'
+    common_args = ['-sWASMFS', '-pthread', '-sPROXY_TO_PTHREAD', '-lopfs.js']
+    profile = (
+      f'wasmfs_profile_log_v4_format_namespace_{random.getrandbits(64):016x}')
+    profile_arg = (
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FORMAT_NAMESPACE_TEST_PROFILE_NAME=' +
+      profile)
+
+    def compile_role(output, role):
+      self.compile_btest(
+        test, common_args + [profile_arg, role, '-o', output],
+        reporting=Reporting.NONE)
+
+    compile_role(
+      'v4-format-manifest-owner.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FORMAT_NAMESPACE_TEST_MANIFEST_OWNER')
+    compile_role(
+      'v4-format-filesystem-owner.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FORMAT_NAMESPACE_TEST_FILESYSTEM_OWNER')
+    compile_role(
+      'v4-format-manifest-mutator.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FORMAT_NAMESPACE_TEST_MANIFEST_MUTATOR')
+    compile_role(
+      'v4-format-filesystem-verifier.html',
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_FORMAT_NAMESPACE_TEST_FILESYSTEM_VERIFIER')
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kManifestOwner = 0;
+        const kFilesystemOwner = 1;
+        const kManifestMutator = 2;
+        const kFilesystemVerifier = 3;
+        const kReady = 0;
+        const kBusy = 16;
+        const kWitnessType = 'wasmfs-opfs-profile-log-v4-format-namespace';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, predicate, description) {
+          const index = module.events.findIndex(predicate);
+          if (index >= 0) {
+            return Promise.resolve(module.events.splice(index, 1)[0]);
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const waiter = module.waiters.findIndex(
+                (candidate) => candidate.resolve === resolve);
+              if (waiter >= 0) {
+                module.waiters.splice(waiter, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({predicate, resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          const waiter = module.waiters.findIndex(
+            (candidate) => candidate.predicate(event.data));
+          if (waiter >= 0) {
+            const candidate = module.waiters.splice(waiter, 1)[0];
+            clearTimeout(candidate.timeout);
+            candidate.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(
+                module, (event) => event.event === 'result', description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.result !== kReady ||
+                message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', result=' + message.result + ', errno=' +
+                              message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          await runAfterLeaseRelease(
+            'v4-format-manifest-owner.html', kManifestOwner,
+            'V4 opaque-manifest owner');
+          await runAfterLeaseRelease(
+            'v4-format-filesystem-owner.html', kFilesystemOwner,
+            'fresh V4 filesystem owner with the same profile');
+          await runAfterLeaseRelease(
+            'v4-format-manifest-mutator.html', kManifestMutator,
+            'fresh V4 opaque-manifest mutator');
+          await runAfterLeaseRelease(
+            'v4-format-filesystem-verifier.html', kFilesystemVerifier,
+            'fresh V4 filesystem verifier');
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''')
+    self.run_browser('a.html', '/report_result?0', timeout=180)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_fail_closed_retirement(self):
     # A higher-level profile owner can reject its own close/fence result after
     # all WasmFS writes succeeded. The explicit failure-retirement ABI must
