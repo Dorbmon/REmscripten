@@ -5,13 +5,15 @@
 
 // Browser-coordinated proof for the mountable V4 logical-profile filesystem.
 // Every role runs in a fresh same-origin document and reaches OPFS only through
-// the native leased backend.  The test proves durable directory topology,
-// regular-file content and metadata, copy-on-write chunk reads, truncation
-// and zero fill, replacement rename, symlink identity, unlinked-open-file
-// behavior, directory fsync, and a clean profile-lease handoff.  It does not
-// claim physical power-loss behavior, database recovery, Chromium shutdown
-// integration, or record-lock support; those are separate gates.
+// the native leased backend.  The test proves durable directory topology and
+// exact enumeration, regular-file content and metadata, copy-on-write chunk
+// reads, truncation and zero fill, replacement rename, symlink identity,
+// unlinked-open-file behavior, directory fsync, and a clean profile-lease
+// handoff.  It does not claim physical power-loss behavior, database recovery,
+// Chromium shutdown integration, or record-lock support; those are separate
+// gates.
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -97,6 +99,12 @@ struct Witness {
   uint64_t data_size;
   int64_t data_mtime_sec;
   int64_t data_mtime_nsec;
+};
+
+struct ExpectedDirectoryEntry {
+  const char* name;
+  unsigned char type;
+  uint64_t ino;
 };
 
 static int ErrorOrEIO(void) { return errno ? errno : EIO; }
@@ -327,6 +335,105 @@ static int CheckAbsent(const char* path) {
   return lstat(path, &status) == -1 && errno == ENOENT ? 0 : EIO;
 }
 
+static int CheckDirectoryEntries(const char* path,
+                                 const struct ExpectedDirectoryEntry* expected,
+                                 size_t expected_count) {
+  int seen[8] = {};
+  if (!expected || expected_count > sizeof(seen) / sizeof(seen[0])) {
+    return EINVAL;
+  }
+  DIR* directory = opendir(path);
+  if (!directory) {
+    return ErrorOrEIO();
+  }
+  int error = 0;
+  errno = 0;
+  for (struct dirent* entry; (entry = readdir(directory));) {
+    if (strcmp(entry->d_name, ".") == 0 ||
+        strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+    size_t index = 0;
+    while (index != expected_count &&
+           strcmp(entry->d_name, expected[index].name) != 0) {
+      ++index;
+    }
+    if (index == expected_count || seen[index] ||
+        entry->d_type != expected[index].type ||
+        (uint64_t)entry->d_ino != expected[index].ino) {
+      error = EIO;
+      break;
+    }
+    seen[index] = 1;
+  }
+  if (!error && errno != 0) {
+    error = ErrorOrEIO();
+  }
+  if (!error) {
+    for (size_t index = 0; index != expected_count; ++index) {
+      if (!seen[index]) {
+        error = EIO;
+        break;
+      }
+    }
+  }
+  const int close_error = closedir(directory) == 0 ? 0 : ErrorOrEIO();
+  return error ? error : close_error;
+}
+
+static int CheckDirectoryTopology(const struct Witness* witness,
+                                  int final_topology) {
+  if (!witness) {
+    return EINVAL;
+  }
+  struct stat live = {};
+  struct stat incoming = {};
+  if (stat(kLivePath, &live) != 0 || !S_ISDIR(live.st_mode) ||
+      !live.st_ino || stat(kIncomingPath, &incoming) != 0 ||
+      !S_ISDIR(incoming.st_mode) || !incoming.st_ino) {
+    return ErrorOrEIO();
+  }
+  const struct ExpectedDirectoryEntry root_entries[] = {
+    {"incoming", DT_DIR, incoming.st_ino},
+    {"live", DT_DIR, live.st_ino},
+    {"state", DT_REG, witness->state_ino},
+  };
+  int error = CheckDirectoryEntries(kMountPath, root_entries,
+                                    sizeof(root_entries) /
+                                      sizeof(root_entries[0]));
+  if (error) {
+    return error;
+  }
+
+  const struct ExpectedDirectoryEntry initial_live_entries[] = {
+    {"data", DT_REG, witness->data_ino},
+    {"data-link", DT_LNK, witness->link_ino},
+    {"orphan", DT_REG, witness->orphan_ino},
+    {"replaced", DT_REG, witness->replaced_ino},
+  };
+  const struct ExpectedDirectoryEntry final_live_entries[] = {
+    {"data", DT_REG, witness->data_ino},
+    {"data-link", DT_LNK, witness->link_ino},
+    {"replaced", DT_REG, witness->move_ino},
+  };
+  error = CheckDirectoryEntries(
+    kLivePath, final_topology ? final_live_entries : initial_live_entries,
+    final_topology ? sizeof(final_live_entries) / sizeof(final_live_entries[0])
+                   : sizeof(initial_live_entries) /
+                       sizeof(initial_live_entries[0]));
+  if (error) {
+    return error;
+  }
+
+  const struct ExpectedDirectoryEntry initial_incoming_entries[] = {
+    {"move-me", DT_REG, witness->move_ino},
+  };
+  return CheckDirectoryEntries(
+    kIncomingPath, initial_incoming_entries,
+    final_topology ? 0 : sizeof(initial_incoming_entries) /
+                           sizeof(initial_incoming_entries[0]));
+}
+
 static int PopulateOwner(struct Witness* witness) {
   if (mkdir(kLivePath, 0700) != 0 || mkdir(kIncomingPath, 0700) != 0) {
     return ErrorOrEIO();
@@ -419,6 +526,9 @@ static int PopulateOwner(struct Witness* witness) {
   if (error || state_close_error) {
     return error ? error : state_close_error;
   }
+  if ((error = CheckDirectoryTopology(witness, false))) {
+    return error;
+  }
   return FlushAllDirectories();
 }
 
@@ -435,6 +545,10 @@ static int VerifyOwner(const struct Witness* witness) {
       stat(kOrphanPath, &status) != 0 ||
       (uint64_t)status.st_ino != witness->orphan_ino) {
     return EIO;
+  }
+  const int topology_error = CheckDirectoryTopology(witness, false);
+  if (topology_error) {
+    return topology_error;
   }
   const int fd = open(kDataPath, O_RDONLY);
   if (fd < 0) {
@@ -542,6 +656,9 @@ static int Mutate(struct Witness* witness) {
   if ((error = WriteWitness(witness))) {
     return error;
   }
+  if ((error = CheckDirectoryTopology(witness, true))) {
+    return error;
+  }
   return FlushAllDirectories();
 }
 
@@ -569,6 +686,10 @@ static int VerifyFinal(const struct Witness* witness) {
       (uint64_t)status.st_ino != witness->move_ino ||
       CheckAbsent(kMovePath) || CheckAbsent(kOrphanPath)) {
     return EIO;
+  }
+  const int topology_error = CheckDirectoryTopology(witness, true);
+  if (topology_error) {
+    return topology_error;
   }
   return FlushAllDirectories();
 }
