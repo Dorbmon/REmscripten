@@ -3068,6 +3068,18 @@ int _mmap_js(size_t length,
     return -ENOTSUP;
   }
 
+  // A backend that reconstructs reads from snapshots or copy-on-write
+  // generations cannot expose a detached heap copy as a read-only shared
+  // mapping. Return an explicit unsupported result so callers such as SQLite
+  // can fall back to positioned reads instead of observing stale file bytes.
+  if (!(flags & MAP_ANONYMOUS) && mapType == MAP_SHARED &&
+      !(prot & PROT_WRITE)) {
+    if (auto* backend = file->getBackend();
+        backend && !backend->supportsReadOnlySharedMmap()) {
+      return -ENOTSUP;
+    }
+  }
+
   // TODO: On MAP_SHARED, install the mapping on the DataFile object itself so
   // that reads and writes can be redirected to the mapped region and so that
   // the mapping can correctly outlive the file being closed. This will require

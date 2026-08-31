@@ -233,6 +233,10 @@ public:
     return backend->requiresAtomicMetadataMutations();
   }
 
+  bool supportsReadOnlySharedMmap() const override {
+    return backend->supportsReadOnlySharedMmap();
+  }
+
   std::shared_ptr<DataFile> createFile(mode_t mode) override {
     return virtualize(backend->createFile(mode), this);
   }

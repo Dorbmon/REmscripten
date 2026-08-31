@@ -8494,6 +8494,13 @@ public:
     return profileLeaseState->supportsRecordLocks();
   }
 
+  bool supportsReadOnlySharedMmap() const override {
+    // A V4 file read is reconstructed from immutable copy-on-write extents.
+    // WasmFS can only return a detached heap copy for mmap(), so it cannot
+    // keep a MAP_SHARED view coherent across a later durable publication.
+    return false;
+  }
+
   int validateOperation() override {
     ProfileLeaseState::InternalOperation operation(*profileLeaseState);
     if (!operation) {

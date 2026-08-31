@@ -88,6 +88,13 @@ public:
   // cross-instance data races.
   virtual bool supportsRecordLocks() const { return false; }
 
+  // Whether this backend can provide the sharing and lifetime semantics of a
+  // file-backed, non-writable MAP_SHARED mapping. Backends that store file
+  // data as snapshots or copy-on-write generations must return false rather
+  // than let WasmFS expose a detached heap copy as a shared mapping. The
+  // default preserves the historical behavior for existing backends.
+  virtual bool supportsReadOnlySharedMmap() const { return true; }
+
   // Validate storage state once after a public WasmFS operation has acquired
   // this backend's admission token and before pathname or descriptor caches
   // can answer from a previously discovered File object. Persistent backends

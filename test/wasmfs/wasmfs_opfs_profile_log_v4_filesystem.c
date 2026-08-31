@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -532,7 +533,45 @@ static int PopulateOwner(struct Witness* witness) {
   return FlushAllDirectories();
 }
 
-static int VerifyOwner(const struct Witness* witness) {
+static int CheckReadOnlySharedMmapUnsupported(backend_t backend) {
+  const int fd = open(kDataPath, O_RDWR);
+  if (fd < 0) {
+    return ErrorOrEIO();
+  }
+  int error = 0;
+  if (wasmfs_get_backend_by_fd(fd) != backend) {
+    error = EIO;
+  }
+  errno = 0;
+  void* mapping = NULL;
+  if (!error) {
+    mapping = mmap(NULL, kInitialSize, PROT_READ, MAP_SHARED, fd, 0);
+    if (mapping != MAP_FAILED) {
+      (void)munmap(mapping, kInitialSize);
+      error = EIO;
+    } else if (errno != ENOTSUP) {
+      error = EIO;
+    }
+  }
+  if (!error) {
+    mapping = mmap(NULL, kInitialSize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapping == MAP_FAILED) {
+      error = ErrorOrEIO();
+    } else {
+      MakeInitialPayload();
+      if (memcmp(mapping, payload, kInitialSize) != 0) {
+        error = EIO;
+      }
+      if (munmap(mapping, kInitialSize) != 0 && !error) {
+        error = ErrorOrEIO();
+      }
+    }
+  }
+  const int close_error = CloseChecked(fd);
+  return error ? error : close_error;
+}
+
+static int VerifyOwner(const struct Witness* witness, backend_t backend) {
   if (!witness || witness->phase != 1 ||
       CheckDataStat(witness, kInitialSize, true) || CheckLink(witness)) {
     return EIO;
@@ -549,6 +588,10 @@ static int VerifyOwner(const struct Witness* witness) {
   const int topology_error = CheckDirectoryTopology(witness, false);
   if (topology_error) {
     return topology_error;
+  }
+  const int mmap_error = CheckReadOnlySharedMmapUnsupported(backend);
+  if (mmap_error) {
+    return mmap_error;
   }
   const int fd = open(kDataPath, O_RDONLY);
   if (fd < 0) {
@@ -718,7 +761,7 @@ int main(void) {
     error = ReadWitness(&witness);
   }
   if (!error) {
-    error = VerifyOwner(&witness);
+    error = VerifyOwner(&witness, backend);
   }
   if (!error) {
     error = Mutate(&witness);
