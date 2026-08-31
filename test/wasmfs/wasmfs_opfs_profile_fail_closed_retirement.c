@@ -306,6 +306,7 @@ static int RunProxySeed(void) {
 }
 
 #if defined(WASMFS_OPFS_PROFILE_LOG_V4_PROXY_COMPLETION_TEST_HOLDER)
+extern int wasmfs_opfs_profile_log_v4_test_proxy_completion_arm(void);
 extern int wasmfs_opfs_profile_log_v4_test_proxy_completion_latch_count(void);
 extern int wasmfs_opfs_profile_log_v4_test_proxies_after_latch(void);
 
@@ -320,11 +321,20 @@ static int RunProxyHolder(void) {
     }
   }
   if (!error) {
+    // The selected V4 variation is deliberately inert through mount and open.
+    // Arm its one-shot post-flush seam only for this holder's rejected B
+    // mutation so the test proves a targeted acknowledgement-loss boundary.
+    if (wasmfs_opfs_profile_log_v4_test_proxy_completion_arm() != 1) {
+      error = EIO;
+    }
+  }
+  if (!error) {
     errno = 0;
     const ssize_t result = pwrite(
       marker, kProxyRejectedMarker, sizeof(kProxyRejectedMarker), 0);
     const int write_error = errno;
-    if (result != -1 || write_error != EIO) {
+    if (result != -1 || write_error != EIO ||
+        wasmfs_opfs_profile_log_v4_test_proxy_completion_arm() != 0) {
       error = EIO;
     }
   }

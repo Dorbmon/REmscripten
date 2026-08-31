@@ -96,11 +96,35 @@ void latchProfileLogV2ProxyCompletionForTesting() {
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE
 // This is the V4 counterpart to the V2 terminal trace. The focused test
 // checks the explicit failed drain only; it cannot observe runtime destruction
-// after the holder document exits. Normal builds have neither this latch nor
-// these counters.
+// after the holder document exits. A selected test must explicitly arm this
+// one-shot seam after its setup work. That prevents unrelated mount or startup
+// transactions from consuming the fault before the operation under test.
+// Normal builds have neither this latch nor these counters or control.
+enum ProfileLogV4ProxyCompletionTestState {
+  ProfileLogV4ProxyCompletionTestIdle,
+  ProfileLogV4ProxyCompletionTestArmed,
+  ProfileLogV4ProxyCompletionTestLatched,
+};
+
+std::atomic<int> profileLogV4ProxyCompletionStateForTesting =
+  ProfileLogV4ProxyCompletionTestIdle;
 std::atomic<bool> profileLogV4ProxyCompletionLatchForTesting = false;
 std::atomic<uint32_t> profileLogV4ProxyCompletionLatchCountForTesting = 0;
 std::atomic<uint32_t> profileLogV4ProxiesAfterLatchForTesting = 0;
+
+int armProfileLogV4ProxyCompletionForTesting() {
+  int expected = ProfileLogV4ProxyCompletionTestIdle;
+  return profileLogV4ProxyCompletionStateForTesting.compare_exchange_strong(
+           expected, ProfileLogV4ProxyCompletionTestArmed)
+           ? 1
+           : 0;
+}
+
+bool consumeProfileLogV4ProxyCompletionForTesting() {
+  int expected = ProfileLogV4ProxyCompletionTestArmed;
+  return profileLogV4ProxyCompletionStateForTesting.compare_exchange_strong(
+    expected, ProfileLogV4ProxyCompletionTestLatched);
+}
 
 void latchProfileLogV4ProxyCompletionForTesting() {
   profileLogV4ProxyCompletionLatchForTesting.store(true);
@@ -6428,15 +6452,18 @@ protected:
           return error;
         }
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
-        // Controlled acknowledgement-loss seam: this immutable arena record
-        // has really been written and flushed, but the transaction must enter
-        // the same terminal state as a lost native completion before it can
-        // construct or publish the outer manifest, descriptor, or witnesses.
-        // This is not a literal ProxyWorker failure or a crash simulation.
-        ++profileLogV4ProxyCompletionLatchCountForTesting;
-        latchProfileLogV4ProxyCompletionForTesting();
-        store.terminalCloseState->recordUnacknowledgedProxyCompletion();
-        return store.poisonLocked(-EIO);
+        if (consumeProfileLogV4ProxyCompletionForTesting()) {
+          // Controlled acknowledgement-loss seam: this immutable arena record
+          // has really been written and flushed, but the transaction must
+          // enter the same terminal state as a lost native completion before
+          // it can construct or publish the outer manifest, descriptor, or
+          // witnesses. This is not a literal ProxyWorker failure or a crash
+          // simulation.
+          ++profileLogV4ProxyCompletionLatchCountForTesting;
+          latchProfileLogV4ProxyCompletionForTesting();
+          store.terminalCloseState->recordUnacknowledgedProxyCompletion();
+          return store.poisonLocked(-EIO);
+        }
 #endif
       }
       *offset = start;
@@ -11459,6 +11486,10 @@ int wasmfs_opfs_profile_log_v2_test_proxies_after_latch(void) {
 #endif
 
 #if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE
+int wasmfs_opfs_profile_log_v4_test_proxy_completion_arm(void) {
+  return armProfileLogV4ProxyCompletionForTesting();
+}
+
 int wasmfs_opfs_profile_log_v4_test_proxy_completion_latch_count(void) {
   return profileLogV4ProxyCompletionLatchCountForTesting.load();
 }

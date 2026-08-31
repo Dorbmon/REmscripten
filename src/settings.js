@@ -1936,9 +1936,10 @@ var WASMFS_OPFS_PROFILE_LOG_V4_TEST_SELECTED_CORRUPTION = 0;
 // Test-only selector that simulates loss of the native completion
 // acknowledgement after a V4 filesystem transaction has durably flushed one
 // immutable arena record, but before it can publish an outer manifest,
-// descriptor, or phase witness. It controls system-library source selection
-// only, exposes no production runtime API, and is not a browser-crash or
-// power-loss simulation.
+// descriptor, or phase witness. Its selected system-library variation exposes
+// one native test-only arm control so startup transactions cannot consume the
+// one-shot seam. It exposes no host JavaScript API and is not a browser-crash
+// or power-loss simulation.
 // [link]
 var WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE = 0;
 
