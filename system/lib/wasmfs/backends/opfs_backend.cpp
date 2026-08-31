@@ -6460,20 +6460,6 @@ protected:
               store.arenas[nextArena], start, data, size)) {
           return error;
         }
-#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
-        if (consumeProfileLogV4ProxyCompletionForTesting()) {
-          // Controlled acknowledgement-loss seam: this immutable arena record
-          // has really been written and flushed, but the transaction must
-          // enter the same terminal state as a lost native completion before
-          // it can construct or publish the outer manifest, descriptor, or
-          // witnesses. This is not a literal ProxyWorker failure or a crash
-          // simulation.
-          ++profileLogV4ProxyCompletionLatchCountForTesting;
-          latchProfileLogV4ProxyCompletionForTesting();
-          store.terminalCloseState->recordUnacknowledgedProxyCompletion();
-          return store.poisonLocked(-EIO);
-        }
-#endif
       }
       *offset = start;
       nextHighWater[nextArena] = start + size;
@@ -7194,6 +7180,19 @@ protected:
           arenas[arena], manifestOffset, header.data(), header.size())) {
       return error;
     }
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
+    if (consumeProfileLogV4ProxyCompletionForTesting()) {
+      // Controlled acknowledgement loss at the common V4 publication
+      // boundary. The complete next manifest is durable, including a
+      // namespace-only rename transaction, but no descriptor or phase witness
+      // can make it selected. This is not a literal ProxyWorker failure or a
+      // crash simulation.
+      ++profileLogV4ProxyCompletionLatchCountForTesting;
+      latchProfileLogV4ProxyCompletionForTesting();
+      terminalCloseState->recordUnacknowledgedProxyCompletion();
+      return poisonLocked(-EIO);
+    }
+#endif
     auto nextHighWater = startHighWater;
     nextHighWater[arena] = end;
     ProfileLogV4Descriptor descriptor = {recordGeneration,

@@ -16,8 +16,8 @@
 //
 // The separate V4 proxy-completion role family below reuses this holder /
 // contender / actual-EXIT_RUNTIME harness. It starts from an independently
-// drained seed, then faults after a real immutable-record flush but before
-// outer V4 publication. It is a controlled acknowledgement-loss test, not a
+// drained seed, then faults after a real V4 manifest flush but before outer
+// V4 publication. It is a controlled acknowledgement-loss test, not a
 // literal ProxyWorker failure, browser crash, power-loss, or OPFS directory
 // durability simulation.
 
@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -105,6 +106,8 @@ static const uint8_t kMarker[] = {
 };
 static const char kProxyMountPath[] = "/v4fs-proxy-completion";
 static const char kProxyMarkerPath[] = "/v4fs-proxy-completion/marker";
+static const char kProxyReplacementPath[] =
+  "/v4fs-proxy-completion/replacement";
 static const char kProxyThreadScratchPath[] =
   "/v4fs-proxy-completion/thread-affinity";
 static const uint8_t kProxySeedMarker[] = "V4-proxy-completion-A";
@@ -252,12 +255,15 @@ static int RunVerifier(void) {
   return error ? error : drain_error;
 }
 
-static int WriteProxyMarker(const uint8_t* marker, size_t size, int create) {
-  if (!marker || !size) {
+static int WriteProxyMarkerAtPath(const char* path,
+                                  const uint8_t* marker,
+                                  size_t size,
+                                  int create) {
+  if (!path || !marker || !size) {
     return EINVAL;
   }
   const int flags = create ? O_CREAT | O_EXCL | O_RDWR : O_RDWR;
-  const int fd = open(kProxyMarkerPath, flags, 0600);
+  const int fd = open(path, flags, 0600);
   if (fd < 0) {
     return ErrorOrEIO();
   }
@@ -272,6 +278,10 @@ static int WriteProxyMarker(const uint8_t* marker, size_t size, int create) {
     error = ErrorOrEIO();
   }
   return error;
+}
+
+static int WriteProxyMarker(const uint8_t* marker, size_t size, int create) {
+  return WriteProxyMarkerAtPath(kProxyMarkerPath, marker, size, create);
 }
 
 static int ReadProxyMarker(const uint8_t* marker, size_t size) {
@@ -365,8 +375,8 @@ static int RunProxyThreadAffinityProbe(int scratch) {
   } else {
     // The parent owns the one global arm. The barrier makes the child's real
     // V4 write, flush, and close happen after that arm but before the parent's
-    // rejected B write. A non-thread-affine seam would be consumed by the
-    // child, which this test rejects before it reaches B.
+    // rejected B rename. A non-thread-affine seam would be consumed by the
+    // child, which this test rejects before it reaches that replacement.
     if (wasmfs_opfs_profile_log_v4_test_proxy_completion_arm() != 1) {
       error = EIO;
     }
@@ -398,6 +408,15 @@ static int RunProxyHolder(void) {
     }
   }
   if (!error) {
+    // Match ImportantFileWriter's final replacement boundary: B is written,
+    // flushed, and closed under a temporary path before the selected parent
+    // thread arms the V4 manifest publication fault and calls rename.
+    error = WriteProxyMarkerAtPath(kProxyReplacementPath,
+                                   kProxyRejectedMarker,
+                                   sizeof(kProxyRejectedMarker),
+                                   true);
+  }
+  if (!error) {
     const int scratch =
       open(kProxyThreadScratchPath, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (scratch < 0) {
@@ -408,10 +427,9 @@ static int RunProxyHolder(void) {
   }
   if (!error) {
     errno = 0;
-    const ssize_t result = pwrite(
-      marker, kProxyRejectedMarker, sizeof(kProxyRejectedMarker), 0);
-    const int write_error = errno;
-    if (result != -1 || write_error != EIO ||
+    const int rename_result = rename(kProxyReplacementPath, kProxyMarkerPath);
+    const int rename_error = errno;
+    if (rename_result != -1 || rename_error != EIO ||
         wasmfs_opfs_profile_log_v4_test_proxy_completion_arm() != 0) {
       error = EIO;
     }
@@ -470,7 +488,7 @@ static int RunProxyVerifier(void) {
     error = ReadProxyMarker(kProxySeedMarker, sizeof(kProxySeedMarker));
   }
   // This first fresh logical write forces V4 to trim the unreachable,
-  // post-flush B append tail before it can publish C.
+  // post-flush replacement manifest before it can publish C.
   if (!error) {
     error = WriteProxyMarker(
       kProxyRecoveredMarker, sizeof(kProxyRecoveredMarker), false);

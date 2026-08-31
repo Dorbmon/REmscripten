@@ -8947,7 +8947,7 @@ Module["preRun"] = () => {
   @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_proxy_completion_failure(self):
     # This controlled V4 acknowledgement-loss witness starts from a separately
-    # drained A, faults B exactly once only after its immutable record has
+    # drained A, faults B exactly once only after its replacement manifest has
     # really flushed but before outer V4 publication, then proves the failed
     # holder retains its lease. After actual holder EXIT_RUNTIME, a fresh
     # document must read A rather than B, publish C, and a further fresh
