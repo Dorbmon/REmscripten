@@ -321,6 +321,17 @@ public:
     recordFailedAccessClose(-EIO);
   }
 
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
+  void recordControlledUnacknowledgedProxyCompletionForTesting() {
+    // The V4 source-selected publication fault is injected after its browser
+    // write and flush have completed. It needs the same no-later-proxy latch
+    // as an unknown completion, but it is not a failed browser-handle close
+    // that scoped retirement must report as prior cleanup damage.
+    int expected = 0;
+    (void)unacknowledgedProxyError.compare_exchange_strong(expected, -EIO);
+  }
+#endif
+
   int getFailedAccessCloseError() const { return firstError.load(); }
 
   int getUnacknowledgedProxyError() const {
@@ -6487,6 +6498,19 @@ protected:
   ProfileLogV4Descriptor selectedDescriptor = {};
   bool hasSelectedDescriptor = false;
   int fatalError = 0;
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
+  // The selected publication fault is injected only after the underlying
+  // manifest write and flush have returned. It reuses the terminal no-proxy
+  // latch so ordinary post-fault access stays fail-closed, but unlike a real
+  // missing ProxyWorker completion it leaves no browser-side handle operation
+  // of unknown outcome.
+  bool controlledProxyCompletionFailureForTesting = false;
+
+  bool hasControlledProxyCompletionFailureForTesting() {
+    std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    return controlledProxyCompletionFailureForTesting;
+  }
+#endif
   // An empty tag retains the names published by the V4 opaque-manifest
   // experiment.  A logical filesystem must use a distinct tag so an opaque
   // payload, including V4's initial zero-length manifest, can never be
@@ -7189,7 +7213,9 @@ protected:
       // crash simulation.
       ++profileLogV4ProxyCompletionLatchCountForTesting;
       latchProfileLogV4ProxyCompletionForTesting();
-      terminalCloseState->recordUnacknowledgedProxyCompletion();
+      controlledProxyCompletionFailureForTesting = true;
+      terminalCloseState
+        ->recordControlledUnacknowledgedProxyCompletionForTesting();
       return poisonLocked(-EIO);
     }
 #endif
@@ -8187,6 +8213,18 @@ public:
       } else {
         std::lock_guard<std::recursive_mutex> lock(storeMutex);
         if (int error = stopAfterUnacknowledgedProxyLocked()) {
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
+          if (!checkResources && controlledProxyCompletionFailureForTesting) {
+            // This source-selected fault occurs after a known completed
+            // manifest flush, not during an OPFS handle operation. The
+            // terminal latch above has already abandoned every physical
+            // wrapper and closed destructor proxying, so explicit
+            // failure-retirement can retain the lease without issuing a
+            // second proxy or converting the intentional disposition into a
+            // cleanup failure. A normal drain still receives |error|.
+            return 0;
+          }
+#endif
           return error;
         }
         firstError = closeAllFilesForRetirementLocked(!fatalError);
@@ -11449,6 +11487,16 @@ int ProfileLogV4FilesystemBackend::prepareOPFSProfileRetirement(
       firstError = operation.getError();
     } else {
       std::lock_guard<std::recursive_mutex> lock(filesystemMutex);
+#if WASMFS_OPFS_PROFILE_LOG_V4_TEST_PROXY_COMPLETION_FAILURE == 1
+      if (!checkResources &&
+          hasControlledProxyCompletionFailureForTesting()) {
+        // The source-selected post-flush publication fault poisons the
+        // logical mutation that was in progress. Its V4 envelope has already
+        // closed every wrapper/destructor proxy path, however, so the
+        // explicit retained-lease disposition must not try a logical flush or
+        // turn that known test fault into a second cleanup failure.
+      } else
+#endif
       if (filesystemFatal) {
         // An inner logical manifest or chunk validation error is not recorded
         // by the outer V4 store, but it is still a profile-integrity failure.

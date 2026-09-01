@@ -399,14 +399,7 @@ static int RunProxyThreadAffinityProbe(int scratch) {
 
 static int RunProxyHolder(void) {
   backend_t backend = NULL;
-  int marker = -1;
   int error = MountFilesystem(&backend, kProxyMountPath);
-  if (!error) {
-    marker = open(kProxyMarkerPath, O_RDWR);
-    if (marker < 0) {
-      error = ErrorOrEIO();
-    }
-  }
   if (!error) {
     // Match ImportantFileWriter's final replacement boundary: B is written,
     // flushed, and closed under a temporary path before the selected parent
@@ -436,19 +429,23 @@ static int RunProxyHolder(void) {
   }
   if (backend) {
     wasmfs_opfs_profile_drain_result details = {0};
-    const int drain = wasmfs_drain_opfs_profile_backend(backend, &details);
+    // Chromium uses the explicit retained-lease failure disposition after its
+    // real replacement error. There are no open user descriptors here: the
+    // temporary B file and the thread-affinity scratch file were both closed
+    // before the selected rename. The control must therefore prove that this
+    // known post-flush seam seals/retains without a later proxy or a synthetic
+    // cleanup failure.
+    const int drain =
+      wasmfs_fail_closed_opfs_profile_backend(backend, &details);
     if (!error &&
-        (drain != -EIO || details.error != -EIO ||
-         !details.backend_sealed || details.lease_released ||
-         details.backend_retired)) {
+        (drain != -ESHUTDOWN || details.error != -ESHUTDOWN ||
+         details.detached_descriptors != 0 || details.data_file_states != 0 ||
+         details.libc_flush_failed != 0 || details.data_flush_failures != 0 ||
+         details.data_close_failures != 0 || details.prior_close_failures != 0 ||
+         details.lease_release_failures != 0 ||
+         details.backend_retire_failures != 0 || !details.backend_sealed ||
+         details.lease_released || details.backend_retired)) {
       error = EIO;
-    }
-    if (!error) {
-      char byte = 0;
-      errno = 0;
-      if (read(marker, &byte, 1) != -1 || errno != EBADF) {
-        error = EIO;
-      }
     }
     if (!error) {
       wasmfs_opfs_profile_drain_result again = {0};
@@ -465,8 +462,6 @@ static int RunProxyHolder(void) {
        wasmfs_opfs_profile_log_v4_test_proxies_after_latch() != 0)) {
     error = EIO;
   }
-  // The failed drain detached |marker|. Never close its invalid descriptor:
-  // document teardown owns the retained worker/lease tombstone.
   return error;
 }
 #endif
