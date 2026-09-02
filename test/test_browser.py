@@ -9653,6 +9653,234 @@ Module["preRun"] = () => {
 
   @only_chromium
   @no_wasm64()
+  def test_wasmfs_opfs_profile_log_v4_filesystem_sqlite_recovery(self):
+    # SQLite uses an observed DELETE rollback journal with synchronous=FULL on
+    # the mounted V4 filesystem.  An un-interrupted fresh-document control
+    # commits and reloads B.  Each interruption is armed only while COMMIT B
+    # is executing and stops after a V4 durable descriptor-pair, phase-one, or
+    # phase-two publication.  A fresh document must pass integrity_check and
+    # recover one complete A/B pair, never a mixed pair, before it commits and
+    # freshly reopens C.  This is controlled iframe-disposal evidence, not a
+    # physical power-loss, WAL, LevelDB, or Chromium-profile persistence claim.
+    test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_sqlite_recovery.c'
+    common_args = [
+      '-sWASMFS',
+      '-pthread',
+      '-sPROXY_TO_PTHREAD',
+      '-lopfs.js',
+      '-sUSE_SQLITE3',
+    ]
+
+    def profile_arg(profile):
+      return ('-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_PROFILE_NAME=' +
+              profile)
+
+    def compile_role(output, profile, role, phase=None, reload_state=None):
+      args = common_args + [profile_arg(profile), role]
+      if phase is not None:
+        args += [
+          ('-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_INTERRUPT_PHASE=' +
+           str(phase)),
+          '-sWASMFS_OPFS_PROFILE_LOG_V4_TEST_INTERRUPT=1',
+        ]
+      if reload_state is not None:
+        args += [
+          ('-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_RELOAD_STATE=' +
+           str(reload_state)),
+        ]
+      self.compile_btest(test, args + ['-o', output], reporting=Reporting.NONE)
+
+    control_profile = ('wasmfs_profile_log_v4_filesystem_sqlite_recovery_control_%016x' %
+                       random.getrandbits(64))
+    control_seed = 'v4fs-sqlite-recovery-control-seed.html'
+    control = 'v4fs-sqlite-recovery-control.html'
+    control_reload = 'v4fs-sqlite-recovery-control-reload.html'
+    compile_role(
+      control_seed, control_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_SEED')
+    compile_role(
+      control, control_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_CONTROL')
+    compile_role(
+      control_reload, control_profile,
+      '-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_RELOAD',
+      reload_state=2)
+
+    cases = []
+    for phase in (10, 1, 2):
+      profile = ('wasmfs_profile_log_v4_filesystem_sqlite_recovery_%d_%016x' %
+                 (phase, random.getrandbits(64)))
+      prefix = 'v4fs-sqlite-recovery-%d' % phase
+      seed = prefix + '-seed.html'
+      interruptor = prefix + '-interruptor.html'
+      verifier = prefix + '-verifier.html'
+      reload = prefix + '-reload.html'
+      compile_role(
+        seed, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_SEED')
+      compile_role(
+        interruptor, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_INTERRUPTOR',
+        phase=phase)
+      compile_role(
+        verifier, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_VERIFIER')
+      compile_role(
+        reload, profile,
+        '-DWASMFS_OPFS_PROFILE_LOG_V4_SQLITE_RECOVERY_TEST_RELOAD')
+      cases.append((phase, seed, interruptor, verifier, reload))
+
+    case_script = '\n'.join(
+      "          await runAfterLeaseRelease('%s', kSeed, 'SQLite phase %d seed');\n"
+      "          await interruptAfterLeaseRelease('%s', %d, 'SQLite phase %d interruption');\n"
+      "          await runAfterLeaseRelease('%s', kVerifier, 'SQLite phase %d recovery verifier');\n"
+      "          await runAfterLeaseRelease('%s', kReload, 'SQLite phase %d fresh reload');" %
+      (seed, phase, interruptor, phase, phase, verifier, phase, reload, phase)
+      for phase, seed, interruptor, verifier, reload in cases)
+
+    self.add_browser_reporting()
+    create_file('a.html', r'''
+      <!doctype html>
+      <meta charset="utf-8">
+      <body></body>
+      <script src="browser_reporting.js"></script>
+      <script>
+        const kSeed = 0;
+        const kInterruptor = 1;
+        const kVerifier = 2;
+        const kReload = 3;
+        const kControl = 4;
+        const kBusy = 16;
+        const kWitnessType =
+          'wasmfs-opfs-profile-log-v4-filesystem-sqlite-recovery';
+        const kEventTimeoutMs = 25000;
+        const kReleaseAttempts = 80;
+        const pending = new Map();
+
+        function delay(milliseconds) {
+          return new Promise((resolve) => setTimeout(resolve, milliseconds));
+        }
+
+        function launchModule(path) {
+          const frame = document.createElement('iframe');
+          frame.style.display = 'none';
+          document.body.appendChild(frame);
+          const module = {frame, events: [], waiters: []};
+          pending.set(frame.contentWindow, module);
+          frame.src = path;
+          return module;
+        }
+
+        function disposeModule(module) {
+          pending.delete(module.frame.contentWindow);
+          module.frame.remove();
+        }
+
+        function waitFor(module, description) {
+          if (module.events.length) {
+            return Promise.resolve(module.events.shift());
+          }
+          return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              const index = module.waiters.findIndex(
+                (waiter) => waiter.resolve === resolve);
+              if (index >= 0) {
+                module.waiters.splice(index, 1);
+              }
+              reject(new Error('timed out waiting for ' + description));
+            }, kEventTimeoutMs);
+            module.waiters.push({resolve, timeout});
+          });
+        }
+
+        window.addEventListener('message', (event) => {
+          if (event.origin !== window.location.origin ||
+              event.data?.type !== kWitnessType) {
+            return;
+          }
+          const module = pending.get(event.source);
+          if (!module) {
+            return;
+          }
+          if (module.waiters.length) {
+            const waiter = module.waiters.shift();
+            clearTimeout(waiter.timeout);
+            waiter.resolve(event.data);
+          } else {
+            module.events.push(event.data);
+          }
+        });
+
+        async function runAfterLeaseRelease(path, role, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.role !== role || message.error !== 0) {
+              throw new Error(description + ' failed: role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        async function interruptAfterLeaseRelease(path, checkpoint, description) {
+          for (let attempt = 0; attempt < kReleaseAttempts; ++attempt) {
+            const module = launchModule(path);
+            let message;
+            try {
+              message = await waitFor(module, description);
+            } finally {
+              disposeModule(module);
+            }
+            if (message.error === kBusy) {
+              await delay(100);
+              continue;
+            }
+            if (message.event !== 'interrupt' ||
+                message.checkpoint !== checkpoint ||
+                message.role !== kInterruptor || message.error !== 0) {
+              throw new Error(description + ' did not reach checkpoint ' +
+                              checkpoint + ': role=' + message.role +
+                              ', errno=' + message.error);
+            }
+            return;
+          }
+          throw new Error(description + ' never acquired the released lease');
+        }
+
+        (async () => {
+          await runAfterLeaseRelease('%(control_seed)s', kSeed,
+                                     'SQLite un-interrupted control seed');
+          await runAfterLeaseRelease('%(control)s', kControl,
+                                     'SQLite un-interrupted control commit');
+          await runAfterLeaseRelease('%(control_reload)s', kReload,
+                                     'SQLite un-interrupted control reload');
+%(case_script)s
+          reportResultToServer('0');
+        })().catch((error) => {
+          reportResultToServer('failure: ' + error.message);
+        });
+      </script>
+    ''' % {
+      'case_script': case_script,
+      'control_seed': control_seed,
+      'control': control,
+      'control_reload': control_reload,
+    })
+    self.run_browser('a.html', '/report_result?0', timeout=300)
+
+  @only_chromium
+  @no_wasm64()
   def test_wasmfs_opfs_profile_log_v4_filesystem_tail_recovery(self):
     # A phase-one interruption leaves a real unreachable V4 append tail. The
     # parent only reads the named test artifacts to establish that boundary;
