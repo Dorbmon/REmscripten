@@ -12038,6 +12038,8 @@ __PHASE_SCRIPT__
     # filesystem's leased single-process subset in separate documents: another
     # profile instance is rejected while a holder owns the Web Lock, then both
     # document teardown and explicit drain release it for a fresh lock user.
+    # Each fresh verifier also uses two independently opened SQLite DELETE-mode
+    # connections to exercise SQLite's real write-contention VFS path.
     test = 'wasmfs/wasmfs_opfs_profile_log_v4_filesystem_locks.c'
     common_args = [
       '-sWASMFS',
@@ -12045,6 +12047,7 @@ __PHASE_SCRIPT__
       '-sPROXY_TO_PTHREAD',
       '-lopfs.js',
       '-sWASMFS_RECORD_LOCK_TEST=1',
+      '-sUSE_SQLITE3',
     ]
     profile = 'wasmfs_profile_log_v4_locks_%016x' % random.getrandbits(64)
     profile_arg = (

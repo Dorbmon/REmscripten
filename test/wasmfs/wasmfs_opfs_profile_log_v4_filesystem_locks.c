@@ -19,6 +19,7 @@
 #include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
 #include <emscripten/wasmfs.h>
+#include <sqlite3.h>
 
 #if !defined(WASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_HOLDER) && \
   !defined(WASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_CONTENDER) && \
@@ -75,6 +76,7 @@ static const char kProfileName[] =
     WASMFS_OPFS_PROFILE_LOG_V4_FILESYSTEM_LOCK_TEST_PROFILE_NAME);
 static const char kMountPath[] = "/v4fs-locks";
 static const char kDataPath[] = "/v4fs-locks/database";
+static const char kSQLitePath[] = "/v4fs-locks/sqlite-locking.db";
 static const uint8_t kContents[] = {
   0x64, 0x61, 0x74, 0x61, 0x62, 0x61, 0x73, 0x65,
 };
@@ -218,6 +220,207 @@ static int CheckRecordLocks(int fd) {
     return ErrorOrEIO();
   }
   return readonly_result == -1 && readonly_error == EBADF ? 0 : EIO;
+}
+
+static int SQLiteError(int result) {
+  return result == SQLITE_OK || result == SQLITE_ROW || result == SQLITE_DONE
+           ? 0
+           : EIO;
+}
+
+static int ExecSQLite(sqlite3* database, const char* sql) {
+  if (!database || !sql) {
+    return EINVAL;
+  }
+  char* message = NULL;
+  const int result = sqlite3_exec(database, sql, NULL, NULL, &message);
+  sqlite3_free(message);
+  return SQLiteError(result);
+}
+
+static int OpenSQLite(sqlite3** database, int create) {
+  if (!database) {
+    return EINVAL;
+  }
+  *database = NULL;
+  int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_PRIVATECACHE;
+  if (create) {
+    flags |= SQLITE_OPEN_CREATE;
+  }
+  const int result = sqlite3_open_v2(kSQLitePath, database, flags, NULL);
+  if (result != SQLITE_OK) {
+    if (*database) {
+      sqlite3_close(*database);
+      *database = NULL;
+    }
+    return EIO;
+  }
+  return sqlite3_busy_timeout(*database, 0) == SQLITE_OK ? 0 : EIO;
+}
+
+static int CloseSQLite(sqlite3** database) {
+  if (!database || !*database) {
+    return EINVAL;
+  }
+  const int result = sqlite3_close(*database);
+  if (result != SQLITE_OK) {
+    return EIO;
+  }
+  *database = NULL;
+  return 0;
+}
+
+static int CheckSQLiteText(sqlite3* database,
+                           const char* sql,
+                           const char* expected) {
+  if (!database || !sql || !expected) {
+    return EINVAL;
+  }
+  sqlite3_stmt* statement = NULL;
+  int result = sqlite3_prepare_v2(database, sql, -1, &statement, NULL);
+  if (result == SQLITE_OK) {
+    result = sqlite3_step(statement);
+  }
+  if (result == SQLITE_ROW) {
+    const unsigned char* actual = sqlite3_column_text(statement, 0);
+    if (!actual || strcmp((const char*)actual, expected) != 0) {
+      result = SQLITE_ERROR;
+    } else {
+      result = sqlite3_step(statement);
+    }
+  }
+  const int finalize_result =
+    statement ? sqlite3_finalize(statement) : SQLITE_OK;
+  return result == SQLITE_DONE && finalize_result == SQLITE_OK ? 0 : EIO;
+}
+
+static int CheckSQLiteInteger(sqlite3* database,
+                              const char* sql,
+                              int expected) {
+  if (!database || !sql) {
+    return EINVAL;
+  }
+  sqlite3_stmt* statement = NULL;
+  int result = sqlite3_prepare_v2(database, sql, -1, &statement, NULL);
+  if (result == SQLITE_OK) {
+    result = sqlite3_step(statement);
+  }
+  if (result == SQLITE_ROW) {
+    if (sqlite3_column_int(statement, 0) != expected) {
+      result = SQLITE_ERROR;
+    } else {
+      result = sqlite3_step(statement);
+    }
+  }
+  const int finalize_result =
+    statement ? sqlite3_finalize(statement) : SQLITE_OK;
+  return result == SQLITE_DONE && finalize_result == SQLITE_OK ? 0 : EIO;
+}
+
+static int ReadSQLiteRevision(sqlite3* database, int* revision) {
+  if (!database || !revision) {
+    return EINVAL;
+  }
+  sqlite3_stmt* statement = NULL;
+  int result = sqlite3_prepare_v2(
+    database, "SELECT revision FROM lock_state WHERE id = 1", -1,
+    &statement, NULL);
+  if (result != SQLITE_OK) {
+    return EIO;
+  }
+  result = sqlite3_step(statement);
+  if (result == SQLITE_ROW) {
+    *revision = sqlite3_column_int(statement, 0);
+    result = sqlite3_step(statement);
+  }
+  const int finalize_result = sqlite3_finalize(statement);
+  return result == SQLITE_DONE && finalize_result == SQLITE_OK ? 0 : EIO;
+}
+
+// This calls SQLite's actual POSIX VFS lock path with two separately opened
+// connections. The outer V4 Web Lock intentionally prevents this from being
+// a cross-document test; this is only the single leased WasmFS process case.
+// DELETE journaling avoids claiming the currently unsupported WAL/shared-mmap
+// configuration.
+static int CheckSQLiteWriteContention(void) {
+  sqlite3* writer = NULL;
+  sqlite3* contender = NULL;
+  int error = OpenSQLite(&writer, 1);
+  if (!error) {
+    error = ExecSQLite(writer, "PRAGMA journal_mode=DELETE");
+  }
+  if (!error) {
+    error = CheckSQLiteText(writer, "PRAGMA journal_mode", "delete");
+  }
+  if (!error) {
+    error = ExecSQLite(writer, "PRAGMA synchronous=FULL");
+  }
+  if (!error) {
+    error = CheckSQLiteInteger(writer, "PRAGMA synchronous", 2);
+  }
+  if (!error) {
+    error = ExecSQLite(writer,
+                       "CREATE TABLE IF NOT EXISTS lock_state("
+                       "id INTEGER PRIMARY KEY CHECK(id = 1), "
+                       "revision INTEGER NOT NULL);"
+                       "DELETE FROM lock_state;"
+                       "INSERT INTO lock_state(id, revision) VALUES(1, 1);");
+  }
+  if (!error) {
+    error = OpenSQLite(&contender, 0);
+  }
+  if (!error && sqlite3_extended_result_codes(contender, 0) != SQLITE_OK) {
+    error = EIO;
+  }
+  if (!error) {
+    error = ExecSQLite(writer,
+                       "BEGIN IMMEDIATE;"
+                       "UPDATE lock_state SET revision = 2 WHERE id = 1;");
+  }
+  if (!error) {
+    char* message = NULL;
+    const int result =
+      sqlite3_exec(contender, "BEGIN IMMEDIATE", NULL, NULL, &message);
+    sqlite3_free(message);
+    if (result != SQLITE_BUSY || !sqlite3_get_autocommit(contender)) {
+      error = EIO;
+    }
+  }
+  int revision = 0;
+  if (!error) {
+    error = ReadSQLiteRevision(contender, &revision);
+    if (!error && revision != 1) {
+      error = EIO;
+    }
+  }
+  if (!error) {
+    error = ExecSQLite(writer, "COMMIT");
+  }
+  if (!error) {
+    error = ExecSQLite(contender,
+                       "BEGIN IMMEDIATE;"
+                       "UPDATE lock_state SET revision = 3 WHERE id = 1;"
+                       "COMMIT;");
+  }
+  if (!error) {
+    error = ReadSQLiteRevision(writer, &revision);
+    if (!error && revision != 3) {
+      error = EIO;
+    }
+  }
+  if (contender) {
+    const int close_error = CloseSQLite(&contender);
+    if (!error) {
+      error = close_error;
+    }
+  }
+  if (writer) {
+    const int close_error = CloseSQLite(&writer);
+    if (!error) {
+      error = close_error;
+    }
+  }
+  return error;
 }
 
 struct FcntlCloseRace {
@@ -452,6 +655,9 @@ int main(void) {
   }
   if (!error) {
     error = CheckRecordLocks(fd);
+  }
+  if (!error) {
+    error = CheckSQLiteWriteContention();
   }
   if (fd >= 0 && close(fd) != 0 && !error) {
     error = ErrorOrEIO();
